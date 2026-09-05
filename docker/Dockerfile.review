@@ -1,0 +1,38 @@
+# Review-capable execution-node image.
+# Build context must contain the regular node binaries/entrypoint plus the
+# JavaScript agent-compose runtime bundle. This image is opt-in; management and
+# ordinary execution nodes continue to use nodes/docker/Dockerfile.
+#
+# Package set is the base image's (see nodes/docker/Dockerfile for why each is
+# needed) — this image only adds the bundled runtime and the pre-installed
+# review CLIs on top.
+FROM alpine:3.22
+
+RUN apk add --no-cache \
+    ca-certificates \
+    docker-cli \
+    git \
+    nodejs \
+    npm \
+    openssh-client \
+    tini
+
+COPY node-execution /usr/local/bin/node-execution
+COPY agent-compose-node-management /usr/local/bin/node-management
+COPY entrypoint.sh /usr/local/bin/node-entrypoint
+COPY agent-compose-runtime /usr/local/bin/agent-compose-runtime
+
+RUN chmod +x \
+    /usr/local/bin/node-execution \
+    /usr/local/bin/node-management \
+    /usr/local/bin/node-entrypoint \
+    /usr/local/bin/agent-compose-runtime \
+ && npm install -g \
+    @anthropic-ai/claude-code \
+    @alibaba-group/open-code-review \
+ && npm cache clean --force
+
+# Same bind-mount ownership reason as the base image.
+RUN git config --system --add safe.directory '*'
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/node-entrypoint"]

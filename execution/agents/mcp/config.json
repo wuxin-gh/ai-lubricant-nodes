@@ -1,0 +1,9 @@
+{
+  "mcps": {
+    "x": {
+      "transport": "sse",
+      "type": "remote",
+      "url": "https://gw/x/sse"
+    }
+  }
+}

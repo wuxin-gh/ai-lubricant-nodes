@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.env
+runtime/javascript/node_modules/
+*.exe
+# runtime 平台二进制包（pack-release.sh 可重建；发行走 GitHub Releases，仓库只留元数据）
+runtime/javascript/release/

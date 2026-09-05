@@ -1,0 +1,14 @@
+# Provenance and attribution
+
+Upstream: https://github.com/chaitin/agent-compose (AGPL-3.0)
+
+- The `common/proto/agentcompose/v2` bindings are generated from the
+  agentcompose v2 protocol schema (option go_package rewritten to this
+  module's path).
+- The node clients (execution / management binaries) are built against that
+  schema; original code from agent-compose's node client, modified for this
+  project's split topology.
+- `runtime/` carries the vendored agent-compose JS runtime (agent-compose-runtime-sdk)
+  that build.sh packages into the node release archives.
+
+Corresponding source is this repository.

@@ -39,6 +39,12 @@ type sessionManager struct {
 	emitResult     emitFunc
 	emitStructured emitFunc
 	emitStage      emitFunc
+	// gatewayOrigin returns the data service's MCP-gateway origin announced by
+	// the server hello, used to resolve relative MCP spec URLs. nil or "" means
+	// "leave URLs untouched" (older server that emits absolute URLs). Set from
+	// the shared client in NewHandler; read live so a reconnect that changes the
+	// origin takes effect on the next config write.
+	gatewayOrigin func() string
 
 	mu          sync.Mutex
 	workspaceMu sync.Mutex
@@ -681,17 +687,22 @@ func (s *nodeSession) recordRevisionLocked(revision uint64) configResult {
 // is best-effort and revision 0 (the baseline the first editor run loads).
 func (m *sessionManager) applyInitialConfig(session *nodeSession, spec *agentcomposev2.NodeCreateSession) error {
 	// env_mode=system runs against the node operator's real HOME. The node must
-	// NOT rewrite editor config into that home: writeMCPConfig / syncSkills /
-	// syncPlugins all do exact-set rewrites under ~/.claude, ~/.codex, ~/.agents,
-	// which would clobber the operator's own setup and delete skills they
-	// installed by hand. The LLM still reaches the editor via buildEnv's env
-	// vars, so system mode is usable; it just cannot apply task-selected
-	// skills/MCPs/plugins. That is the accepted trade-off for reusing the host
-	// toolchain — a system session gets the operator's environment as-is.
+	// NOT rewrite editor config into that home: writeMCPConfig's provider-native
+	// copy / syncSkills / syncPlugins all do exact-set rewrites under ~/.claude,
+	// ~/.codex, ~/.agents, which would clobber the operator's own setup and
+	// delete skills they installed by hand. Task-selected MCP still reaches the
+	// runtime through the per-session stateRoot copy (writeMCPConfig's first
+	// artifact), and the runners layer it on top of the operator's own native
+	// config rather than replacing it. The LLM rides env vars, as everywhere.
 	if isSystemEnv(spec) {
 		if llm := spec.GetLlm(); llm != nil {
 			if err := m.writeLLMConfig(session, llm); err != nil {
 				return fmt.Errorf("llm: %w", err)
+			}
+		}
+		if len(spec.GetMcps()) > 0 {
+			if err := writeRuntimeMCPConfig(session.stateRoot, spec.GetMcps()); err != nil {
+				return fmt.Errorf("mcp: %w", err)
 			}
 		}
 		return nil
@@ -759,8 +770,13 @@ func (m *sessionManager) applyMCPs(sessionID string, revision uint64, mcps []*ag
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if isSystemEnv(session.spec) {
-		// system mode shares the operator's real HOME; writing MCP config
-		// there would clobber ~/.mcp.json. LLM (env vars) is still applied.
+		// system mode shares the operator's real HOME; the provider-native copy
+		// would clobber ~/.mcp.json. Only the runtime's stateRoot copy is
+		// rewritten — the runners layer task MCP on top of the operator's own
+		// native config. LLM (env vars) is still applied.
+		if err := writeRuntimeMCPConfig(session.stateRoot, mcps); err != nil {
+			return configResult{}, err
+		}
 		return session.recordRevisionLocked(revision), nil
 	}
 	if err := m.writeMCPConfig(session, mcps); err != nil {
@@ -842,10 +858,11 @@ func (m *sessionManager) markArtifactsCollectable(sessionID string) error {
 // (guest-visible) paths. It is shared by both executors; only the path values
 // differ (host paths for local, in-container paths for docker).
 // promptArgs builds the agent-compose-runtime prompt arguments for the given
-// session paths and config. activeSkills, when non-empty, is passed as repeated
-// --skill flags so the one-shot run activates exactly that subset of the
-// environment's installed skills (mirrors the stream executor's start frame).
-func promptArgs(provider, model, mode, stateRoot, workspace, home string, activeSkills []string) []string {
+// session paths and config. activeSkills/activePlugins, when non-empty, are
+// passed as repeated --skill/--plugin flags so the one-shot run activates
+// exactly that subset of the environment's installed skills/plugins (mirrors
+// the stream executor's start frame).
+func promptArgs(provider, model, mode, stateRoot, workspace, home string, activeSkills, activePlugins []string, systemEnv bool) []string {
 	args := []string{
 		"prompt",
 		"--provider", provider,
@@ -859,9 +876,17 @@ func promptArgs(provider, model, mode, stateRoot, workspace, home string, active
 	if md := strings.TrimSpace(mode); md != "" {
 		args = append(args, "--mode", md)
 	}
+	if systemEnv {
+		args = append(args, "--system-env")
+	}
 	for _, skill := range activeSkills {
 		if s := strings.TrimSpace(skill); s != "" {
 			args = append(args, "--skill", s)
+		}
+	}
+	for _, plugin := range activePlugins {
+		if p := strings.TrimSpace(plugin); p != "" {
+			args = append(args, "--plugin", p)
 		}
 	}
 	return args

@@ -104,7 +104,7 @@ func (e *dockerExecutor) start(ctx context.Context, session *nodeSession) (*exec
 	session.mu.Unlock()
 	guestStateRoot := filepath.Join(guestWorkspace, ".agent-compose", "sessions", sanitizeSessionDir(session.id), "state")
 	guestHome := filepath.Join(guestWorkspace, ".agent-compose", "sessions", sanitizeSessionDir(session.id), "home")
-	args := promptArgs(session.provider, session.spec.GetModel(), mode, guestStateRoot, guestWorkspace, guestHome, e.mgr.activeSkillNames(session.spec))
+	args := promptArgs(session.provider, session.spec.GetModel(), mode, guestStateRoot, guestWorkspace, guestHome, e.mgr.activeSkillNames(session.spec), e.mgr.activePluginNames(session.spec), isSystemEnv(session.spec))
 	mkdirs := "mkdir -p " + guestStateRoot + " " + guestHome
 	shell := mkdirs + " && agent-compose-runtime " + shellJoin(args)
 	execResp, err := cli.ContainerExecCreate(ctx, containerID, containerapi.ExecOptions{

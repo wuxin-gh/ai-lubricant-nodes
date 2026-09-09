@@ -67,6 +67,12 @@ function claudeMessageToItems(
     const inner = isRecord(message.message) ? message.message : message;
     const content = Array.isArray(inner.content) ? inner.content : [];
     const items: StreamItem[] = [];
+    // The SDK's assistant API message carries the model and per-call usage on
+    // every assistant message. Stamp them onto each block item so the console
+    // can show "model · N tokens" next to a message time without a separate
+    // usage frame (the context-gauge usage_update carries only window fill).
+    const model = textOf(inner.model) || undefined;
+    const usage = assistantUsage(inner);
     content.forEach((rawBlock, index) => {
       if (!isRecord(rawBlock)) return;
       const blockType = textOf(rawBlock.type);
@@ -80,6 +86,8 @@ function claudeMessageToItems(
           event_kind: "message",
           phase: "complete",
           status: "done",
+          ...(model ? { model } : {}),
+          ...(usage ? { usage } : {}),
         });
         return;
       }
@@ -93,6 +101,8 @@ function claudeMessageToItems(
           event_kind: "reasoning",
           phase: "complete",
           status: "done",
+          ...(model ? { model } : {}),
+          ...(usage ? { usage } : {}),
         });
         return;
       }
@@ -110,6 +120,8 @@ function claudeMessageToItems(
           phase: "start",
           input: rawBlock.input ?? {},
           status: "running",
+          ...(model ? { model } : {}),
+          ...(usage ? { usage } : {}),
         });
       }
     });
@@ -271,6 +283,27 @@ function claudeUsageFrame(message: Record<string, unknown>): object | null {
   return { used, size };
 }
 
+/**
+ * Compact a Claude assistant message's per-call API usage into the shape the
+ * console stamps onto items. The SDK reports Anthropic API `usage` (snake_case
+ * `input_tokens` etc.); we normalise to short field names and a pre-summed
+ * total so the frontend renders without knowing the SDK's naming. Returns
+ * undefined when the message carries no usable numbers (assistant prefill
+ * fragments, or older SDK shapes without usage).
+ */
+function assistantUsage(inner: Record<string, unknown>):
+  | { input: number; output: number; cache_read: number; cache_creation: number; total: number }
+  | undefined {
+  const usageRaw = isRecord(inner.usage) ? inner.usage : null;
+  if (!usageRaw) return undefined;
+  const input = Number(usageRaw.input_tokens ?? usageRaw.inputTokens ?? 0);
+  const output = Number(usageRaw.output_tokens ?? usageRaw.outputTokens ?? 0);
+  const cacheRead = Number(usageRaw.cache_read_input_tokens ?? usageRaw.cacheReadInputTokens ?? 0);
+  const cacheCreation = Number(usageRaw.cache_creation_input_tokens ?? usageRaw.cacheCreationInputTokens ?? 0);
+  if (!input && !output && !cacheRead && !cacheCreation) return undefined;
+  return { input, output, cache_read: cacheRead, cache_creation: cacheCreation, total: input + output + cacheRead + cacheCreation };
+}
+
 function hasOwn(object: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
@@ -334,8 +367,12 @@ function claudeEnvironment(): NodeJS.ProcessEnv {
  * a Claude Code plugin the SDK can load wholesale (commands, agents, skills,
  * hooks) — this is how a multi-skill repo (e.g. obra/superpowers) reaches the
  * session. Returns absolute paths; a missing dir yields an empty list.
+ *
+ * activePlugins narrows the result: a non-empty list means only those package
+ * names load this run (the env-tier activation subset); empty/undefined keeps
+ * the historic "load everything present" behaviour.
  */
-function discoverLocalPlugins(home: string): string[] {
+function discoverLocalPlugins(home: string, activePlugins?: string[]): string[] {
   const root = join(home, ".agents", "plugins");
   let entries: string[];
   try {
@@ -343,8 +380,14 @@ function discoverLocalPlugins(home: string): string[] {
   } catch {
     return [];
   }
+  const wanted = activePlugins && activePlugins.length > 0
+    ? new Set(activePlugins.map((name) => name.trim()).filter(Boolean))
+    : null;
   const plugins: string[] = [];
   for (const entry of entries) {
+    if (wanted && !wanted.has(entry.trim())) {
+      continue;
+    }
     const dir = join(root, entry);
     try {
       if (!statSync(dir).isDirectory()) continue;
@@ -405,7 +448,7 @@ export class ClaudeRunner {
     // Plugin packages the node synced for this session. The SDK loads each one
     // wholesale from its .claude-plugin/plugin.json, so a package's own skills
     // arrive without being listed in `skills` below.
-    const localPlugins = discoverLocalPlugins(this.options.home);
+    const localPlugins = discoverLocalPlugins(this.options.home, this.options.plugins);
     return {
       cwd: this.options.workspace,
       env: claudeEnvironment(),

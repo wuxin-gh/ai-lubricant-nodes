@@ -90,11 +90,22 @@ func (e *streamExecutor) start(ctx context.Context, session *nodeSession) (*exec
 		"editorId":        session.editorID,
 		"editorSessionId": session.editorSessionID,
 	}
-	// active_skills narrows which of the environment's installed skills this
-	// session turns on (shared tier). The runtime activates by name; the files
-	// themselves live in the shared HOME and are never touched per session.
+	// systemEnv tells the runtime the session shares the operator's real HOME:
+	// the node wrote only the per-session stateRoot MCP config (never the
+	// provider-native file), so runners merge the operator's own native MCP
+	// config under the task's config rather than replacing it.
+	if isSystemEnv(session.spec) {
+		startFrame["systemEnv"] = true
+	}
+	// active_skills/active_plugins narrow which of the environment's installed
+	// skills/plugins this session turns on (shared tier). The runtime activates
+	// by name; the files themselves live in the shared HOME and are never
+	// touched per session.
 	if skills := e.mgr.activeSkillNames(session.spec); len(skills) > 0 {
 		startFrame["skills"] = skills
+	}
+	if plugins := e.mgr.activePluginNames(session.spec); len(plugins) > 0 {
+		startFrame["plugins"] = plugins
 	}
 	if err := e.writeFrame(startFrame); err != nil {
 		return nil, fmt.Errorf("send start frame: %w", err)

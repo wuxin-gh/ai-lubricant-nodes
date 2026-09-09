@@ -32,6 +32,14 @@ export interface RunnerOptions {
   systemContext: string;
   mcpConfig?: Record<string, unknown>;
   skills?: string[];
+  plugins?: string[];
+  /**
+   * True when the session runs against the node operator's real HOME (env_mode
+   * = system). The node never writes the provider-native MCP file into that
+   * HOME; instead runners merge the task's stateRoot MCP config ON TOP OF the
+   * operator's own native MCP config (read-only) rather than replacing it.
+   */
+  systemEnv?: boolean;
   outputSchema?: RuntimeJsonSchema;
   /**
    * Whether the provider should compact its context automatically as it fills.

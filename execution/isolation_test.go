@@ -376,7 +376,7 @@ func TestProviderPromptArgsCarriesSessionHome(t *testing.T) {
 	m, _ := newTestManager(t)
 	sessA, _ := twoClaudeSessions(t, m)
 
-	args := promptArgs(sessA.provider, "model-x", "", sessA.stateRoot, sessA.workDir, sessA.home, nil)
+	args := promptArgs(sessA.provider, "model-x", "", sessA.stateRoot, sessA.workDir, sessA.home, nil, nil, false)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--home "+sessA.home) {
 		t.Fatalf("prompt args do not pass the session's home: %s", joined)

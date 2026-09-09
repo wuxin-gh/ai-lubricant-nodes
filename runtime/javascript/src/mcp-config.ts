@@ -40,6 +40,106 @@ export async function readMCPConfig(stateRoot: string): Promise<RuntimeMCPConfig
   }
 }
 
+/**
+ * Read a provider's native MCP config from a system HOME, read-only, and
+ * normalize it into the runtime's own RuntimeMCPServer shape. Only the
+ * three providers whose CLI reads a JSON config file are covered; codex's
+ * native MCP lives in TOML (~/.codex/config.toml) and is deliberately not
+ * parsed here — it has no task-level MCP channel in system mode.
+ */
+export async function readNativeMCPConfig(provider: string, home: string): Promise<RuntimeMCPConfig> {
+  const normalized = provider.trim().toLowerCase();
+  const candidates: Record<string, string[]> = {
+    claude: [path.join(home, ".mcp.json")],
+    gemini: [path.join(home, ".gemini", "settings.json")],
+    opencode: [path.join(home, ".config", "opencode", "opencode.json")],
+  };
+  const filePath = candidates[normalized]?.[0];
+  if (!filePath) return {};
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+  const source = normalized === "opencode" ? parsed.mcp : parsed.mcpServers;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return {};
+  const mcps: Record<string, RuntimeMCPServer> = {};
+  for (const [name, value] of Object.entries(source as Record<string, unknown>)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const server = value as Record<string, unknown>;
+    const command = typeof server.command === "string"
+      ? server.command
+      : Array.isArray(server.command) && typeof server.command[0] === "string" ? server.command[0] : undefined;
+    const rest = Array.isArray(server.command)
+      ? server.command.slice(1).filter((item): item is string => typeof item === "string")
+      : undefined;
+    const args = Array.isArray(server.args)
+      ? server.args.filter((item): item is string => typeof item === "string")
+      : rest;
+    const url = typeof server.url === "string" ? server.url : typeof server.httpUrl === "string" ? server.httpUrl : undefined;
+    if (command) {
+      mcps[name] = {
+        type: "local",
+        command,
+        ...(args && args.length ? { args } : {}),
+        env: toEnvVars(server.env || server.environment),
+      };
+    } else if (url) {
+      mcps[name] = {
+        type: "remote",
+        url,
+        transport: typeof server.type === "string" && server.type === "sse" ? "sse" : "http",
+        headers: toEnvVars(server.headers),
+      };
+    }
+  }
+  return { mcps };
+}
+
+/**
+ * Resolve the effective MCP server set for a provider session.
+ *
+ * system-env sessions run against the node operator's real HOME, whose
+ * provider-native MCP config (~/.mcp.json, ~/.gemini/settings.json, …) is read
+ * here as-is and layered UNDER the task's own stateRoot config (the task's
+ * freshly minted tokens) — never overwriting it, so the operator's own servers
+ * stay available and the task's per-session servers land on top. Other tiers
+ * return the task config unchanged (the node already wrote the native copy for
+ * them, or the HOME is session-private). Codex has no per-task MCP channel in
+ * system mode and is skipped (returns task config as-is).
+ */
+export async function resolveEffectiveMCPConfig(
+  stateRoot: string,
+  provider: string,
+  systemEnv: boolean,
+  home: string,
+): Promise<Record<string, RuntimeMCPServer>> {
+  const taskConfig = await readMCPConfig(stateRoot);
+  const taskMcps = taskConfig.mcps || {};
+  if (!systemEnv || provider.trim().toLowerCase() === "codex") {
+    return taskMcps;
+  }
+  const nativeConfig = await readNativeMCPConfig(provider, home);
+  const nativeMcps = nativeConfig.mcps || {};
+  // Task tokens win on name collisions: the node wrote the task's per-session
+  // config with this run's own freshly minted credentials, so they are the
+  // authoritative source for any shared server name.
+  return { ...nativeMcps, ...taskMcps };
+}
+
+function toEnvVars(value: unknown): Record<string, RuntimeMCPEnvVar> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out: Record<string, RuntimeMCPEnvVar> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const inner = typeof item === "object" && item !== null && !Array.isArray(item)
+      ? (item as Record<string, unknown>)
+      : null;
+    out[key] = { value: String(inner && "value" in inner ? inner.value : item ?? "") };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function flattenEnvMap(values?: Record<string, RuntimeMCPEnvVar>): Record<string, string> | undefined {
   if (!values || typeof values !== "object") {
     return undefined;

@@ -6,7 +6,9 @@ require (
 	connectrpc.com/connect v1.19.2
 	device-control/ios v0.0.0
 	github.com/UserExistsError/conpty v0.1.4
+	github.com/aluedeke/go-codesign v0.0.6
 	github.com/creack/pty v1.1.24
+	github.com/danielpaulus/go-ios v1.3.2
 	github.com/docker/docker v28.5.1+incompatible
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
@@ -22,7 +24,6 @@ replace device-control/ios => ../device-control/ios
 require (
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/aluedeke/go-codesign v0.0.6 // indirect
 	github.com/blacktop/go-dwarf v1.0.14 // indirect
 	github.com/blacktop/go-macho v1.1.258 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
@@ -31,14 +32,13 @@ require (
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/danielpaulus/go-ios v1.3.2 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
-	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/miekg/dns v1.1.57 // indirect
@@ -50,6 +50,11 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pierrec/lz4 v2.6.1+incompatible // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/quic-go/quic-go v0.59.1 // indirect
+	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8 // indirect
+	github.com/tadglines/go-pkgs v0.0.0-20210623144937-b983b20f54f9 // indirect
+	github.com/vishvananda/netlink v1.3.1 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	go.mozilla.org/pkcs7 v0.9.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0 // indirect
@@ -67,7 +72,11 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	gotest.tools/v3 v3.5.2 // indirect
+	gvisor.dev/gvisor v0.0.0-20240405191320-0878b34101b5 // indirect
 	howett.net/plist v1.0.1 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.7.2 // indirect
 )

@@ -84,6 +84,9 @@ export async function runStreamCommand(options: RunStreamOptions = {}): Promise<
             mode: stringField(frame, "mode"),
             outputSchemaFile: stringField(frame, "outputSchemaFile"),
             sessionScope: stringField(frame, "editorSessionId") || stringField(frame, "sessionId"),
+            skills: stringArrayField(frame, "skills"),
+            plugins: stringArrayField(frame, "plugins"),
+            systemEnv: frame.systemEnv === true,
           }, emit);
           break;
         case "human_message": {
@@ -254,6 +257,17 @@ function emitOutputFrame(
 function stringField(record: Record<string, unknown>, field: string): string | undefined {
   const value = record[field];
   return typeof value === "string" ? value : undefined;
+}
+
+function stringArrayField(record: Record<string, unknown>, field: string): string[] | undefined {
+  const value = record[field];
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const items = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item !== "");
+  return items.length > 0 ? items : undefined;
 }
 
 function numberField(record: Record<string, unknown>, field: string): number | undefined {

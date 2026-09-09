@@ -42,6 +42,32 @@ RUN chmod +x \
     /usr/local/bin/node-management \
     /usr/local/bin/node-entrypoint
 
+# 镜像内固定 state 目录：容器里 managed 子执行节点不带 AGENT_COMPOSE_NODE_STATE_DIR，
+# 显式钉住让 RuntimeDir() (= stateDir/runtime) 落点确定，不依赖 $HOME 解析。管理容器与
+# 子执行容器都继承这个 ENV，两边一致。
+ENV AGENT_COMPOSE_NODE_STATE_DIR=/opt/agent-compose/state
+
+# 首次 build 就把服务端发布的通用 runtime 包（node-runtime.tar.gz，顶层目录 runtime/）
+# 解压进 state 目录：镜像自带 runtime/dist/cli.js，执行节点首次注册即上报 runtime_version，
+# 不再依赖注册后单独的 RuntimeUpgrade 推送——审批门禁不会卡在缺 runtime。缺 cli.js 直接
+# 让 build 失败，避免产出「能启动但没 runtime」的坏镜像。
+COPY node-runtime.tar.gz /tmp/node-runtime.tar.gz
+RUN mkdir -p /opt/agent-compose/state \
+ && tar -xzf /tmp/node-runtime.tar.gz -C /opt/agent-compose/state \
+ && test -f /opt/agent-compose/state/runtime/dist/cli.js \
+ && rm -f /tmp/node-runtime.tar.gz
+
+# 首次 build 装齐 npm 形态的编辑器 CLI（与 execution/editormgmt.go 的 package 映射一致）：
+# claude/codex/gemini/opencode。执行节点注册时探测 PATH 上这些 CLI 上报 providers，镜像自带
+# 即满足审批「至少一个编辑器」门禁。Cursor 不是 npm 包（官方 curl 安装器），无法作为
+# 可复现的非交互 Alpine build 输入；它需要时再从节点详情单独安装。
+RUN npm install -g \
+    @anthropic-ai/claude-code \
+    @openai/codex \
+    @google/gemini-cli \
+    opencode-ai \
+ && npm cache clean --force
+
 # System mode is disabled in container nodes by default: the container HOME is
 # the image's HOME, not the operator's host HOME.
 ENV AGENT_COMPOSE_NODE_ALLOW_SYSTEM_ENV=off

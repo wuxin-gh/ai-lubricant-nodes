@@ -147,6 +147,15 @@ func NewClient(opts Options, logger *slog.Logger) *Client {
 // EmitUpstream closure.
 func (c *Client) SetHandler(h DownstreamHandler) { c.handler = h }
 
+// GatewayOrigin returns the origin relative MCP spec URLs resolve against: the
+// server address this node itself dials. The node is already connected to it,
+// so the server needs no configured public gateway URL — a relative spec
+// (/mcp/{name}/sse?token=…) becomes absolute here, and absolute specs from an
+// older server pass through untouched (see sessionManager.resolveMCPURLs).
+func (c *Client) GatewayOrigin() string {
+	return strings.TrimRight(strings.TrimSpace(c.opts.Server), "/")
+}
+
 // Logger exposes the client logger to handlers.
 func (c *Client) Logger() *slog.Logger { return c.logger }
 
@@ -177,6 +186,10 @@ func newNodeHTTPClient(opts Options) *http.Client {
 // Run drives the reconnect loop: dial, register, serve the stream until it
 // breaks, then back off and retry until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
+	// A node-managed host-tool install (Node.js) from a previous run must be
+	// visible before the first registration probes host tool versions, and
+	// before any session spawns resolve their launchers.
+	EnsureManagedNodeOnPath()
 	backoff := c.opts.MinBackoff
 	for {
 		if ctx.Err() != nil {
@@ -658,6 +671,30 @@ func (c *Client) SendEditorAck(frameID string, cmdErr error, editorVersion strin
 	}
 	if err := c.EmitUpstream(frame); err != nil {
 		c.logger.Warn("editor ack send failed", "error", err)
+	}
+}
+
+// SendHostToolAck acks an InstallHostTool command. On success nodeVersion /
+// npmVersion carry the freshly probed versions (nodejs), or xcodebuildVersion
+// carries the probed xcodebuild version (xcode detection), so the server can
+// refresh the node's capability labels (node_version/npm_version/
+// xcodebuild_version) without waiting for a re-register.
+func (c *Client) SendHostToolAck(frameID string, cmdErr error, nodeVersion, npmVersion, xcodebuildVersion string) {
+	ack := &agentcomposev2.NodeCommandAck{
+		ServerFrameId:     frameID,
+		Ok:                cmdErr == nil,
+		NodeVersion:       nodeVersion,
+		NpmVersion:        npmVersion,
+		XcodebuildVersion: xcodebuildVersion,
+	}
+	if cmdErr != nil {
+		ack.Error = cmdErr.Error()
+	}
+	frame := &agentcomposev2.NodeUpstreamFrame{
+		Frame: &agentcomposev2.NodeUpstreamFrame_CommandAck{CommandAck: ack},
+	}
+	if err := c.EmitUpstream(frame); err != nil {
+		c.logger.Warn("host-tool ack send failed", "error", err)
 	}
 }
 

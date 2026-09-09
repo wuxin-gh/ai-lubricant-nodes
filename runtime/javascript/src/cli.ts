@@ -38,6 +38,8 @@ export function createProgram(options: { exitOverride?: boolean } = {}): Command
     .option("--mode <mode>", "editor permission/approval mode")
     .option("--output-schema-file <path>", "JSON schema file for structured output")
     .option("--skill <name>", "enabled agent skill name", collectRepeated, [])
+    .option("--plugin <name>", "enabled agent plugin name", collectRepeated, [])
+    .option("--system-env", "session runs against the node operator's real HOME")
     .action(async (options: {
       provider: string;
       messageFile: string;
@@ -48,9 +50,11 @@ export function createProgram(options: { exitOverride?: boolean } = {}): Command
       mode?: string;
       outputSchemaFile?: string;
       skill?: string[];
+      plugin?: string[];
+      systemEnv?: boolean;
     }) => {
-      const { skill, ...promptOptions } = options;
-      const result = await runPromptCommand({ ...promptOptions, skills: skill });
+      const { skill, plugin, ...promptOptions } = options;
+      const result = await runPromptCommand({ ...promptOptions, skills: skill, plugins: plugin, systemEnv: options.systemEnv === true });
       process.stdout.write(`${RESULT_PREFIX}${JSON.stringify(result)}\n`);
     });
 

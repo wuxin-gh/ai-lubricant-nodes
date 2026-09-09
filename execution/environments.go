@@ -130,6 +130,34 @@ func (m *sessionManager) activeSkillNames(spec *agentcomposev2.NodeCreateSession
 	return names
 }
 
+// activePluginNames is the plugin counterpart of activeSkillNames: the subset
+// of the environment's installed plugins this session turns on. Explicit list
+// wins; empty means "activate everything the environment has" (enumerated for
+// shared envs; the system tier has no enumerable ledger, so empty stays empty —
+// every physically present plugin loads, which matches the operator's own
+// setup exactly).
+func (m *sessionManager) activePluginNames(spec *agentcomposev2.NodeCreateSession) []string {
+	if names := spec.GetActivePlugins(); len(names) > 0 {
+		return names
+	}
+	if !isSharedEnv(spec) {
+		return nil
+	}
+	inventory, err := m.inspectEnvironment(&agentcomposev2.NodeInspectEnvironment{EnvId: spec.GetEnvId()})
+	if err != nil {
+		m.logger.Warn("environment plugin enumeration failed",
+			"env_id", spec.GetEnvId(), "error", err)
+		return nil
+	}
+	var names []string
+	for _, entry := range inventory {
+		if entry.GetKind() == "plugin" {
+			names = append(names, entry.GetName())
+		}
+	}
+	return names
+}
+
 // manageEnvironment provisions or removes a named shared environment on this
 // host, dispatched via a NodeManageEnvironment downstream frame. CREATE is
 // idempotent (an existing dir is left as-is); REMOVE deletes the whole tree
@@ -296,11 +324,13 @@ func (m *sessionManager) inspectEnvironment(frame *agentcomposev2.NodeInspectEnv
 	return out, nil
 }
 
-// readResourceVersion is a best-effort version probe for an installed resource.
-// Skills carry no version (SKILL.md frontmatter has name/description only), and
-// plugin packages vary by provider, so an unknown version is normal and reported
-// as empty rather than guessed.
-func readResourceVersion(dir string) string {
+// readResourceMeta is a best-effort probe of an installed resource's version and
+// description. Versions come from the manifests a plugin layout provides
+// (package.json, .claude-plugin/plugin.json, .codex-plugin/plugin.json); skills
+// carry none. Descriptions come from those manifests' `description` field and,
+// for skills, the `description:` line of SKILL.md's YAML frontmatter. Every value
+// is optional: unknown is reported as empty rather than guessed.
+func readResourceMeta(dir string) (version, description string) {
 	for _, candidate := range []string{
 		filepath.Join(dir, "package.json"),
 		filepath.Join(dir, ".claude-plugin", "plugin.json"),
@@ -311,13 +341,68 @@ func readResourceVersion(dir string) string {
 			continue
 		}
 		var doc struct {
-			Version string `json:"version"`
+			Version     string `json:"version"`
+			Description string `json:"description"`
 		}
-		if json.Unmarshal(raw, &doc) == nil {
-			if v := strings.TrimSpace(doc.Version); v != "" {
-				return v
-			}
+		if json.Unmarshal(raw, &doc) != nil {
+			continue
 		}
+		if version == "" {
+			version = strings.TrimSpace(doc.Version)
+		}
+		if description == "" {
+			description = strings.TrimSpace(doc.Description)
+		}
+	}
+	if description == "" {
+		description = readSkillDescription(dir)
+	}
+	return version, description
+}
+
+// readResourceVersion keeps the version-only probe for callers that don't need
+// the description (shared-env inventories, sync touchbacks).
+func readResourceVersion(dir string) string {
+	version, _ := readResourceMeta(dir)
+	return version
+}
+
+// readSkillDescription pulls the `description:` line out of a skill's SKILL.md
+// frontmatter. A line scan suffices — the value is a single line in every skill
+// layout we produce or archive, and a YAML parser is not worth the dependency
+// for one tooltip.
+func readSkillDescription(dir string) string {
+	raw, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
+	if err != nil {
+		return ""
+	}
+	return frontmatterDescription(string(raw))
+}
+
+// frontmatterDescription scans the leading `---` fenced YAML frontmatter block
+// for a top-level `description:` key. Quoted values are unquoted; multi-line
+// (folded/block) scalars are skipped rather than reconstructed.
+func frontmatterDescription(text string) string {
+	norm := strings.ReplaceAll(text, "\r\n", "\n")
+	if !strings.HasPrefix(norm, "---\n") {
+		return ""
+	}
+	body := norm[len("---\n"):]
+	end := strings.Index(body, "\n---")
+	if end < 0 {
+		return ""
+	}
+	for _, line := range strings.Split(body[:end], "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "description:") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(trimmed, "description:"))
+		value = strings.Trim(value, `"'`)
+		if value == "" || strings.HasPrefix(value, ">") || strings.HasPrefix(value, "|") {
+			return ""
+		}
+		return value
 	}
 	return ""
 }

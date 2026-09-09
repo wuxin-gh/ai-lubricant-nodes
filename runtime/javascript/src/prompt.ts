@@ -9,7 +9,7 @@ import { CodexRunner } from "./runners/codex.js";
 import { GeminiRunner } from "./runners/gemini.js";
 import { OpenCodeRunner } from "./runners/opencode.js";
 import { CursorAcpRunner } from "./runners/acp/cursor.js";
-import { readMCPConfig } from "./mcp-config.js";
+import { resolveEffectiveMCPConfig } from "./mcp-config.js";
 import { agentSystemPromptPath, buildSystemContext, readSystemPromptFile } from "./system-context.js";
 import type { AgentResult, RuntimeJsonSchema } from "./types.js";
 
@@ -23,6 +23,8 @@ export interface PromptCommandOptions {
   mode?: string;
   outputSchemaFile?: string;
   skills?: string[];
+  plugins?: string[];
+  systemEnv?: boolean;
   sessionScope?: string;
 }
 
@@ -38,8 +40,12 @@ export async function buildPromptRuntimeOptions(commandOptions: Omit<PromptComma
     : undefined;
   const systemPrompt = await readSystemPromptFile(agentSystemPromptPath(stateRoot));
   const mpi = await readMpiContext(stateRoot);
-  const mcpConfig = await readMCPConfig(stateRoot);
+  const systemEnv = commandOptions.systemEnv === true;
+  // system-env sessions layer the operator's native MCP config UNDER the task's
+  // stateRoot config (read-only merge); other tiers use the task config alone.
+  const mcpConfig = await resolveEffectiveMCPConfig(stateRoot, provider, systemEnv, home);
   const skills = normalizeSkills(commandOptions.skills);
+  const plugins = normalizeSkills(commandOptions.plugins);
   const baseSystemContext = buildSystemContext(systemPrompt, mpi.context);
   return {
     provider,
@@ -53,8 +59,10 @@ export async function buildPromptRuntimeOptions(commandOptions: Omit<PromptComma
     systemContext: provider === "gemini" || provider === "codex"
       ? await appendSkillCatalogContext(baseSystemContext, home, skills)
       : baseSystemContext,
-    mcpConfig: mcpConfig.mcps,
+    mcpConfig,
     skills,
+    plugins,
+    systemEnv,
     outputSchema,
   };
 }

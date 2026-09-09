@@ -2,9 +2,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
-build/
+/build/
 dist/
 .env
+# 根级依赖目录（runtime/javascript/node_modules/ 另有规则；根级来自误在仓库根跑 npm）
+/node_modules/
 runtime/javascript/node_modules/
 *.exe
 # runtime 平台二进制包（pack-release.sh 可重建；发行走 GitHub Releases，仓库只留元数据）

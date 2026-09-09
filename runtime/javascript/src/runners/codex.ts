@@ -208,7 +208,7 @@ export class CodexRunner {
     // before starting the thread. Codex's plugin loader is marketplace-driven
     // and has no SDK option, so this CLI call is what makes synced plugins reach
     // the session. Idempotent and non-fatal on failure.
-    registerCodexMarketplaces(this.options.home);
+    registerCodexMarketplaces(this.options.home, this.options.plugins);
 
     const { Codex } = await import("@openai/codex-sdk");
     const stored = await readStoredThread(this.options.stateRoot, "codex", this.options.sessionScope);
@@ -298,18 +298,28 @@ function discoverCodexMarketplaces(home: string): string[] {
  * does. Idempotent: re-adding an already-added marketplace is a no-op (Codex
  * reports `already_added`). Failures are non-fatal — a bad marketplace should
  * not block the session, only that plugin won't load.
+ *
+ * activePlugins narrows which marketplace roots are registered: a non-empty
+ * list means only those package names load this run (the env-tier activation
+ * subset); empty/undefined keeps the historic "register everything" behaviour.
  */
-function registerCodexMarketplaces(home: string): void {
+function registerCodexMarketplaces(home: string, activePlugins?: string[]): void {
   const roots = discoverCodexMarketplaces(home);
   if (roots.length === 0) {
     return;
   }
+  const wanted = activePlugins && activePlugins.length > 0
+    ? new Set(activePlugins.map((name) => name.trim()).filter(Boolean))
+    : null;
   const codexBin = resolveCodexPath();
   if (!codexBin) {
     return;
   }
   const env = sessionEnv(home);
   for (const root of roots) {
+    if (wanted && !wanted.has(path.basename(root).trim())) {
+      continue;
+    }
     try {
       spawnSync(codexBin, ["plugin", "marketplace", "add", root, "--json"], {
         cwd: root,

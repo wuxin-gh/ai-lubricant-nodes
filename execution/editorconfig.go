@@ -58,6 +58,40 @@ func (m *sessionManager) writeLLMConfig(session *nodeSession, llm *agentcomposev
 	}
 }
 
+// resolveMCPURLs returns the spec set with relative remote URLs resolved
+// against the server-announced gateway origin. Specs from the server carry a
+// RELATIVE path (e.g. "/mcp/{name}/sse?token=…") so no public gateway URL has to
+// be configured on the server; the node combines it with the origin it learned
+// from the hello frame. Absolute URLs (older server) and local (stdio) specs
+// pass through untouched. A relative URL with no known origin also passes
+// through unchanged — the write then fails loudly downstream instead of being
+// silently rewritten to a wrong host.
+func (m *sessionManager) resolveMCPURLs(mcps []*agentcomposev2.MCPServerSpec) []*agentcomposev2.MCPServerSpec {
+	if len(mcps) == 0 {
+		return mcps
+	}
+	origin := ""
+	if m.gatewayOrigin != nil {
+		origin = strings.TrimSpace(m.gatewayOrigin())
+	}
+	if origin == "" {
+		return mcps
+	}
+	origin = strings.TrimRight(origin, "/")
+	out := make([]*agentcomposev2.MCPServerSpec, 0, len(mcps))
+	for _, mcp := range mcps {
+		url := strings.TrimSpace(mcp.GetUrl())
+		if !isRemoteMCP(mcp) || url == "" || !strings.HasPrefix(url, "/") {
+			out = append(out, mcp)
+			continue
+		}
+		resolved := mcp
+		resolved.Url = origin + url
+		out = append(out, resolved)
+	}
+	return out
+}
+
 // writeMCPConfig rewrites the session editor's MCP configuration to exactly the
 // given set (empty clears the managed block).
 //
@@ -74,6 +108,7 @@ func (m *sessionManager) writeLLMConfig(session *nodeSession, llm *agentcomposev
 // MCP set, so session-scoped servers (e.g. issue-workflow) never reached the
 // agent.
 func (m *sessionManager) writeMCPConfig(session *nodeSession, mcps []*agentcomposev2.MCPServerSpec) error {
+	mcps = m.resolveMCPURLs(mcps)
 	if err := writeRuntimeMCPConfig(session.stateRoot, mcps); err != nil {
 		return err
 	}

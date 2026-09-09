@@ -176,3 +176,38 @@ func TestActiveSkillsSubsetWins(t *testing.T) {
 		t.Fatalf("empty active list should activate the env's full set, got %v", all)
 	}
 }
+
+// TestActivePluginsSubsetWins mirrors TestActiveSkillsSubsetWins for plugins:
+// the explicit active_plugins list is the load set; empty enumerates the env.
+func TestActivePluginsSubsetWins(t *testing.T) {
+	m, workRoot := newTestManager(t)
+	pluginsRoot := filepath.Join(workRoot, "envs", "prod", ".agents", "plugins")
+	for _, name := range []string{"plug-1", "plug-2"} {
+		if err := os.MkdirAll(filepath.Join(pluginsRoot, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	narrowed := sharedSpec("t-narrow-p", "prod")
+	narrowed.ActivePlugins = []string{"plug-2"}
+	if got := m.activePluginNames(narrowed); len(got) != 1 || got[0] != "plug-2" {
+		t.Fatalf("explicit plugin subset = %v, want [plug-2]", got)
+	}
+
+	all := m.activePluginNames(sharedSpec("t-all-p", "prod"))
+	if len(all) != 2 {
+		t.Fatalf("empty plugin active list should activate the env's full set, got %v", all)
+	}
+
+	// The system tier has no enumerable env ledger: an empty list stays empty
+	// (the operator's physically present plugins load as-is), and an explicit
+	// list still narrows.
+	sysSpec := &agentcomposev2.NodeCreateSession{EnvMode: "system"}
+	if got := m.activePluginNames(sysSpec); got != nil {
+		t.Fatalf("system tier with no active list should stay empty, got %v", got)
+	}
+	sysSpec.ActivePlugins = []string{"op-plugin"}
+	if got := m.activePluginNames(sysSpec); len(got) != 1 || got[0] != "op-plugin" {
+		t.Fatalf("system tier explicit subset = %v, want [op-plugin]", got)
+	}
+}

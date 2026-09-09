@@ -109,6 +109,14 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			err := agent.RuntimeUpgrade(ctx, spec, c.Logger(), c.DownloadProxy())
 			c.SendAck(frameID, err, nil)
 		}(payload.RuntimeUpgrade)
+	case *agentcomposev2.NodeDownstreamFrame_InstallHostTool:
+		// A management node can also run Node.js tooling (host shell, ios exec,
+		// etc.), so host-tool install is supported on both roles. Installs are
+		// downloaded to the shared managed-tools dir and placed on PATH at start.
+		go func(spec *agentcomposev2.NodeInstallHostTool) {
+			nodeV, npmV, xcodeV, err := agent.InstallHostTool(ctx, spec, c.Logger(), c.DownloadProxy())
+			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
+		}(payload.InstallHostTool)
 	case *agentcomposev2.NodeDownstreamFrame_TerminalOpen:
 		// A management node with a client can also host a console shell (the
 		// admin operates its host machine directly). env_id (environment

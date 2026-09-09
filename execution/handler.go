@@ -48,6 +48,10 @@ type Handler struct {
 func NewHandler(c *agent.Client, workRoot string, providers []string, docker bool, systemEnvAllowed bool) *Handler {
 	opts := sessionOptions{workRoot: workRoot, providers: providers, docker: docker, systemEnvAllowed: systemEnvAllowed}
 	sessions := newSessionManager(opts, c.Logger(), c.EmitUpstream, c.EmitUpstream, c.EmitUpstream, c.EmitUpstream)
+	// MCP wire specs now carry a relative path; the node resolves it against the
+	// gateway origin the server announced in the hello frame (same host the node
+	// connected to, so the server needs no configured public gateway URL).
+	sessions.gatewayOrigin = c.GatewayOrigin
 	terminals := agent.NewTerminalManager(c.EmitUpstream, c.Logger())
 	terminals.StartReaper()
 	toolruns := agent.NewToolRunManager(c.EmitUpstream, c.Logger())
@@ -148,6 +152,14 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			version, err := manageEditor(ctx, spec)
 			c.SendEditorAck(frameID, err, version)
 		}(payload.ManageEditor)
+	case *agentcomposev2.NodeDownstreamFrame_InstallHostTool:
+		// Install a host-level runtime dependency (currently Node.js). A full
+		// Node.js tarball is ~30 MB; download/extract must not block heartbeats
+		// or session dispatch.
+		go func(spec *agentcomposev2.NodeInstallHostTool) {
+			nodeV, npmV, xcodeV, err := agent.InstallHostTool(ctx, spec, c.Logger(), c.DownloadProxy())
+			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
+		}(payload.InstallHostTool)
 	case *agentcomposev2.NodeDownstreamFrame_ManageEnvironment:
 		// Create/remove a named shared environment directory on this host. Disk
 		// work only (mkdir/remove), so it is cheap, but run it off the dispatch

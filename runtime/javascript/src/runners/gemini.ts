@@ -18,6 +18,13 @@ export class GeminiRunner {
   async writeSettingsFile(): Promise<void> {
     const mcps = this.options.mcpConfig as Record<string, Record<string, unknown>> | undefined;
     const geminiDir = path.join(this.options.home, ".gemini");
+    // system-env sessions share the operator's real HOME; rewriting their
+    // ~/.gemini/settings.json would clobber their own MCP setup. The gemini CLI
+    // reads only that file (no config-env redirect exists), so task-level MCP is
+    // not applicable in system mode — keeping the operator's config intact wins.
+    if (this.options.systemEnv) {
+      return;
+    }
     await fs.mkdir(geminiDir, { recursive: true });
     const settingsPath = path.join(geminiDir, "settings.json");
     let settings: Record<string, unknown> = {};

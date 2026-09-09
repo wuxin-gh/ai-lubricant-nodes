@@ -93,6 +93,15 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			err := agent.RuntimeUpgrade(ctx, spec, c.Logger(), c.DownloadProxy())
 			c.SendAck(frameID, err, nil)
 		}(payload.RuntimeUpgrade)
+	case *agentcomposev2.NodeDownstreamFrame_InstallHostTool:
+		// A macOS iOS host is the project-page build node, so it serves the same
+		// host-tool surface as a management node — notably the xcodebuild
+		// detection the build tab's install guidance drives. Same shape as
+		// management/handler.go; installs share the managed-tools dir.
+		go func(spec *agentcomposev2.NodeInstallHostTool) {
+			nodeV, npmV, xcodeV, err := agent.InstallHostTool(ctx, spec, c.Logger(), c.DownloadProxy())
+			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
+		}(payload.InstallHostTool)
 
 	// ─── iOS device management ───────────────────────────────────────────────
 	case *agentcomposev2.NodeDownstreamFrame_IosDiscover:

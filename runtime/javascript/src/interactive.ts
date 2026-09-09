@@ -1,7 +1,7 @@
 import path from "node:path";
 import process from "node:process";
 import { TurnCancelledError } from "./errors.js";
-import { readMCPConfig } from "./mcp-config.js";
+import { resolveEffectiveMCPConfig } from "./mcp-config.js";
 import { buildPromptRuntimeOptions } from "./prompt.js";
 import { ClaudeRunner } from "./runners/claude.js";
 import { CodexRunner } from "./runners/codex.js";
@@ -22,6 +22,9 @@ export interface InteractiveStartOptions {
   mode?: string;
   outputSchemaFile?: string;
   sessionScope?: string;
+  skills?: string[];
+  plugins?: string[];
+  systemEnv?: boolean;
 }
 
 export type EmitInteractiveFrame = (type: string, fields?: object) => void;
@@ -301,12 +304,12 @@ export class PromptRunnerSession implements InteractiveSession {
     if (snapshot?.mode !== undefined) this.currentMode = snapshot.mode;
     if (snapshot?.llm !== undefined) this.currentLlm = snapshot.llm;
 
-    const mcpConfig = await readMCPConfig(this.baseOptions.stateRoot);
+    const mcpConfig = await resolveEffectiveMCPConfig(this.baseOptions.stateRoot, this.baseOptions.provider, this.baseOptions.systemEnv === true, this.baseOptions.home);
     const options: RunnerOptions = {
       ...this.baseOptions,
       model: model || this.baseOptions.model,
       mode: mode || this.baseOptions.mode,
-      mcpConfig: mcpConfig.mcps,
+      mcpConfig,
       emit: this.emit,
     };
     if (llm) {

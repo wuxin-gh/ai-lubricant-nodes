@@ -126,6 +126,13 @@ func cmdRun(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// iOS 17+ devices only launch WDA through a CoreDevice RSD tunnel; embed
+	// go-ios's tunnel manager so the host needs no separate `ios tunnel start`
+	// process. Degraded start (port conflict, unwritable state dir) only
+	// affects 17+ phones — iOS ≤16 keeps working.
+	tunnels := startTunnelAgent(ctx, logger, stateDir(path))
+	defer tunnels.Close()
+
 	var wg sync.WaitGroup
 
 	// NodeConnect control plane (identity / heartbeat / version / self-upgrade /

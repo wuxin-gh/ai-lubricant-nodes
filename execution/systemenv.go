@@ -125,23 +125,38 @@ func saveSystemEnvManifest(home string, manifest *systemEnvManifest) error {
 	return nil
 }
 
-// systemEnvScanTarget is one directory a provider scans for resources.
+// systemEnvScanTarget is one directory a provider scans for resources. readers
+// is the set of editors whose runtime would LOAD a resource found here — the
+// tab-attribution fact reported to the console (provider only names which
+// directory the entry was found under, which is not the same question).
 type systemEnvScanTarget struct {
 	kind     string
 	provider string
 	rel      []string
+	readers  []string
 }
 
+// Editors referenced by readers, in the fixed order the console shows tabs in.
+const (
+	editorClaude    = "claude"
+	editorCodex     = "codex"
+	editorGemini    = "gemini"
+	editorOpencode  = "opencode"
+)
+
 // systemEnvScanTargets enumerates every discovery path a provider actually reads.
-// Keep in sync with runtimeSkillsDir / runtimePluginsDir in editorconfig.go — if
-// those move, a system-env session's resources move with them and this scan must
-// follow, or the console would report an inventory the editor doesn't use.
+// Keep the paths in sync with runtimeSkillsDir / runtimePluginsDir in
+// editorconfig.go — if those move, a system-env session's resources move with
+// them and this scan must follow, or the console would report an inventory the
+// editor doesn't use. Keep readers in sync too: claude loads skills only from
+// .claude/skills, every other runner loads them from .agents/skills; plugins
+// load from .agents/plugins except gemini, which discovers .gemini/extensions.
 func systemEnvScanTargets(provider string) []systemEnvScanTarget {
 	all := []systemEnvScanTarget{
-		{kind: systemEnvKindSkill, provider: "claude", rel: []string{".claude", "skills"}},
-		{kind: systemEnvKindSkill, provider: "", rel: []string{".agents", "skills"}},
-		{kind: systemEnvKindPlugin, provider: "", rel: []string{".agents", "plugins"}},
-		{kind: systemEnvKindPlugin, provider: "gemini", rel: []string{".gemini", "extensions"}},
+		{kind: systemEnvKindSkill, provider: "claude", rel: []string{".claude", "skills"}, readers: []string{editorClaude}},
+		{kind: systemEnvKindSkill, provider: "", rel: []string{".agents", "skills"}, readers: []string{editorCodex, editorGemini, editorOpencode}},
+		{kind: systemEnvKindPlugin, provider: "", rel: []string{".agents", "plugins"}, readers: []string{editorClaude, editorCodex, editorOpencode}},
+		{kind: systemEnvKindPlugin, provider: "gemini", rel: []string{".gemini", "extensions"}, readers: []string{editorGemini}},
 	}
 	want := normalizeProvider(strings.TrimSpace(provider))
 	if want == "" {
@@ -149,8 +164,8 @@ func systemEnvScanTargets(provider string) []systemEnvScanTarget {
 	}
 	var out []systemEnvScanTarget
 	for _, target := range all {
-		// The provider-neutral .agents tree is read by every non-claude runner, so
-		// it stays in scope for any provider filter.
+		// The .agents tree is read by non-claude runners (and claude's plugins),
+		// so it stays in scope for any provider filter.
 		if target.provider == "" || target.provider == want {
 			out = append(out, target)
 		}
@@ -158,30 +173,196 @@ func systemEnvScanTargets(provider string) []systemEnvScanTarget {
 	return out
 }
 
-// systemEnvMCPNames reads the MCP server names out of the operator's claude MCP
-// config. MCP is config rather than files, so it is reported for visibility only
-// — nothing here installs or removes it (writing it would leak per-task tokens
-// into the operator's home).
-func systemEnvMCPNames(home string) ([]string, string) {
-	path := filepath.Join(home, ".mcp.json")
+// systemEnvMCPSource is one MCP server observed in one of the operator's editor
+// config files. MCP is config rather than files, so it is reported for visibility
+// only — nothing here installs or removes it (writing it would leak per-task
+// tokens into the operator's home). readers is the editor set that would load it.
+type systemEnvMCPSource struct {
+	name     string
+	provider string   // editor whose config declared it ("" never happens: every source file has an owner)
+	readers  []string // editors that would load this server
+	path     string   // HOME-relative config file, so the console can name the source
+}
+
+// systemEnvMCPSources sweeps every config file an editor actually reads MCP
+// servers from. ~/.mcp.json alone was never the whole story: `claude mcp add`
+// writes ~/.claude.json (top-level mcpServers), gemini keeps its own
+// ~/.gemini/settings.json, codex uses TOML tables in ~/.codex/config.toml, and
+// opencode reads ~/.config/opencode/opencode.json — whose MCP map is under the
+// top-level `mcp` key rather than `mcpServers`. ~/.mcp.json is claude's
+// project-level config (a system-env session runs with cwd=HOME, so that IS the
+// project root claude reads) — hence provider "claude", not a shared bucket.
+func systemEnvMCPSources(home string) []systemEnvMCPSource {
+	fromJSON := func(path, provider, rel, field string) []systemEnvMCPSource {
+		var out []systemEnvMCPSource
+		for _, name := range readJSONMapKeys(path, field) {
+			out = append(out, systemEnvMCPSource{name: name, provider: provider, readers: []string{provider}, path: rel})
+		}
+		return out
+	}
+	var out []systemEnvMCPSource
+	out = append(out, fromJSON(filepath.Join(home, ".claude.json"), editorClaude, ".claude.json", "mcpServers")...)
+	out = append(out, fromJSON(filepath.Join(home, ".gemini", "settings.json"), editorGemini, ".gemini/settings.json", "mcpServers")...)
+	for _, name := range readCodexMCPServers(filepath.Join(home, ".codex", "config.toml")) {
+		out = append(out, systemEnvMCPSource{name: name, provider: editorCodex, readers: []string{editorCodex}, path: ".codex/config.toml"})
+	}
+	out = append(out, fromJSON(filepath.Join(home, ".config", "opencode", "opencode.json"), editorOpencode, ".config/opencode/opencode.json", "mcp")...)
+	out = append(out, fromJSON(filepath.Join(home, ".mcp.json"), editorClaude, ".mcp.json", "mcpServers")...)
+	return out
+}
+
+// readJSONMapKeys returns the sorted keys of a top-level object field, for
+// config shapes like {"mcpServers": {"name": {...}}}.
+func readJSONMapKeys(path, field string) []string {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, ""
+		return nil
 	}
-	var doc struct {
-		MCPServers map[string]json.RawMessage `json:"mcpServers"`
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
 	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, ""
+	var inner map[string]json.RawMessage
+	if json.Unmarshal(doc[field], &inner) != nil {
+		return nil
 	}
-	names := make([]string, 0, len(doc.MCPServers))
-	for name := range doc.MCPServers {
+	names := make([]string, 0, len(inner))
+	for name := range inner {
 		if trimmed := strings.TrimSpace(name); trimmed != "" {
 			names = append(names, trimmed)
 		}
 	}
 	sort.Strings(names)
-	return names, ".mcp.json"
+	return names
+}
+
+// readCodexMCPServers lists MCP server names from ~/.codex/config.toml by
+// scanning `[mcp_servers.<name>]` table headers. The Go stdlib has no TOML
+// parser, and a header line is unambiguous — values never contain `]` in codex
+// server names — so pulling in a dependency to list names is not justified.
+func readCodexMCPServers(path string) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[mcp_servers.") || !strings.HasSuffix(line, "]") {
+			continue
+		}
+		name := strings.TrimSpace(line[len("[mcp_servers.") : len(line)-1])
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// systemEnvClaudePlugins enumerates plugins installed through claude's own
+// marketplace system under ~/.claude/plugins. That tree is separate from the
+// provider-neutral .agents/plugins directory, so without this sweep the console
+// shows no plugins at all for an operator who only ever used `claude plugin`.
+// installed_plugins.json maps "<name>@<marketplace>" to per-scope install
+// records; the same plugin name from two marketplaces is two installs and is
+// reported twice, keyed (and deduped) by the full name@marketplace string.
+func systemEnvClaudePlugins(home string) []*agentcomposev2.NodeSystemEnvEntry {
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", "plugins", "installed_plugins.json"))
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Plugins map[string][]struct {
+			InstallPath string `json:"installPath"`
+			Version     string `json:"version"`
+		} `json:"plugins"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+	base := filepath.Join(home, ".claude", "plugins")
+	var out []*agentcomposev2.NodeSystemEnvEntry
+	seen := map[string]bool{}
+	for key, scopes := range doc.Plugins {
+		if len(scopes) == 0 || seen[key] {
+			continue
+		}
+		seen[key] = true
+		// The entry's Name is the full "<name>@<marketplace>" key. Claude lets
+		// the same plugin name be installed from two marketplaces as two real
+		// installs, and the server table is unique on (node, kind, name) — the
+		// composite key keeps both rows and is exactly what the archive lookup
+		// needs to find the install again.
+		name := strings.TrimSpace(key)
+		if name == "" {
+			continue
+		}
+		record := scopes[0]
+		installPath := strings.TrimSpace(record.InstallPath)
+		if installPath == "" {
+			continue
+		}
+		if !filepath.IsAbs(installPath) {
+			installPath = filepath.Join(base, installPath)
+		}
+		// The manifest at the install path is the canonical name/version/
+		// description; the ledger's own version is the fallback (some manifests
+		// omit it and claude records the git sha instead).
+		version, description := readResourceMeta(installPath)
+		if version == "" {
+			version = strings.TrimSpace(record.Version)
+		}
+		relPath := filepath.ToSlash(strings.TrimPrefix(installPath, home+string(os.PathSeparator)))
+		out = append(out, &agentcomposev2.NodeSystemEnvEntry{
+			Kind:            systemEnvKindPlugin,
+			Name:            name,
+			Version:         version,
+			Provider:        "claude",
+			Path:            relPath,
+			PlatformManaged: false,
+			Description:     description,
+			Readers:         []string{editorClaude},
+		})
+	}
+	return out
+}
+
+// claudePluginInstallPath resolves a "<name>@<marketplace>" inventory name back
+// to its install directory via the claude plugin ledger. Best-effort: an empty
+// return means "not a claude-marketplace plugin (or the ledger moved)" and the
+// caller falls back to the discovery-path lookup.
+func claudePluginInstallPath(home, key string) string {
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", "plugins", "installed_plugins.json"))
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		Plugins map[string][]struct {
+			InstallPath string `json:"installPath"`
+		} `json:"plugins"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return ""
+	}
+	scopes, ok := doc.Plugins[strings.TrimSpace(key)]
+	if !ok || len(scopes) == 0 {
+		return ""
+	}
+	installPath := strings.TrimSpace(scopes[0].InstallPath)
+	if installPath == "" {
+		return ""
+	}
+	if !filepath.IsAbs(installPath) {
+		installPath = filepath.Join(home, ".claude", "plugins", installPath)
+	}
+	if info, statErr := os.Stat(installPath); statErr != nil || !info.IsDir() {
+		return ""
+	}
+	return installPath
 }
 
 // inspectSystemEnv enumerates what the providers would discover in the operator's
@@ -195,7 +376,7 @@ func (m *sessionManager) inspectSystemEnv(frame *agentcomposev2.NodeInspectSyste
 	manifest := loadSystemEnvManifest(home)
 
 	var out []*agentcomposev2.NodeSystemEnvEntry
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for _, target := range systemEnvScanTargets(frame.GetProvider()) {
 		dir := filepath.Join(append([]string{home}, target.rel...)...)
 		entries, err := os.ReadDir(dir)
@@ -210,39 +391,84 @@ func (m *sessionManager) inspectSystemEnv(frame *agentcomposev2.NodeInspectSyste
 				continue
 			}
 			name := entry.Name()
-			// One resource can appear under two providers' paths (a skill mirrored
-			// into both .claude/skills and .agents/skills). Report it once: the
-			// console shows capability, not filesystem layout.
+			// One resource can live under two discovery paths (a platform skill is
+			// mirrored into both .claude/skills and .agents/skills). Report it once:
+			// the console shows capability, not filesystem layout. The readers of
+			// every path it was found under merge, so the merged entry lands in
+			// every editor tab whose runtime loads it; provider/path stay the first
+			// discovery location so they always agree with each other.
 			key := systemEnvManifestKey(target.kind, name)
-			if seen[key] {
+			if idx, ok := seen[key]; ok {
+				existing := out[idx]
+				existing.Readers = mergeStrings(existing.GetReaders(), target.readers)
 				continue
 			}
-			seen[key] = true
+			seen[key] = len(out)
 			_, managed := manifest.Entries[key]
+			version, description := readResourceMeta(filepath.Join(dir, name))
 			out = append(out, &agentcomposev2.NodeSystemEnvEntry{
 				Kind:            target.kind,
 				Name:            name,
-				Version:         readResourceVersion(filepath.Join(dir, name)),
+				Version:         version,
 				Provider:        target.provider,
 				Path:            filepath.ToSlash(filepath.Join(append(append([]string{}, target.rel...), name)...)),
 				PlatformManaged: managed,
+				Description:     description,
+				Readers:         append([]string{}, target.readers...),
 			})
 		}
 	}
 
-	if names, rel := systemEnvMCPNames(home); rel != "" {
-		for _, name := range names {
-			out = append(out, &agentcomposev2.NodeSystemEnvEntry{
-				Kind: systemEnvKindMCP,
-				Name: name,
-				Path: rel,
-				// MCP is never platform-installed here: we deliberately do not write
-				// the operator's MCP config, so every entry is theirs.
-				PlatformManaged: false,
-			})
+	// claude marketplace plugins live in their own tree, outside every scan
+	// target above; sweep them separately so the console finally sees plugins.
+	// They dedupe internally by name@marketplace, so the same plugin name from
+	// two marketplaces stays two rows.
+	out = append(out, systemEnvClaudePlugins(home)...)
+
+	// MCP from every editor config, not just one. A server configured in two of
+	// the same editor's files (.claude.json + .mcp.json) collapses to one row;
+	// the same name under different editors stays separate — different runtimes
+	// would load different definitions.
+	seenMCP := map[string]bool{}
+	for _, src := range systemEnvMCPSources(home) {
+		key := src.provider + "/" + src.name
+		if seenMCP[key] {
+			continue
 		}
+		seenMCP[key] = true
+		out = append(out, &agentcomposev2.NodeSystemEnvEntry{
+			Kind:     systemEnvKindMCP,
+			Name:     src.name,
+			Provider: src.provider,
+			Path:     src.path,
+			Readers:  append([]string{}, src.readers...),
+			// MCP is never platform-installed here: we deliberately do not write
+			// the operator's MCP config, so every entry is theirs.
+			PlatformManaged: false,
+		})
 	}
 	return out, nil
+}
+
+// mergeStrings unions two string slices preserving first-slice order, then any
+// new second-slice values. Readers stay in a stable order for display; an empty
+// union returns nil so the proto field stays unset rather than empty.
+func mergeStrings(base, extra []string) []string {
+	seen := map[string]bool{}
+	for _, v := range base {
+		seen[v] = true
+	}
+	out := append([]string{}, base...)
+	for _, v := range extra {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // systemEnvInstallDirs is where we PUT a resource we install. Deliberately the
@@ -260,6 +486,21 @@ func systemEnvInstallDirs(home, kind string) []string {
 		}
 	case systemEnvKindPlugin:
 		return []string{filepath.Join(home, ".agents", "plugins")}
+	default:
+		return nil
+	}
+}
+
+// systemEnvKindReaders is the reader set of a freshly written resource: the
+// union over every discovery path systemEnvInstallDirs lays it down in (skills
+// land in .agents/skills and are mirrored to .claude/skills, so all four
+// runtimes load them).
+func systemEnvKindReaders(kind string) []string {
+	switch kind {
+	case systemEnvKindSkill:
+		return []string{editorClaude, editorCodex, editorGemini, editorOpencode}
+	case systemEnvKindPlugin:
+		return []string{editorClaude, editorCodex, editorOpencode}
 	default:
 		return nil
 	}
@@ -309,6 +550,7 @@ func (m *sessionManager) syncSystemEnv(ctx context.Context, frame *agentcomposev
 				Kind: kind, Name: name, Path: "skipped",
 				Version:         readResourceVersion(existing),
 				PlatformManaged: managed,
+				Readers:         systemEnvKindReaders(kind),
 			})
 			return nil
 		}
@@ -339,6 +581,7 @@ func (m *sessionManager) syncSystemEnv(ctx context.Context, frame *agentcomposev
 			Kind: kind, Name: name, Path: "installed",
 			Version:         readResourceVersion(primary),
 			PlatformManaged: true,
+			Readers:         systemEnvKindReaders(kind),
 		})
 		return nil
 	}
@@ -383,6 +626,7 @@ func (m *sessionManager) syncSystemEnv(ctx context.Context, frame *agentcomposev
 		delete(manifest.Entries, key)
 		touched = append(touched, &agentcomposev2.NodeSystemEnvEntry{
 			Kind: kind, Name: name, Path: "removed", PlatformManaged: false,
+			Readers: systemEnvKindReaders(kind),
 		})
 	}
 
@@ -460,6 +704,11 @@ func (m *sessionManager) archiveSystemEnvResource(ctx context.Context, frame *ag
 			src = candidate
 			break
 		}
+	}
+	// claude marketplace plugins are named "<name>@<marketplace>" and live outside
+	// every scan target; resolve them through the install ledger instead.
+	if src == "" && kind == systemEnvKindPlugin && strings.Contains(name, "@") {
+		src = claudePluginInstallPath(home, name)
 	}
 	if src == "" {
 		return fmt.Errorf("archive system env: %s %q not found in the operator home", kind, name)

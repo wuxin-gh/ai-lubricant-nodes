@@ -24,6 +24,12 @@ export class OpenCodeRunner {
     if (!mcps || Object.keys(mcps).length === 0) {
       return;
     }
+    // system-env sessions share the operator's real HOME. The runtime stateRoot
+    // carries the task MCP, so never rewrite the operator's native config here;
+    // it rides the per-run temp config in writeRuntimeConfig instead.
+    if (this.options.systemEnv) {
+      return;
+    }
     const configPath = process.env.OPENCODE_CONFIG || path.join(this.options.home, ".config", "opencode", "opencode.json");
     await fs.mkdir(path.dirname(configPath), { recursive: true });
     let config: Record<string, unknown> = {};
@@ -32,23 +38,7 @@ export class OpenCodeRunner {
     } catch {
       config = {};
     }
-    const mcp: Record<string, unknown> = {};
-    for (const [name, server] of Object.entries(mcps)) {
-      if (server.type === "local") {
-        mcp[name] = {
-          type: "local",
-          command: [server.command, ...(Array.isArray(server.args) ? server.args : [])],
-          environment: flattenEnvMap(server.env as Record<string, { value: string }> | undefined),
-        };
-      } else if (server.type === "remote") {
-        mcp[name] = {
-          type: "remote",
-          url: server.url,
-          headers: flattenEnvMap(server.headers as Record<string, { value: string }> | undefined),
-        };
-      }
-    }
-    config.mcp = mcp;
+    config.mcp = this.toOpenCodeMcp(mcps);
     await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
   }
 
@@ -82,11 +72,13 @@ export class OpenCodeRunner {
       OPENCODE_DISABLE_MODELS_FETCH: process.env.OPENCODE_DISABLE_MODELS_FETCH || "1",
     };
     const hasSkills = Boolean(this.options.skills && this.options.skills.length > 0);
-    const localPlugins = await discoverOpenCodePlugins(this.options.home);
-    // Only rewrite config when there is something to add — skills.paths or a
-    // local plugin package. Sessions with neither stay on the untouched base
-    // config, exactly as before.
-    if (hasSkills || localPlugins.length > 0) {
+    const localPlugins = await discoverOpenCodePlugins(this.options.home, this.options.plugins);
+    const hasMcp = Boolean(this.options.mcpConfig && Object.keys(this.options.mcpConfig).length > 0);
+    // Only rewrite config when there is something to add — skills.paths, a
+    // local plugin package, or (system-env only) task MCP that must NOT land in
+    // the operator's own opencode.json. Sessions with neither stay on the
+    // untouched base config, exactly as before.
+    if (hasSkills || localPlugins.length > 0 || (this.options.systemEnv && hasMcp)) {
       const configPath = await this.writeRuntimeConfig(
         this.baseConfigPath(process.env.OPENCODE_CONFIG),
         hasSkills,
@@ -131,8 +123,39 @@ export class OpenCodeRunner {
         : [];
       config.plugin = uniqueStrings([...existingPlugins, ...localPlugins]);
     }
+    // system-env only: the task's MCP (already merged with the operator's own
+    // servers by resolveEffectiveMCPConfig) rides this per-run temp config —
+    // writeMCPConfig never touched the operator's native opencode.json. The temp
+    // config is derived FROM the base config, so the operator's other mcp
+    // entries are preserved under the merged set.
+    if (this.options.systemEnv) {
+      const mcps = this.options.mcpConfig as Record<string, Record<string, unknown>> | undefined;
+      if (mcps && Object.keys(mcps).length > 0) {
+        config.mcp = this.toOpenCodeMcp(mcps);
+      }
+    }
     await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
     return configPath;
+  }
+
+  toOpenCodeMcp(mcps: Record<string, Record<string, unknown>>): Record<string, unknown> {
+    const mcp: Record<string, unknown> = {};
+    for (const [name, server] of Object.entries(mcps)) {
+      if (server.type === "local") {
+        mcp[name] = {
+          type: "local",
+          command: [server.command, ...(Array.isArray(server.args) ? server.args : [])],
+          environment: flattenEnvMap(server.env as Record<string, { value: string }> | undefined),
+        };
+      } else if (server.type === "remote") {
+        mcp[name] = {
+          type: "remote",
+          url: server.url,
+          headers: flattenEnvMap(server.headers as Record<string, { value: string }> | undefined),
+        };
+      }
+    }
+    return mcp;
   }
 
   async cleanupSkillsConfig(): Promise<void> {
@@ -311,8 +334,12 @@ function uniqueStrings(values: string[]): string[] {
  * package.json registers its skills/commands through OpenCode's plugin manager
  * (see obra/superpowers .opencode/INSTALL.md). Returns absolute paths; a missing
  * dir yields an empty list.
+ *
+ * activePlugins narrows the result: a non-empty list means only those package
+ * names load this run (the env-tier activation subset); empty/undefined keeps
+ * the historic "load everything present" behaviour.
  */
-async function discoverOpenCodePlugins(home: string): Promise<string[]> {
+async function discoverOpenCodePlugins(home: string, activePlugins?: string[]): Promise<string[]> {
   const root = path.join(home, ".agents", "plugins");
   let entries: string[];
   try {
@@ -320,8 +347,14 @@ async function discoverOpenCodePlugins(home: string): Promise<string[]> {
   } catch {
     return [];
   }
+  const wanted = activePlugins && activePlugins.length > 0
+    ? new Set(activePlugins.map((name) => name.trim()).filter(Boolean))
+    : null;
   const plugins: string[] = [];
   for (const entry of entries) {
+    if (wanted && !wanted.has(entry.trim())) {
+      continue;
+    }
     const dir = path.join(root, entry);
     try {
       if (!statSync(dir).isDirectory()) continue;

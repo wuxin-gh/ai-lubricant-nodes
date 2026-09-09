@@ -73,7 +73,7 @@ func (e *localExecutor) start(ctx context.Context, session *nodeSession) (*execu
 	session.mu.Lock()
 	mode := session.mode
 	session.mu.Unlock()
-	args := promptArgs(session.provider, session.spec.GetModel(), mode, stateRoot, session.workDir, home, e.mgr.activeSkillNames(session.spec))
+	args := promptArgs(session.provider, session.spec.GetModel(), mode, stateRoot, session.workDir, home, e.mgr.activeSkillNames(session.spec), e.mgr.activePluginNames(session.spec), isSystemEnv(session.spec))
 	cmd, err := agent.RuntimeCommand(ctx, args...)
 	if err != nil {
 		return nil, err

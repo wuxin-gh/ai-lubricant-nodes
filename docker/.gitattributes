@@ -1,0 +1,6 @@
+# These artifacts are served by the control service and consumed by `docker
+# build` on a Linux host: a CRLF shebang (`#!/bin/sh\r`) makes exec fail in
+# the container with "No such file or directory". Force LF on every checkout,
+# Windows autocrlf included (the server also normalizes at serve time, but the
+# source tree must not regress either).
+* text eol=lf

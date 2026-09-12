@@ -152,3 +152,59 @@ export function flattenEnvMap(values?: Record<string, RuntimeMCPEnvVar>): Record
   }
   return Object.fromEntries(entries);
 }
+
+// ── skill/plugin activation list ──────────────────────────────────────────────
+
+const activationConfigRelativePath = path.join("agents", "activation.json");
+
+export type RuntimeActivationConfig = {
+  skills: string[];
+  plugins: string[];
+};
+
+/**
+ * Read the task's skill/plugin activation list from
+ * stateRoot/agents/activation.json. The node writes it from applySkills /
+ * applyPlugins in system mode (where installing files is forbidden — the
+ * operator's HOME is shared, so selection is the only channel), and the
+ * interactive runtime re-reads it every turn: the same stateRoot-file
+ * hot-switch channel the MCP config uses above.
+ *
+ * Both arrays default to empty. A missing file (nothing was ever narrowed) and
+ * an unparsable file (torn write) both yield the empty list — with a warning
+ * for the latter — so a bad file can never narrow a session on its own.
+ *
+ * Empty-array semantics, platform rule: an empty list is the platform's "no
+ * selection" encoding and means "no narrowing = full set", NEVER "activate
+ * nothing". Every runner gates on length > 0, so [] and undefined are
+ * identical downstream and an empty list can never zero a session out — see
+ * optionsForTurn in interactive.ts for how the overlay consumes this.
+ */
+export async function readRuntimeActivationConfig(stateRoot: string): Promise<RuntimeActivationConfig> {
+  const configPath = path.join(stateRoot, activationConfigRelativePath);
+  let raw: string;
+  try {
+    raw = await fs.readFile(configPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { skills: [], plugins: [] };
+    }
+    console.warn(`[activation] failed to read ${configPath}:`, error);
+    return { skills: [], plugins: [] };
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<RuntimeActivationConfig>;
+    return {
+      skills: toStringArray(parsed?.skills),
+      plugins: toStringArray(parsed?.plugins),
+    };
+  } catch (error) {
+    console.warn(`[activation] failed to parse ${configPath}:`, error);
+    return { skills: [], plugins: [] };
+  }
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}

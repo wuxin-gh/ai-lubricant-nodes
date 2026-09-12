@@ -29,12 +29,15 @@ type Handler struct {
 	jobs    *WdaJobManager
 	// builds may be nil (build runner not wired); HandleBuildFrame is nil-safe.
 	builds *build.Runner
+	// xcode may be nil; HandleHostToolJobFrame is nil-safe.
+	xcode *agent.XcodeJobRunner
 }
 
 // NewHandler builds the iOS host downstream handler. manager may be nil (pure
-// device mode); the iOS management frames then error-ack. builds may be nil.
-func NewHandler(c *agent.Client, manager *DeviceManager, jobs *WdaJobManager, builds *build.Runner) *Handler {
-	return &Handler{logger: c.Logger(), manager: manager, jobs: jobs, builds: builds}
+// device mode); the iOS management frames then error-ack. builds and xcode may
+// be nil.
+func NewHandler(c *agent.Client, manager *DeviceManager, jobs *WdaJobManager, builds *build.Runner, xcode *agent.XcodeJobRunner) *Handler {
+	return &Handler{logger: c.Logger(), manager: manager, jobs: jobs, builds: builds, xcode: xcode}
 }
 
 // ActiveSessionIDs implements agent.DownstreamHandler: an iOS host runs no
@@ -67,6 +70,9 @@ var errNoManager = errors.New("iOS device management is not enabled on this host
 func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agentcomposev2.NodeDownstreamFrame) {
 	frameID := frame.GetServerFrameId()
 	if h.builds.HandleBuildFrame(ctx, c, frame) {
+		return
+	}
+	if h.xcode.HandleHostToolJobFrame(ctx, c, frame) {
 		return
 	}
 	switch payload := frame.GetFrame().(type) {

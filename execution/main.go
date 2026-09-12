@@ -32,6 +32,11 @@ import (
 var buildVersion = "dev"
 
 func main() {
+	// The "service" subcommand is the click-to-manage desktop entry: pop the
+	// start/stop/restart dialog and exit. It never reads credentials.
+	if len(os.Args) > 1 && os.Args[1] == "service" {
+		os.Exit(agent.ServiceMenu())
+	}
 	opts, workRoot, instance, systemEnvAllowed, err := parseFlags(os.Args[1:])
 	if err != nil {
 		if errors.Is(err, agent.ErrInstallCancelled) {
@@ -108,6 +113,12 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 		// credentials) to any task the node runs, and a container's HOME is the
 		// image's, not the operator's. on/off force it either way.
 		allowSystemEnv = fs.String("allow-system-env", agent.EnvOr("AGENT_COMPOSE_NODE_ALLOW_SYSTEM_ENV", "auto"), "allow sessions to run against this node's real user HOME (env_mode=system): auto|on|off (auto = on for a host install, off inside a container) (env AGENT_COMPOSE_NODE_ALLOW_SYSTEM_ENV)")
+		// autostart asks once whether to install a per-user login entry
+		// (launchd / systemd user / schtasks ONLOGON). auto prompts on an
+		// interactive host when no entry exists and no answer is recorded;
+		// on/off force it (the install script's silent paths pass an explicit
+		// value). Managed children and containers never install autostart.
+		autostartFlag = fs.String("autostart", agent.EnvOr("AGENT_COMPOSE_NODE_AUTOSTART", "auto"), "configure per-user login autostart: auto|on|off (auto = ask once on an interactive host) (env AGENT_COMPOSE_NODE_AUTOSTART)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return agent.Options{}, "", nil, false, err
@@ -120,12 +131,15 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 	}
 
 	// A managed child (launched by a management node) runs straight from its
-	// flags/env: no host lock, no persisted config. The manual single-instance
-	// rule applies only to nodes an operator installs directly on a machine.
+	// flags/env: no host lock, no persisted config, and never installs
+	// login autostart (the parent owns its lifecycle). The manual
+	// single-instance rule applies only to nodes an operator installs
+	// directly on a machine.
 	if *managed {
 		if strings.TrimSpace(*server) == "" || strings.TrimSpace(*nodeID) == "" || strings.TrimSpace(*secret) == "" {
 			return agent.Options{}, "", nil, false, fmt.Errorf("--server, --node-id and --secret are required")
 		}
+		_, _ = agent.ResolveAutostart("off", agent.InstallOptions{})
 		providerList := agent.SplitAndTrim(*providers)
 		if len(providerList) == 0 {
 			providerList = detectProviders()
@@ -188,6 +202,14 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 	if *installOnly {
 		instance.Close()
 		return agent.Options{}, "", nil, false, agent.ErrInstallComplete
+	}
+
+	// Resolve autostart after the lock (a busy host never prompts) but before
+	// the client dials, so the startup_method label reflects the final state
+	// at registration. --install-only exits above and never prompts.
+	if _, err := agent.ResolveAutostart(*autostartFlag, agent.InstallOptions{}); err != nil {
+		instance.Close()
+		return agent.Options{}, "", nil, false, err
 	}
 
 	providerList := agent.SplitAndTrim(cfg.Providers)

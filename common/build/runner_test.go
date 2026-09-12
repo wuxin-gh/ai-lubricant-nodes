@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-lubricant-nodes/common/agent"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
 
@@ -133,14 +134,13 @@ func runAndWait(t *testing.T, r *Runner, req *agentcomposev2.NodeBuildRequest, e
 
 func TestRunnerHappyPath(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 
 	// The exec script: clone succeeds, checkout succeeds, one build step
 	// succeeds. The step must also plant the artifact on disk because globOne
 	// stats a real file (workDir is a real temp dir, srcDir is real too).
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{}
-	se.script["git checkout v1.0.0"] = scriptEntry{}
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{}
 	se.script["sh -c xcodebuild build-for-testing -project WDA.xcodeproj"] = scriptEntry{out: []byte("xcodebuild: build succeeded\n")}
 	// Plant the artifact: the fake sh step cannot write files, so intercept at
 	// the glob — plant it from a pre-step by making clone the writer is not
@@ -209,9 +209,9 @@ func TestRunnerHappyPath(t *testing.T) {
 
 func TestRunnerCloneFails(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{
 		out: []byte("fatal: repository not found"),
 		err: errors.New("exit status 128"),
 	}
@@ -238,10 +238,9 @@ func TestRunnerCloneFails(t *testing.T) {
 
 func TestRunnerStepFailsRedactsSecrets(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{}
-	se.script["git checkout v1.0.0"] = scriptEntry{}
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{}
 	se.script["sh -c xcodebuild build-for-testing -project WDA.xcodeproj"] = scriptEntry{
 		out: []byte("error: -----BEGIN RSA PRIVATE KEY-----\nMIIEpA never mind\nbuild failed"),
 		err: errors.New("exit status 65"),
@@ -268,10 +267,9 @@ func TestRunnerStepFailsRedactsSecrets(t *testing.T) {
 
 func TestRunnerArtifactGlobNoMatch(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{}
-	se.script["git checkout v1.0.0"] = scriptEntry{}
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{}
 	se.script["sh -c xcodebuild build-for-testing -project WDA.xcodeproj"] = scriptEntry{}
 	r.execFn = se.call
 
@@ -288,10 +286,9 @@ func TestRunnerArtifactGlobNoMatch(t *testing.T) {
 
 func TestRunnerUploadFailsRetryable(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{}
-	se.script["git checkout v1.0.0"] = scriptEntry{}
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{}
 	se.script["sh -c xcodebuild build-for-testing -project WDA.xcodeproj"] = scriptEntry{}
 	r.execFn = func(ctx context.Context, dir, name string, args []string) ([]byte, error) {
 		if name == "sh" {
@@ -327,7 +324,7 @@ func TestRunnerUploadFailsRetryable(t *testing.T) {
 }
 
 func TestRunnerCancelUnknownBuildIsNoop(t *testing.T) {
-	r := NewRunner(func(*agentcomposev2.NodeUpstreamFrame) error { return nil }, fakeRunnerLogger{})
+	r := NewRunner(func(*agentcomposev2.NodeUpstreamFrame) error { return nil }, fakeRunnerLogger{}, nil)
 	if err := r.Cancel("nope"); err != nil {
 		t.Fatalf("cancel of unknown build: %v", err)
 	}
@@ -335,7 +332,7 @@ func TestRunnerCancelUnknownBuildIsNoop(t *testing.T) {
 }
 
 func TestRunnerStartValidation(t *testing.T) {
-	r := NewRunner(func(*agentcomposev2.NodeUpstreamFrame) error { return nil }, fakeRunnerLogger{})
+	r := NewRunner(func(*agentcomposev2.NodeUpstreamFrame) error { return nil }, fakeRunnerLogger{}, nil)
 	cases := []*agentcomposev2.NodeBuildRequest{
 		{},                             // no build id
 		{BuildId: "x"},                 // no source
@@ -351,12 +348,12 @@ func TestRunnerStartValidation(t *testing.T) {
 
 func TestRunnerStartIdempotent(t *testing.T) {
 	em := &captureEmitter{}
-	r := NewRunner(em.emit, fakeRunnerLogger{})
+	r := NewRunner(em.emit, fakeRunnerLogger{}, nil)
 	// Block the first build forever at clone; a second Start with the same id
 	// must return nil without registering a second pipeline.
 	block := make(chan struct{})
 	se := &scriptExec{script: map[string]scriptEntry{}}
-	se.script["git clone --depth 1 https://example.invalid/wda.git src"] = scriptEntry{}
+	se.script["git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"] = scriptEntry{}
 	r.execFn = func(ctx context.Context, dir, name string, args []string) ([]byte, error) {
 		<-block
 		return se.call(ctx, dir, name, args)
@@ -392,12 +389,19 @@ func TestTailBounded(t *testing.T) {
 
 func TestRedactSecrets(t *testing.T) {
 	in := "prefix -----BEGIN PRIVATE KEY-----\nabc\nsuffix"
-	got := redactSecrets(in)
+	got := redactPEM(in)
 	if strings.Contains(got, "abc") {
 		t.Errorf("key body leaked: %q", got)
 	}
 	if !strings.Contains(got, "[redacted key material]") {
 		t.Errorf("redaction marker missing: %q", got)
+	}
+	// git-secret shapes: a clone-URL userinfo and an http.extraHeader value.
+	if got := logTail([]byte("fatal: unable to access 'https://tok@host/repo.git/'")); strings.Contains(got, "tok@") {
+		t.Errorf("clone URL userinfo leaked: %q", got)
+	}
+	if got := logTail([]byte("git -c http.extraHeader=Authorization: Basic dG9rOg== clone")); strings.Contains(got, "dG9rOg") {
+		t.Errorf("extraHeader credential leaked: %q", got)
 	}
 }
 
@@ -436,5 +440,51 @@ func TestSanitizeFileName(t *testing.T) {
 	long := strings.Repeat("z", 100)
 	if got := sanitizeFileName(long); len(got) > 48 {
 		t.Errorf("long id not clamped: %d", len(got))
+	}
+}
+
+// fakeProxyReader is a ProxySpecReader stub: tests inject the egress-proxy
+// snapshot the runner should see, without a real agent.Client.
+type fakeProxyReader struct{ spec agent.ProxySpec }
+
+func (f fakeProxyReader) DownloadProxySpec() agent.ProxySpec { return f.spec }
+
+// proxyReq is happyReq with the egress paths in scope: the runner's clone
+// command is what each proxy test asserts on.
+func newProxyRunner(t *testing.T, spec agent.ProxySpec) (*Runner, *scriptExec, *captureEmitter) {
+	t.Helper()
+	em := &captureEmitter{}
+	r := NewRunner(em.emit, fakeRunnerLogger{}, fakeProxyReader{spec: spec})
+	se := &scriptExec{script: map[string]scriptEntry{}}
+	// Clone succeeds (the artifact/upload path is irrelevant — these tests
+	// only assert the clone argv). Plant no artifact; the build will fail at
+	// artifact_not_found, which is fine for asserting clone args.
+	r.execFn = se.call
+	return r, se, em
+}
+
+func TestRunnerCloneURLPrefixRewritesURL(t *testing.T) {
+	spec := agent.ProxySpec{Mode: "url_prefix", URLPrefix: "https://ghmirror.example"}
+	r, se, em := newProxyRunner(t, spec)
+	se.script["git clone --depth 1 --branch v1.0.0 https://ghmirror.example/https://example.invalid/wda.git src"] = scriptEntry{}
+
+	runAndWait(t, r, happyReq("b-prefix"), em)
+
+	joined := "git clone --depth 1 --branch v1.0.0 https://ghmirror.example/https://example.invalid/wda.git src"
+	if !se.invoked(joined) {
+		t.Errorf("url_prefix mode did not rewrite the clone URL\ninvoked: %v", se.calls)
+	}
+}
+
+func TestRunnerCloneNetworkModeInjectsProxyArgs(t *testing.T) {
+	spec := agent.ProxySpec{Mode: "network", URL: "http://proxy.local:8080"}
+	r, se, em := newProxyRunner(t, spec)
+	joined := "git -c https.proxy=http://proxy.local:8080 -c http.proxy=http://proxy.local:8080 clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"
+	se.script[joined] = scriptEntry{}
+
+	runAndWait(t, r, happyReq("b-network"), em)
+
+	if !se.invoked(joined) {
+		t.Errorf("network mode did not inject -c proxy args\ninvoked: %v", se.calls)
 	}
 }

@@ -56,6 +56,11 @@ func main() {
 		cmdPair(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
+	case "service":
+		// The click-to-manage desktop entry ("Ai Lubricant 节点"): pop the
+		// start/stop/restart dialog for the node process and exit. It never
+		// reads credentials — only the lock owner file and the launcher.
+		os.Exit(agent.ServiceMenu())
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -92,6 +97,7 @@ func usage() {
 func cmdRun(args []string) {
 	fs := newFlagSet("run")
 	configPath := configFlag(fs)
+	autostartFlag := fs.String("autostart", agent.EnvOr("AGENT_COMPOSE_NODE_AUTOSTART", "auto"), "configure per-user login autostart: auto|on|off (auto = ask once on an interactive host) (env AGENT_COMPOSE_NODE_AUTOSTART)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -109,6 +115,13 @@ func cmdRun(args []string) {
 		os.Exit(1)
 	}
 	defer release()
+
+	// Resolve autostart after the lock so a busy host never prompts; the
+	// node-ios host is a manual install, so the one-time ask belongs here.
+	if _, err := agent.ResolveAutostart(*autostartFlag, agent.InstallOptions{}); err != nil {
+		logger.Error("resolve autostart", "error", err)
+		os.Exit(1)
+	}
 
 	cfg, path, err := LoadDevicesConfig(*configPath)
 	if err != nil {
@@ -164,14 +177,19 @@ func cmdRun(args []string) {
 		// lives here). The runner is always wired; the server picks hosts by
 		// the xcodebuild_version capability label, so non-macOS hosts simply
 		// never receive a build frame.
-		builds := build.NewRunner(client.EmitUpstream, logger)
+		builds := build.NewRunner(client.EmitUpstream, logger, client)
+		// The async Xcode installer (xcodereleases .xip → /Applications): the
+		// sync InstallHostTool "xcode" entry stays as the detection-only path,
+		// installs run here where the hours-long pipeline fits.
+		xcodeJobs := agent.NewXcodeJobRunner(client.EmitUpstream, logger, client.DownloadProxy)
 
-		client.SetHandler(NewHandler(client, manager, jobs, builds))
+		client.SetHandler(NewHandler(client, manager, jobs, builds, xcodeJobs))
 		manager.Start(ctx)
 		manager.StartClaimedDevices(ctx)
 		defer manager.Stop()
 		defer jobs.StopAll()
 		defer builds.StopAll()
+		defer xcodeJobs.StopAll()
 
 		wg.Add(1)
 		go func() {

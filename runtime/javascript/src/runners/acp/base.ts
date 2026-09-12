@@ -66,6 +66,7 @@ export abstract class BaseAcpRunner {
       mcpServers: this.options.mcpConfig ? this.toAcpMcpServers(this.options.mcpConfig) : [],
     };
     if (this.options.mode) params.mode = this.options.mode;
+    if (this.options.model) params.model = this.options.model;
     if (storedThreadId && this.supportsSessionLoad()) {
       params.sessionId = storedThreadId;
     }

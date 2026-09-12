@@ -705,6 +705,25 @@ func (m *sessionManager) applyInitialConfig(session *nodeSession, spec *agentcom
 				return fmt.Errorf("mcp: %w", err)
 			}
 		}
+		// Initial skill/plugin activation list (mirrors the start frame's
+		// active_skills/active_plugins). Written only when non-empty: an absent
+		// file means "no narrowing" — the operator's full set loads — and the
+		// applySkills/applyPlugins commands keep the file fresh on mid-task
+		// selection changes.
+		if len(spec.GetActiveSkills()) > 0 || len(spec.GetActivePlugins()) > 0 {
+			if err := writeRuntimeActivationConfig(session.stateRoot, spec.GetActiveSkills(), spec.GetActivePlugins()); err != nil {
+				return fmt.Errorf("activation: %w", err)
+			}
+		}
+		// Platform-level task prompt. Written to the session's own stateRoot in
+		// every tier (never the operator's HOME — it is task state, not editor
+		// config), where the runtime re-reads it each turn and splices it into
+		// the provider's systemContext.
+		if sp := strings.TrimSpace(spec.GetSystemPrompt()); sp != "" {
+			if err := writeAgentSystemPrompt(session.stateRoot, sp); err != nil {
+				return fmt.Errorf("system_prompt: %w", err)
+			}
+		}
 		return nil
 	}
 	var errs []string
@@ -735,6 +754,14 @@ func (m *sessionManager) applyInitialConfig(session *nodeSession, spec *agentcom
 			if err := m.syncPlugins(session, spec.GetPlugins()); err != nil {
 				errs = append(errs, "plugins: "+err.Error())
 			}
+		}
+	}
+	// Platform-level task prompt, same as the system tier: task state, not
+	// editor config — always the session's own stateRoot, never a (possibly
+	// shared) HOME. The runtime re-reads the file every turn.
+	if sp := strings.TrimSpace(spec.GetSystemPrompt()); sp != "" {
+		if err := writeAgentSystemPrompt(session.stateRoot, sp); err != nil {
+			errs = append(errs, "system_prompt: "+err.Error())
 		}
 	}
 	if len(errs) > 0 {
@@ -796,7 +823,19 @@ func (m *sessionManager) applySkills(sessionID string, revision uint64, skills [
 	if isSystemEnv(session.spec) {
 		// system mode shares the operator's real HOME; syncSkills does an
 		// exact-set rewrite of ~/.claude/skills (or ~/.agents/skills) and
-		// would delete skills the operator installed by hand.
+		// would delete skills the operator installed by hand. Skills here only
+		// narrow what loads: publish the activation list to the runtime's
+		// stateRoot (nil plugins keeps the plugin side of the file untouched)
+		// and let the interactive runtime re-read it each turn.
+		names := make([]string, 0, len(skills))
+		for _, skill := range skills {
+			if name := strings.TrimSpace(skill.GetName()); name != "" {
+				names = append(names, name)
+			}
+		}
+		if err := writeRuntimeActivationConfig(session.stateRoot, names, nil); err != nil {
+			return configResult{}, err
+		}
 		return session.recordRevisionLocked(revision), nil
 	}
 	if err := m.syncSkills(session, skills); err != nil {
@@ -816,12 +855,97 @@ func (m *sessionManager) applyPlugins(sessionID string, revision uint64, plugins
 	if isSystemEnv(session.spec) {
 		// system mode shares the operator's real HOME; syncPlugins rewrites
 		// ~/.agents/plugins and would clobber the operator's own plugin set.
+		// Plugins here only narrow what loads: publish the activation list to
+		// the runtime's stateRoot (nil skills keeps the skill side of the file
+		// untouched) and let the interactive runtime re-read it each turn.
+		names := make([]string, 0, len(plugins))
+		for _, plugin := range plugins {
+			if name := strings.TrimSpace(plugin.GetName()); name != "" {
+				names = append(names, name)
+			}
+		}
+		if err := writeRuntimeActivationConfig(session.stateRoot, nil, names); err != nil {
+			return configResult{}, err
+		}
 		return session.recordRevisionLocked(revision), nil
 	}
 	if err := m.syncPlugins(session, plugins); err != nil {
 		return configResult{}, err
 	}
 	return session.recordRevisionLocked(revision), nil
+}
+
+// runtimeActivationConfigPath is the activation-list file agent-compose-runtime
+// re-reads on every turn (the hot-switch channel for system-mode skill/plugin
+// selection). Keep in sync with the runtime's mcp-config.ts
+// (readRuntimeActivationConfig).
+func runtimeActivationConfigPath(stateRoot string) string {
+	return filepath.Join(stateRoot, "agents", "activation.json")
+}
+
+// runtimeActivationConfig is the persisted activation list: which installed
+// skills/plugins this task turns on. Both keys are always serialized as arrays
+// (never null). The consumer treats an empty array as "no narrowing = full
+// set" — the platform's semantic for an empty selection — so an empty array
+// here must never be read back as "activate nothing".
+type runtimeActivationConfig struct {
+	Skills  []string `json:"skills"`
+	Plugins []string `json:"plugins"`
+}
+
+// writeRuntimeActivationConfig merges an activation list into
+// stateRoot/agents/activation.json with read-modify-write semantics: a nil
+// slice keeps the key already on disk, a non-nil slice rewrites that key (an
+// empty non-nil slice included, written as []). applySkills and applyPlugins
+// arrive as separate commands and each owns only its own key, so the other
+// key survives untouched. The interactive runtime re-reads the file every
+// turn, so a write here takes effect on the next human_message — same
+// hot-switch pattern as writeRuntimeMCPConfig, no restart required.
+func writeRuntimeActivationConfig(stateRoot string, skills, plugins []string) error {
+	path := runtimeActivationConfigPath(stateRoot)
+	config := runtimeActivationConfig{}
+	if data, err := os.ReadFile(path); err == nil {
+		// Best-effort: a corrupt file is regenerated from this write rather
+		// than failing the config ack for something the next write fixes.
+		_ = json.Unmarshal(data, &config)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read runtime activation config: %w", err)
+	}
+	if skills != nil {
+		config.Skills = normalizeActivationNames(skills)
+	}
+	if plugins != nil {
+		config.Plugins = normalizeActivationNames(plugins)
+	}
+	if config.Skills == nil {
+		config.Skills = []string{}
+	}
+	if config.Plugins == nil {
+		config.Plugins = []string{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create runtime activation dir: %w", err)
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write runtime activation config: %w", err)
+	}
+	return nil
+}
+
+// normalizeActivationNames trims and drops blank names from an activation
+// list; a nil input yields an empty (non-nil) slice so it serializes as [].
+func normalizeActivationNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // configureMode records the editor mode for a session and writes it to the

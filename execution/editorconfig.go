@@ -75,6 +75,21 @@ func (m *sessionManager) resolveMCPURLs(mcps []*agentcomposev2.MCPServerSpec) []
 		origin = strings.TrimSpace(m.gatewayOrigin())
 	}
 	if origin == "" {
+		// A relative URL nobody can resolve is the classic silent MCP death:
+		// the CLI later dials a relative/broken base, gets a 404, and drops the
+		// server with no trace. Log which servers are affected so the missing
+		// origin is visible in the node log instead of inferring it from an
+		// empty tool list.
+		var unresolved []string
+		for _, mcp := range mcps {
+			if isRemoteMCP(mcp) && strings.HasPrefix(strings.TrimSpace(mcp.GetUrl()), "/") {
+				unresolved = append(unresolved, strings.TrimSpace(mcp.GetName()))
+			}
+		}
+		if len(unresolved) > 0 {
+			m.logger.Warn("no gateway origin known; relative MCP urls left unresolved (CLI will fail to connect)",
+				"servers", strings.Join(unresolved, ","))
+		}
 		return mcps
 	}
 	origin = strings.TrimRight(origin, "/")
@@ -88,6 +103,18 @@ func (m *sessionManager) resolveMCPURLs(mcps []*agentcomposev2.MCPServerSpec) []
 		resolved := mcp
 		resolved.Url = origin + url
 		out = append(out, resolved)
+	}
+	if m.logger != nil {
+		var resolved []string
+		for _, mcp := range out {
+			if isRemoteMCP(mcp) && strings.HasPrefix(strings.TrimSpace(mcp.GetUrl()), origin) {
+				resolved = append(resolved, fmt.Sprintf("%s=%s", strings.TrimSpace(mcp.GetName()), strings.TrimSpace(mcp.GetUrl())))
+			}
+		}
+		if len(resolved) > 0 {
+			m.logger.Info("resolved relative MCP urls against gateway origin",
+				"origin", origin, "servers", strings.Join(resolved, " "))
+		}
 	}
 	return out
 }
@@ -136,6 +163,30 @@ func (m *sessionManager) writeMCPConfig(session *nodeSession, mcps []*agentcompo
 // Keep in sync with the runtime's mcp-config.ts (agentMCPConfigPath).
 func runtimeMCPConfigPath(stateRoot string) string {
 	return filepath.Join(stateRoot, "agents", "mcp", "config.json")
+}
+
+// agentSystemPromptPath is the per-task identity prompt the runtime splices
+// into the provider's systemContext every turn. Keep in sync with the
+// runtime's system-context.ts (agentSystemPromptPath). Empty file / absent =
+// no identity injected (the MPI context alone forms the systemContext).
+func agentSystemPromptPath(stateRoot string) string {
+	return filepath.Join(stateRoot, "agents", "system-prompts", "system-prompt.txt")
+}
+
+// writeAgentSystemPrompt writes the task's platform-level prompt to the
+// per-session stateRoot copy the runtime reads each turn. It only writes when
+// the prompt is non-empty: an empty prompt leaves any existing file untouched
+// (applyInitialConfig runs at session create, before the editor starts, so a
+// fresh stateRoot has nothing to clear).
+func writeAgentSystemPrompt(stateRoot, prompt string) error {
+	path := agentSystemPromptPath(stateRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create agent system prompt dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(prompt), 0o644); err != nil {
+		return fmt.Errorf("write agent system prompt: %w", err)
+	}
+	return nil
 }
 
 // writeRuntimeMCPConfig writes the exact desired MCP set in the runtime's own

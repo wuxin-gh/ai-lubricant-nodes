@@ -75,7 +75,8 @@ func trustedOwner(info ownerInfo) bool {
 	base := strings.ToLower(filepath.Base(info.Executable))
 	known := strings.HasPrefix(base, "node-execution") ||
 		strings.HasPrefix(base, "agent-compose-node-execution") ||
-		strings.HasPrefix(base, "agent-compose-node-management")
+		strings.HasPrefix(base, "agent-compose-node-management") ||
+		strings.HasPrefix(base, "node-ios")
 	if !known || !processAlive(info.PID) {
 		return false
 	}

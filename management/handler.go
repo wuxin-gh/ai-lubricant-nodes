@@ -37,6 +37,7 @@ type Handler struct {
 	launches  *launchRegistry
 	terminals *agent.TerminalManager
 	builds    *build.Runner
+	xcode     *agent.XcodeJobRunner
 }
 
 // NewHandler builds a management handler. server is the address launched
@@ -53,7 +54,8 @@ func NewHandler(c *agent.Client, server, agentImage, executionBin string) *Handl
 			t.StartReaper()
 			return t
 		}(),
-		builds: build.NewRunner(c.EmitUpstream, c.Logger()),
+		builds: build.NewRunner(c.EmitUpstream, c.Logger(), c),
+		xcode:  agent.NewXcodeJobRunner(c.EmitUpstream, c.Logger(), c.DownloadProxy),
 	}
 }
 
@@ -76,6 +78,9 @@ func (h *Handler) StopAll() { h.terminals.DetachAll() }
 // launch command onto the launch registry and acks through the client.
 func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agentcomposev2.NodeDownstreamFrame) {
 	if h.builds.HandleBuildFrame(ctx, c, frame) {
+		return
+	}
+	if h.xcode.HandleHostToolJobFrame(ctx, c, frame) {
 		return
 	}
 	frameID := frame.GetServerFrameId()

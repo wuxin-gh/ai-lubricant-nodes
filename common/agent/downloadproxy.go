@@ -21,6 +21,15 @@ type proxySpec struct {
 	urlPrefix string // url_prefix mode: reverse-proxy prefix base
 }
 
+// ProxySpec is the exported form of proxySpec, for callers outside this
+// package (the build runner) that must route a `git clone` through the node's
+// egress: url_prefix rewrites the clone URL; network passes a git http(s).proxy.
+type ProxySpec struct {
+	Mode      string // "" | "direct" | "network" | "url_prefix"
+	URL       string // network mode: full proxy URL
+	URLPrefix string // url_prefix mode: reverse-proxy prefix base
+}
+
 // resolveDownloadURL rewrites the asset URL for url_prefix mode. network mode
 // leaves the URL untouched (the transport handles routing).
 func resolveDownloadURL(spec proxySpec, rawURL string) string {
@@ -81,6 +90,14 @@ func httpClientForProxy(spec proxySpec) (*http.Client, error) {
 // follow the same egress route as self-upgrade.
 func (c *Client) ResolveDownloadURL(rawURL string) string {
 	return resolveDownloadURL(c.DownloadProxy(), rawURL)
+}
+
+// DownloadProxySpec returns the node's persisted egress-proxy snapshot in the
+// exported form (the build runner's clone step reads this per build, so a
+// runtime proxy-config update applies to the next build without a restart).
+func (c *Client) DownloadProxySpec() ProxySpec {
+	p := c.DownloadProxy()
+	return ProxySpec{Mode: p.mode, URL: p.url, URLPrefix: p.urlPrefix}
 }
 
 // DownloadHTTPClient builds an *http.Client for a large download through the

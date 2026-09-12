@@ -76,6 +76,13 @@ type EmitFunc func(*agentcomposev2.NodeUpstreamFrame) error
 // ErrStreamGone is returned by EmitUpstream when no stream is currently live.
 var ErrStreamGone = fmt.Errorf("node stream is closed")
 
+// refreshLabelsProbeTimeout bounds the RefreshLabels re-probe. Mirrors the
+// register-time probe budget: editor --version and host-tool probes each carry
+// their own short internal timeouts, so this is only a generous outer ceiling
+// for the whole batch (the server waits for the ack on a shorter dispatch
+// window and surfaces an exceeded deadline to the operator).
+const refreshLabelsProbeTimeout = 30 * time.Second
+
 // DownstreamHandler processes the downstream command frames for one node role.
 // The common client handles NodeServerHello, the registration ack, heartbeats,
 // and server Error frames itself; every other frame is passed to HandleFrame.
@@ -129,6 +136,13 @@ type Client struct {
 	publicIP      publicIPState
 	publicIPWake  chan struct{}
 	proxy         proxyState
+	// gatewayOrigin is the DATA service origin (MCP SSE gateway) announced by
+	// the server's NodeServerHello. The node dials the CONTROL plane, which is
+	// a separate process/port serving no /mcp/* routes — relative MCP spec
+	// URLs must resolve against this, not against opts.Server. Guarded by mu;
+	// empty (old control plane, or hello not yet received) falls back to
+	// opts.Server in GatewayOrigin.
+	gatewayOrigin string
 }
 
 // NewClient builds a client for the given options. Call SetHandler before Run.
@@ -148,11 +162,20 @@ func NewClient(opts Options, logger *slog.Logger) *Client {
 func (c *Client) SetHandler(h DownstreamHandler) { c.handler = h }
 
 // GatewayOrigin returns the origin relative MCP spec URLs resolve against: the
-// server address this node itself dials. The node is already connected to it,
-// so the server needs no configured public gateway URL — a relative spec
-// (/mcp/{name}/sse?token=…) becomes absolute here, and absolute specs from an
-// older server pass through untouched (see sessionManager.resolveMCPURLs).
+// DATA service origin (MCP SSE gateway) announced in the server's
+// NodeServerHello.gateway_origin. The node dials the CONTROL plane, which is a
+// separate process/port and serves no /mcp/* routes, so announcing the gateway
+// explicitly is the only way the node can learn it. An old control plane (no
+// field) or a hello without the value falls back to opts.Server — the node's
+// own dial address — which is correct only when both planes share one port.
+// See sessionManager.resolveMCPURLs.
 func (c *Client) GatewayOrigin() string {
+	c.mu.Lock()
+	origin := strings.TrimSpace(c.gatewayOrigin)
+	c.mu.Unlock()
+	if origin != "" {
+		return strings.TrimRight(origin, "/")
+	}
 	return strings.TrimRight(strings.TrimSpace(c.opts.Server), "/")
 }
 
@@ -190,6 +213,10 @@ func (c *Client) Run(ctx context.Context) error {
 	// visible before the first registration probes host tool versions, and
 	// before any session spawns resolve their launchers.
 	EnsureManagedNodeOnPath()
+	// Re-apply a persisted DEVELOPER_DIR fallback (Xcode found by a previous
+	// detect click but activated rootless) before the register-time probe, so
+	// xcodebuild_version is reported without re-clicking detect every restart.
+	EnsureDeveloperDir()
 	backoff := c.opts.MinBackoff
 	for {
 		if ctx.Err() != nil {
@@ -258,6 +285,16 @@ func (c *Client) serve(ctx context.Context) error {
 	serverTime, err := time.Parse(time.RFC3339Nano, serverHello.GetServerTime())
 	if err != nil {
 		return fmt.Errorf("parse server time %q: %w", serverHello.GetServerTime(), err)
+	}
+	// The hello may announce the DATA service origin (MCP SSE gateway) — the
+	// node dials the control plane, which serves no MCP routes, so this is how
+	// relative MCP spec URLs get a reachable absolute base. Old control planes
+	// omit the field and GatewayOrigin keeps falling back to opts.Server.
+	if announced := strings.TrimSpace(serverHello.GetGatewayOrigin()); announced != "" {
+		c.mu.Lock()
+		c.gatewayOrigin = strings.TrimRight(announced, "/")
+		c.mu.Unlock()
+		c.logger.Info("gateway origin announced", "origin", serverHello.GetGatewayOrigin())
 	}
 	c.logger.Info("server hello received")
 
@@ -374,6 +411,14 @@ func (c *Client) capabilityLabels(ctx context.Context) map[string]string {
 	if c.opts.SystemEnvAllowed {
 		labels["system_env"] = "true"
 	}
+	// startup_method reports how this node is actually started on its host:
+	// "autostart" when a per-user login entry (launchd/systemd/schtasks) the
+	// node manages is installed, "standalone" when manually run. Server-side
+	// the admin UI prefers this over the onboard-recorded startup_method
+	// (which is the operator's install choice, not a post-install fact).
+	// Hardcoded like terminal/host_exec: it is a binary capability, not an
+	// operator label, so user configuration cannot override it.
+	labels["startup_method"] = StartupMethodLabel()
 	return labels
 }
 
@@ -440,6 +485,13 @@ func (c *Client) dispatchLoop(ctx context.Context, stream *connect.BidiStreamFor
 			if errFrame.GetTerminal() {
 				return fmt.Errorf("server terminal error: %s", errFrame.GetMessage())
 			}
+			continue
+		}
+		if refresh := frame.GetRefreshLabels(); refresh != nil {
+			// Re-probe every capability label and reply with the full snapshot.
+			// Probes can block (editor --version, host tools), so run them off
+			// the receive loop like every other command ack.
+			go c.refreshLabels(frame.GetServerFrameId())
 			continue
 		}
 		c.handler.HandleFrame(ctx, c, frame)
@@ -696,6 +748,46 @@ func (c *Client) SendHostToolAck(frameID string, cmdErr error, nodeVersion, npmV
 	if err := c.EmitUpstream(frame); err != nil {
 		c.logger.Warn("host-tool ack send failed", "error", err)
 	}
+}
+
+// SendRefreshLabelsAck acks a RefreshLabels command. On success caps carries
+// the freshly probed capability snapshot (the same shape the node registers
+// with) so the server can fold it into the node's stored capabilities without
+// a node restart.
+func (c *Client) SendRefreshLabelsAck(frameID string, cmdErr error, caps *agentcomposev2.NodeCapabilities) {
+	ack := &agentcomposev2.NodeCommandAck{
+		ServerFrameId: frameID,
+		Ok:            cmdErr == nil,
+	}
+	if cmdErr != nil {
+		ack.Error = cmdErr.Error()
+	} else {
+		ack.RefreshedCapabilities = caps
+	}
+	frame := &agentcomposev2.NodeUpstreamFrame{
+		Frame: &agentcomposev2.NodeUpstreamFrame_CommandAck{CommandAck: ack},
+	}
+	if err := c.EmitUpstream(frame); err != nil {
+		c.logger.Warn("refresh labels ack send failed", "error", err)
+	}
+}
+
+// refreshLabels re-probes every capability label (editors, host tools, host
+// facts, operator labels) and replies with the full snapshot. Mirrors the
+// register-time NodeCapabilities assembly exactly so the server-side folding
+// of this reply cannot disagree with what a re-register would advertise.
+func (c *Client) refreshLabels(frameID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), refreshLabelsProbeTimeout)
+	defer cancel()
+	caps := &agentcomposev2.NodeCapabilities{
+		Os:        runtime.GOOS,
+		Arch:      runtime.GOARCH,
+		Docker:    DockerAvailable(),
+		Providers: c.opts.Providers,
+		Editors:   EditorCapabilities(ctx),
+		Labels:    c.capabilityLabels(ctx),
+	}
+	c.SendRefreshLabelsAck(frameID, nil, caps)
 }
 
 // SendEnvironmentInventoryAck acks an InspectEnvironment command, carrying the

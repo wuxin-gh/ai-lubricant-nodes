@@ -19,6 +19,7 @@
 #   RUNTIME_DIST=/path/to/runtime bash nodes/pack-release.sh
 #   SKIP_RUNTIME=1 bash nodes/pack-release.sh        # 只打两个 Go 二进制，不含 runtime
 #   PLATFORMS="linux/amd64" bash nodes/pack-release.sh   # 只打指定平台（默认全 6 平台）
+#   KEEP_CACHE=1 bash nodes/pack-release.sh          # 打完不清缓存（默认清：go 编译缓存/npm 缓存/dist 散件）
 #
 # 产物布局（nodes/dist/<version>/，全部拖进上传弹框）：
 #   node-execution-<os>-<arch>[.exe]
@@ -51,7 +52,14 @@ PLATFORMS="${PLATFORMS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 window
 # 同分钟内多次打会在末尾加序号 -2/-3/... 避免覆盖。
 # validator 接受此格式（_is_node_version），也兼容显式传的 semver。
 if [ -z "$VERSION" ]; then
-  VERSION="$(date +%Y%m%d-%H%M)"
+  # 防 TZ 漂移：Git Bash(MSYS) 偶发把脚本进程的 date 拉进 UTC（版本目录名差
+  # 整 8 小时，本地 09:19 打出 0119）。Windows 上用 PowerShell 取系统本地时间
+  # （不依赖 shell 的 TZ 环境）；mac/linux 的 date 本来就跟随本地时区。
+  if uname -s 2>/dev/null | grep -qiE "msys|cygwin"; then
+    VERSION="$(powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmm" 2>/dev/null || date +%Y%m%d-%H%M)"
+  else
+    VERSION="$(date +%Y%m%d-%H%M)"
+  fi
 fi
 echo "==> 打包版本: $VERSION"
 
@@ -158,8 +166,7 @@ if [ -n "$RUNTIME_SRC" ]; then
   if command -v node >/dev/null 2>&1; then
     echo "==> 自检归档解压后可启动"
     VERIFY="$(mktemp -d)"
-    tar -xzf "$OUT/$RUNTIME_ARTIFACT" -C "$VERIFY"
-    if ! ( cd "$VERIFY/runtime" && node dist/cli.js --version ); then
+    if ! ( tar -xzf "$OUT/$RUNTIME_ARTIFACT" -C "$VERIFY" && cd "$VERIFY/runtime" && node dist/cli.js --version ); then
       rm -rf "$VERIFY"
       echo "归档自检失败：解压后 dist/cli.js 起不来，拒绝出包" >&2
       exit 1
@@ -180,3 +187,35 @@ echo "================================================================"
 echo "下一步：把 $OUT/ 下的文件拖进市场管理页「上传新版本」弹框。"
 echo "  弹框只认 node-execution-* / agent-compose-node-management-* / node-ios-* / node-runtime.tar.gz，版本说明/状态在弹框里填。"
 echo "  上传后服务端自动写 node-releases/version.json，无需手动提交。"
+
+# ── 清理打包缓存 ────────────────────────────────────────────────────────────
+# 打包收尾清掉构建过程产生的缓存，释放磁盘：
+#   - go clean -cache：Go 编译缓存（一次全量交叉编译 18 个二进制可吃数 GB，
+#     清掉后下次打包全量重编，慢几分钟——频繁打包时用 KEEP_CACHE=1 保留）
+#   - npm cache clean：runtime npm ci 的下载缓存
+#   - dist/ 根目录散件：build.sh 时代的平铺产物（旧二进制/VERSION/checksums），
+#     不清容易和 dist/<version>/ 的正式产物混着拿错版本
+# **版本子目录（dist/<version>/）永不删除**——保留全部历史产物供上传/回滚。
+# 中途失败退出时不会走到这里，保留现场便于排查/重跑。
+KEEP_CACHE="${KEEP_CACHE:-0}"
+if [ "$KEEP_CACHE" != "1" ]; then
+  echo
+  echo "==> 清理打包缓存（KEEP_CACHE=1 可保留）"
+  if command -v go >/dev/null 2>&1; then
+    if go clean -cache; then
+      echo "  Go 编译缓存已清"
+    fi
+  fi
+  if command -v npm >/dev/null 2>&1; then
+    if npm cache clean --force >/dev/null 2>&1; then
+      echo "  npm 下载缓存已清"
+    fi
+  fi
+  if [ -d "$DIST_ROOT" ]; then
+    # 只删散件文件，版本子目录一律保留。
+    find "$DIST_ROOT" -maxdepth 1 -type f -delete
+    echo "  dist 根目录散件已清（版本子目录全部保留）"
+    echo "  现存版本目录："
+    ls -1d "$DIST_ROOT"/*/ 2>/dev/null | while read -r d; do echo "    $(basename "$d")"; done
+  fi
+fi

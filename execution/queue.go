@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,12 +68,40 @@ func (q *outputQueue) pump(r io.Reader, stream agentcomposev2.StdioStream) {
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
+			// Runtime diagnostic traces (the [runtime-*]/[turn-*]/[claude-*] lines
+			// the JS runtime writes to stderr) are forwarded upstream like every
+			// other output byte, but the node's own rotating log file never sees
+			// them — stdout/stderr pipes go to the queue, not to slog. A single
+			// diagnostic line that says nothing when debugging on a server is a
+			// real cost: these lines are how "task ran a different model than
+			// selected" and "thread mismatch" get pinned down. Mirror any chunk
+			// carrying one of the diagnostic prefixes into slog (Info) so they
+			// land in the node's log file too.
+			if stream == agentcomposev2.StdioStream_STDIO_STREAM_STDERR && hasRuntimeDiagnosticPrefix(chunk) {
+				q.logger.Info("runtime-diag", "line", strings.TrimRight(string(chunk), "\r\n"))
+			}
 			q.append(chunk, stream)
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// runtimeDiagnosticPrefixes are the stderr markers the JS runtime emits for
+// cross-layer value tracing (model/session/thread flows). Keep in sync with
+// nodes/runtime/javascript/src/stream.ts + interactive.ts + runners/claude.ts.
+var runtimeDiagnosticPrefixes = []string{
+	"[runtime-", "[turn-", "[claude-",
+}
+
+func hasRuntimeDiagnosticPrefix(chunk []byte) bool {
+	for _, prefix := range runtimeDiagnosticPrefixes {
+		if bytes.Contains(chunk, []byte(prefix)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (q *outputQueue) append(data []byte, stream agentcomposev2.StdioStream) {

@@ -40,6 +40,7 @@ type Handler struct {
 	terminals *agent.TerminalManager
 	toolruns  *agent.ToolRunManager
 	builds    *build.Runner
+	xcode     *agent.XcodeJobRunner
 }
 
 // NewHandler builds an execution handler bound to the given client. The session
@@ -55,12 +56,13 @@ func NewHandler(c *agent.Client, workRoot string, providers []string, docker boo
 	terminals := agent.NewTerminalManager(c.EmitUpstream, c.Logger())
 	terminals.StartReaper()
 	toolruns := agent.NewToolRunManager(c.EmitUpstream, c.Logger())
-	builds := build.NewRunner(c.EmitUpstream, c.Logger())
+	builds := build.NewRunner(c.EmitUpstream, c.Logger(), c)
 	return &Handler{
 		sessions:  sessions,
 		terminals: terminals,
 		toolruns:  toolruns,
 		builds:    builds,
+		xcode:     agent.NewXcodeJobRunner(c.EmitUpstream, c.Logger(), c.DownloadProxy),
 	}
 }
 
@@ -85,6 +87,9 @@ func (h *Handler) StopAll() {
 // session command onto the session manager and acks through the client.
 func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agentcomposev2.NodeDownstreamFrame) {
 	if h.builds.HandleBuildFrame(ctx, c, frame) {
+		return
+	}
+	if h.xcode.HandleHostToolJobFrame(ctx, c, frame) {
 		return
 	}
 	frameID := frame.GetServerFrameId()

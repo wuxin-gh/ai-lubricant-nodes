@@ -352,12 +352,53 @@ function claudeExecutable(): string | undefined {
 
 function claudeEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, IS_SANDBOX: "1" };
-  if (!env.ANTHROPIC_API_KEY && env.LLM_API_KEY) {
+  // The LLM_* snapshot is the task's per-turn source of truth. Unconditionally
+  // overwrite any system-level ANTHROPIC_* residue: the previous "only fill if
+  // missing" fallback let stale machine-global credentials win, silently
+  // repointing the session at the wrong endpoint/key.
+  if (env.LLM_API_KEY) {
     env.ANTHROPIC_API_KEY = env.LLM_API_KEY;
   }
-  if (!env.ANTHROPIC_BASE_URL && env.LLM_API_ENDPOINT) {
+  if (env.LLM_API_ENDPOINT) {
     env.ANTHROPIC_BASE_URL = env.LLM_API_ENDPOINT;
   }
+  return env;
+}
+
+/**
+ * claudeSettingsLlmEnv lifts the per-turn LLM snapshot (the LLM_* vars the
+ * node's llmEnv / the runtime's plantLlmEnv plant into process.env) into the
+ * SDK ``settings`` env block. Settings env outranks user settings.json —
+ * which is the ONLY way to beat an operator-managed ~/.claude/settings.json
+ * in system-env mode: that file is the operator's real HOME config, tools
+ * like ccswitch write their own env block (endpoint + key) into it, and
+ * settings.json env overrides process env — so without this every task turn
+ * was silently re-pointed at the operator's proxy and billed to their key
+ * instead of the task's. The ANTHROPIC_* trio stays empty when no LLM
+ * snapshot is planted, so native-login sessions keep working untouched.
+ *
+ * Scope: settings env only covers TASK-SEMANTIC keys (endpoint/key/model plus
+ * task-privacy switches). Every other operator settings.json key passes
+ * through untouched. The DISABLE_* / NONESSENTIAL_TRAFFIC switches are pinned
+ * here with fixed values so an operator's settings.json env block cannot
+ * re-enable telemetry for task turns — task turns must never leak the
+ * operator's HOME context.
+ */
+function claudeSettingsLlmEnv(): Record<string, string> {
+  const endpoint = String(process.env.LLM_API_ENDPOINT || "").trim();
+  const key = String(process.env.LLM_API_KEY || "").trim();
+  const model = String(process.env.LLM_MODEL || "").trim();
+  const env: Record<string, string> = {};
+  if (endpoint) env.ANTHROPIC_BASE_URL = endpoint;
+  if (key) {
+    env.ANTHROPIC_API_KEY = key;
+    env.ANTHROPIC_AUTH_TOKEN = key;
+  }
+  if (model) env.ANTHROPIC_MODEL = model;
+  // Fixed task-privacy switches (see doc comment above).
+  env.DISABLE_TELEMETRY = "1";
+  env.DISABLE_ERROR_REPORTING = "1";
+  env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   return env;
 }
 
@@ -507,6 +548,10 @@ export class ClaudeRunner {
         ...(this.options.autoCompactWindow && this.options.autoCompactWindow > 0
           ? { autoCompactWindow: this.options.autoCompactWindow }
           : {}),
+        // Task LLM config rides --settings env so it outranks the session
+        // HOME's own settings.json (ccswitch's env block in system-env mode).
+        // See claudeSettingsLlmEnv for the full rationale.
+        ...claudeSettingsLlmEnv(),
       },
     };
   }
@@ -660,9 +705,18 @@ export class ClaudeRunner {
   async runPrompt(promptText: string): Promise<AgentResult> {
     const { query: claudeQuery } = await import("@anthropic-ai/claude-agent-sdk");
     const stored = await readStoredThread(this.options.stateRoot, "claude", this.options.sessionScope);
+    const queryOpts = this.queryOptions(stored);
+    // Diagnostic trace: exactly what the SDK receives for this turn — model,
+    // resume thread, permission mode. process.env.ANTHROPIC_* at query time is
+    // what the CLI actually inherits (settings env is inside queryOpts.settings).
+    process.stderr.write(
+      `[claude-query] model=${String(queryOpts.model || "<none>")} resume=${stored?.threadId || "<none>"} `
+      + `env.ANTHROPIC_MODEL=${process.env.ANTHROPIC_MODEL || "<none>"} env.LLM_MODEL=${process.env.LLM_MODEL || "<none>"} `
+      + `mode=${String((queryOpts as Record<string, unknown>).permissionMode || "<none>")}\n`,
+    );
     const stream = claudeQuery({
       prompt: promptText,
-      options: this.queryOptions(stored),
+      options: queryOpts,
     });
 
     const result: AgentResult = {
@@ -678,7 +732,17 @@ export class ClaudeRunner {
     try {
       messages: for await (const rawMessage of stream) {
         const message = rawMessage as Record<string, unknown>;
-        result.threadId = String(message.session_id || result.threadId);
+        const newThreadId = String(message.session_id || "");
+        if (newThreadId && newThreadId !== result.threadId) {
+          // Diagnostic trace: the CLI's actual session id as it changes mid-turn
+          // (resume may fork a new session). This is the value the CLI sends to
+          // the gateway as x-claude-code-session-id — if it diverges from the
+          // task's bound thread, the gateway 403s the next task key request.
+          process.stderr.write(
+            `[claude-session] old=${result.threadId || "<none>"} new=${newThreadId} msgType=${textOf(message.type)}\n`,
+          );
+          result.threadId = newThreadId;
+        }
         // Pipe every SDK message through untouched (stream mode only). The
         // transcript handling below is unchanged; this just stops the runtime
         // from discarding the SDK's own structure and sub-agent attribution.

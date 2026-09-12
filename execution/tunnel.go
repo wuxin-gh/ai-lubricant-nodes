@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	agent "ai-lubricant-nodes/common/agent"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
 
@@ -21,9 +22,21 @@ import (
 const tunnelChunkBytes = 32 * 1024
 
 // tunnelClient is the node-local HTTP client used to reach a session's services
-// (jupyter, file server). It is separate from the server-connection client and
-// never times out the body copy — the per-request context bounds it instead.
-var tunnelClient = &http.Client{Timeout: 0}
+// (jupyter, file server) AND to forward NodeProxyRequest bodies to absolute
+// URLs (e.g. when the server proxies Apple ID GSA auth through this node). The
+// TLS root pool is the system pool PLUS Apple's private CA chain — Apple
+// endpoints (gsa.apple.com) terminate at Apple Root CA, absent from public
+// trust stores, so without it a forwarded GSA handshake fails "unknown
+// authority". System trust is left intact; only Apple's chain is appended.
+var tunnelClient = newTunnelClient()
+
+func newTunnelClient() *http.Client {
+	transport := &http.Transport{}
+	if tlsCfg := agent.AppleCATLSConfig(); tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
+	}
+	return &http.Client{Timeout: 0, Transport: transport}
+}
 
 // handleTunnel forwards a reverse-proxy request from the server to the session's
 // local service and streams the response back up as TunnelResponse frames. It is

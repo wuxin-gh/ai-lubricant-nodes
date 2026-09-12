@@ -88,6 +88,12 @@ export async function runStreamCommand(options: RunStreamOptions = {}): Promise<
             plugins: stringArrayField(frame, "plugins"),
             systemEnv: frame.systemEnv === true,
           }, emit);
+          // Diagnostic trace: the start-frame model is the session baseline —
+          // every later turn without an explicit snapshot model falls back to it.
+          process.stderr.write(
+            `[runtime-start] provider=${stringField(frame, "provider")} model=${stringField(frame, "model") || "<none>"} `
+            + `mode=${stringField(frame, "mode") || "<none>"} systemEnv=${frame.systemEnv === true}\n`,
+          );
           break;
         case "human_message": {
           if (!session) {
@@ -95,6 +101,11 @@ export async function runStreamCommand(options: RunStreamOptions = {}): Promise<
           }
           const messageId = stringField(frame, "messageId") || "";
           const attempt = numberField(frame, "deliveryAttempt") || 1;
+          process.stderr.write(
+            `[runtime-recv] type=human_message messageId=${messageId} attempt=${attempt} `
+            + `frame.model=${typeof frame.model === "string" ? frame.model : "<none>"} `
+            + `frame.mode=${typeof frame.mode === "string" ? frame.mode : "<none>"}\n`,
+          );
           const turnKey = messageId ? `${messageId}:${attempt}` : "";
           if (turnKey && seenTurnKeys.has(turnKey)) {
             // Transport-level replay of a frame we already accepted: ACK receipt
@@ -224,10 +235,17 @@ function turnSnapshot(frame: StreamFrame): TurnSnapshot | undefined {
     snapshot.llm = {
       endpoint: stringField(llm, "endpoint"),
       apiKey: stringField(llm, "apiKey"),
-      model: stringField(llm, "model"),
+      model: stringField(llm, "llm.model") || stringField(llm, "model"),
       protocol: stringField(llm, "protocol"),
     };
   }
+  // Diagnostic trace: the per-turn model/mode/llm.model exactly as received on
+  // the frame. Any later "task ran a different model than selected" report is
+  // falsified or confirmed HERE — before optionsForTurn/runner could change it.
+  process.stderr.write(
+    `[runtime-snapshot] model=${snapshot.model ?? "<none>"} mode=${snapshot.mode ?? "<none>"} `
+    + `llm.model=${snapshot.llm?.model || "<none>"} llm.protocol=${snapshot.llm?.protocol || "<none>"}\n`,
+  );
   return Object.keys(snapshot).length > 0 ? snapshot : undefined;
 }
 

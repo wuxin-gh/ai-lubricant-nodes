@@ -1,7 +1,7 @@
 import path from "node:path";
 import process from "node:process";
 import { TurnCancelledError } from "./errors.js";
-import { resolveEffectiveMCPConfig } from "./mcp-config.js";
+import { readRuntimeActivationConfig, resolveEffectiveMCPConfig } from "./mcp-config.js";
 import { buildPromptRuntimeOptions } from "./prompt.js";
 import { ClaudeRunner } from "./runners/claude.js";
 import { CodexRunner } from "./runners/codex.js";
@@ -146,6 +146,9 @@ export class PromptRunnerSession implements InteractiveSession {
     if (this.currentAbort) {
       throw new Error("another turn is already running");
     }
+    process.stderr.write(
+      `[turn-begin] provider=${this.baseOptions.provider} messageLen=${message.length} messageId=${messageId || "<none>"} attempt=${deliveryAttempt}\n`,
+    );
     const options = await this.optionsForTurn(snapshot);
     // The abort handle covers the whole turn — including the optional auto-compact
     // pass ahead of the prompt — so a cancel can interrupt compaction too, not
@@ -182,6 +185,15 @@ export class PromptRunnerSession implements InteractiveSession {
         },
       );
       if (result.threadId) {
+        // Diagnostic trace: thread lifecycle. If this differs from the stored
+        // thread that the gateway has bound to the task, the next gateway
+        // request will 403 ("Task API Key 与 provider 会话不匹配") — this line
+        // pins down exactly when the thread id changed.
+        if (this.lastThreadId && result.threadId !== this.lastThreadId) {
+          process.stderr.write(
+            `[thread-changed] old=${this.lastThreadId} new=${result.threadId}\n`,
+          );
+        }
         this.lastThreadId = result.threadId;
       }
       if (result.transcript) {
@@ -193,6 +205,9 @@ export class PromptRunnerSession implements InteractiveSession {
         result.threadId,
         undefined,
         options.sessionScope,
+      );
+      process.stderr.write(
+        `[turn-done] provider=${options.provider} threadId=${result.threadId || "<none>"} status=completed\n`,
       );
       this.emit("agent_turn_completed", {
         provider: options.provider,
@@ -291,10 +306,11 @@ export class PromptRunnerSession implements InteractiveSession {
 
   /**
    * Build the RunnerOptions for this turn by overlaying the snapshot on the
-   * start-frame baseline, then re-reading the runtime MCP config from disk (so
-   * MCP changes the node wrote between turns take effect immediately). The LLM
-   * snapshot is planted into the process env the same way buildPromptRuntimeOptions
-   * plants the start-frame LLM, so provider CLIs see the current endpoint/key.
+   * start-frame baseline, then re-reading the runtime config from disk (so
+   * MCP changes and skill/plugin activation changes the node wrote between
+   * turns take effect immediately). The LLM snapshot is planted into the
+   * process env the same way buildPromptRuntimeOptions plants the start-frame
+   * LLM, so provider CLIs see the current endpoint/key.
    */
   private async optionsForTurn(snapshot?: TurnSnapshot): Promise<RunnerOptions> {
     const model = snapshot?.model ?? this.currentModel;
@@ -303,6 +319,12 @@ export class PromptRunnerSession implements InteractiveSession {
     if (snapshot?.model !== undefined) this.currentModel = snapshot.model;
     if (snapshot?.mode !== undefined) this.currentMode = snapshot.mode;
     if (snapshot?.llm !== undefined) this.currentLlm = snapshot.llm;
+    // Diagnostic trace: which model value THIS turn resolves to, and whether it
+    // came from the snapshot (per-turn) or the session baseline (start frame).
+    process.stderr.write(
+      `[turn-options] model=${model || "<none>"} modelSource=${snapshot?.model !== undefined ? "snapshot" : "baseline"} `
+      + `mode=${mode || "<none>"} llmModel=${llm?.model || "<none>"} llmEndpoint=${(llm?.endpoint || "").replace(/\/\/[^/]*@/, "//***@") || "<none>"}\n`,
+    );
 
     const mcpConfig = await resolveEffectiveMCPConfig(this.baseOptions.stateRoot, this.baseOptions.provider, this.baseOptions.systemEnv === true, this.baseOptions.home);
     const options: RunnerOptions = {
@@ -312,6 +334,28 @@ export class PromptRunnerSession implements InteractiveSession {
       mcpConfig,
       emit: this.emit,
     };
+    // system-env sessions share the operator's real HOME, so skills/plugins are
+    // never installed per task — selection is the only channel, and it must be
+    // able to change mid-task. The node publishes the current activation list to
+    // stateRoot/agents/activation.json on every applySkills/applyPlugins
+    // (read-modify-write, one key at a time); re-reading it here every turn is
+    // the same stateRoot hot-switch the MCP config uses above. Non-system tiers
+    // never get the file and keep the start-frame list untouched — their
+    // narrowing is applied by the node's file sync, not by this overlay.
+    if (this.baseOptions.systemEnv === true) {
+      const activation = await readRuntimeActivationConfig(this.baseOptions.stateRoot);
+      // A non-empty list narrows to exactly those names. An empty list is the
+      // platform's "nothing selected" encoding: no narrowing = the runner's
+      // full set. Every runner gates on length > 0 (claude --skill, opencode
+      // hasSkills, codex marketplace wanted-set, gemini catalog context), so []
+      // and undefined are the same thing to all of them — passing [] through
+      // can never "clear" skills. It must also not be read as "keep the
+      // start-frame list": that would pin a stale selection forever after the
+      // user unchecked the last skill mid-task, which contradicts the platform
+      // semantic (empty selection = no narrowing = full set).
+      options.skills = activation.skills;
+      options.plugins = activation.plugins;
+    }
     if (llm) {
       plantLlmEnv(llm);
     }

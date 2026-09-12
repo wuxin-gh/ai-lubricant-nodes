@@ -37,6 +37,11 @@ type options struct {
 }
 
 func main() {
+	// The "service" subcommand is the click-to-manage desktop entry: pop the
+	// start/stop/restart dialog and exit. It never reads credentials.
+	if len(os.Args) > 1 && os.Args[1] == "service" {
+		os.Exit(agent.ServiceMenu())
+	}
 	opts, instance, err := parseFlags(os.Args[1:])
 	if err != nil {
 		if errors.Is(err, agent.ErrInstallCancelled) {
@@ -95,6 +100,7 @@ func parseFlags(args []string) (options, *agent.Instance, error) {
 		install      = fs.Bool("install", false, "save the supplied credentials on this machine as the single local node, replacing any previous one after confirmation")
 		installOnly  = fs.Bool("install-only", false, "with --install, save the configuration and exit instead of staying in the foreground")
 		assumeYes    = fs.Bool("yes", false, "with --install, approve replacing an existing local node without prompting (automation only)")
+		autostart    = fs.String("autostart", agent.EnvOr("AGENT_COMPOSE_NODE_AUTOSTART", "auto"), "configure per-user login autostart: auto|on|off (auto = ask once on an interactive host) (env AGENT_COMPOSE_NODE_AUTOSTART)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return options{}, nil, err
@@ -128,6 +134,12 @@ func parseFlags(args []string) (options, *agent.Instance, error) {
 	if *installOnly {
 		instance.Close()
 		return options{}, nil, agent.ErrInstallComplete
+	}
+	// Same ordering as the execution binary: after the lock, before dialing,
+	// so the startup_method label reflects the final state at registration.
+	if _, err := agent.ResolveAutostart(*autostart, agent.InstallOptions{}); err != nil {
+		instance.Close()
+		return options{}, nil, err
 	}
 	name := cfg.NodeName
 	if name == "" {

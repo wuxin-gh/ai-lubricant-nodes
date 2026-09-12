@@ -34,6 +34,8 @@ import (
 	"sync"
 	"time"
 
+	"ai-lubricant-nodes/common/agent"
+	"ai-lubricant-nodes/common/workspaces"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
 
@@ -41,10 +43,22 @@ import (
 // can capture the event stream without a client.
 type UpstreamEmitter func(*agentcomposev2.NodeUpstreamFrame) error
 
+// ProxySpecReader is the slice of *agent.Client the build runner needs: the
+// node's persisted egress-proxy snapshot. An interface so tests inject a fake
+// without constructing a real client.
+type ProxySpecReader interface {
+	DownloadProxySpec() agent.ProxySpec
+}
+
 // Runner tracks and executes build jobs for this host.
 type Runner struct {
 	emit   UpstreamEmitter
 	logger Logger
+	// client supplies the node's egress-proxy snapshot; nil means direct egress
+	// (no proxy bound). The clone step routes through it (url_prefix rewrites
+	// the clone URL, network sets git http(s).proxy) so a build on a
+	// GFW-restricted host can still reach github.
+	client ProxySpecReader
 
 	// execFn / uploadFn are production seams (wdajob.go's WdaSteps pattern):
 	// tests inject fakes instead of requiring git/xcodebuild on the test host.
@@ -75,9 +89,10 @@ type buildJob struct {
 // control plane must not carry unbounded payloads.
 const logTailBytes = 4 << 10 // 4 KiB
 
-// NewRunner builds the runner.
-func NewRunner(emit UpstreamEmitter, log Logger) *Runner {
-	return &Runner{emit: emit, logger: log, jobs: map[string]*buildJob{}}
+// NewRunner builds the runner. client supplies the node's egress-proxy
+// snapshot; pass nil when the host egresses directly (no proxy bound).
+func NewRunner(emit UpstreamEmitter, log Logger, client ProxySpecReader) *Runner {
+	return &Runner{emit: emit, logger: log, client: client, jobs: map[string]*buildJob{}}
 }
 
 // ActiveBuilds returns the ids of builds currently running (reconciliation on
@@ -196,8 +211,35 @@ func (r *Runner) runBuild(ctx context.Context, j *buildJob, req *agentcomposev2.
 	r.event(j, "queued", "build accepted", 0, "")
 
 	// ── clone ────────────────────────────────────────────────────────────
-	r.event(j, "cloning", "git clone "+req.GetSourceUrl()+" @ "+refLabel(req.GetSourceRef()), 5, "")
-	cloneOut, err := r.exec(ctx, workDir, "git", []string{"clone", "--depth", "1", req.GetSourceUrl(), "src"})
+	// Route through the node's egress proxy when one is bound (same snapshot
+	// self-upgrade / artifact downloads honor): url_prefix rewrites the clone
+	// URL; network passes a per-command git http(s).proxy via -c (never written
+	// to any git config, and visible in the argv of one short-lived process).
+	// No proxy bound ("" / direct) keeps the historical direct clone.
+	cloneURL := strings.TrimSpace(req.GetSourceUrl())
+	ref := strings.TrimSpace(req.GetSourceRef())
+	var preArgs []string
+	if r.client != nil {
+		if spec := r.client.DownloadProxySpec(); spec.Mode == "url_prefix" && spec.URLPrefix != "" {
+			cloneURL = strings.TrimRight(spec.URLPrefix, "/") + "/" + strings.TrimLeft(cloneURL, "/")
+		} else if spec.Mode == "network" && spec.URL != "" {
+			// libcurl (git's transport) accepts http(s):// and socks5(h)://
+			// proxy URLs here; https.proxy covers the github clone, http.proxy
+			// is the fallback for an http remote.
+			preArgs = []string{"-c", "https.proxy=" + spec.URL, "-c", "http.proxy=" + spec.URL}
+		}
+	}
+	cloneArgs := append(preArgs, "clone", "--depth", "1")
+	if ref != "" {
+		// --branch lands the pinned tag/branch in the same depth-1 clone; the
+		// old clone-then-checkout needed a full --unshallow fetch because a
+		// default-branch shallow clone does not carry the tag object.
+		cloneArgs = append(cloneArgs, "--branch", ref)
+	}
+	cloneArgs = append(cloneArgs, cloneURL, "src")
+
+	r.event(j, "cloning", "git clone "+workspaces.RedactGitURL(cloneURL)+" @ "+refLabel(ref), 5, "")
+	cloneOut, err := r.exec(ctx, workDir, "git", cloneArgs)
 	if err != nil {
 		if ctx.Err() != nil {
 			return buildOutcome{stage: "cloning", errCode: "cancelled", err: ctx.Err()}
@@ -205,22 +247,6 @@ func (r *Runner) runBuild(ctx context.Context, j *buildJob, req *agentcomposev2.
 		return buildOutcome{stage: "cloning", errCode: "clone_failed", err: err, retryable: true, logTail: logTail(cloneOut)}
 	}
 	srcDir := filepath.Join(workDir, "src")
-	ref := strings.TrimSpace(req.GetSourceRef())
-	if ref != "" {
-		// Pin after a shallow clone. A depth-1 clone of a non-branch ref
-		// (commit sha) can miss the object; fall back to a full fetch then.
-		checkoutOut, err := r.exec(ctx, srcDir, "git", []string{"checkout", ref})
-		if err != nil {
-			fetchOut, ferr := r.exec(ctx, srcDir, "git", []string{"fetch", "--unshallow", "origin"})
-			if ferr != nil {
-				return buildOutcome{stage: "cloning", errCode: "clone_failed", err: ferr, retryable: true, logTail: logTail(fetchOut)}
-			}
-			checkoutOut, err = r.exec(ctx, srcDir, "git", []string{"checkout", ref})
-			if err != nil {
-				return buildOutcome{stage: "cloning", errCode: "checkout_failed", err: err, retryable: true, logTail: logTail(checkoutOut)}
-			}
-		}
-	}
 
 	// ── steps ────────────────────────────────────────────────────────────
 	total := len(req.GetSteps())
@@ -331,9 +357,12 @@ func (r *Runner) exec(ctx context.Context, dir, name string, args []string) ([]b
 	return cmd.CombinedOutput()
 }
 
-// logTail trims command output to the bounded tail and redacts it.
+// logTail trims command output to the bounded tail and redacts it: git-secret
+// shapes first (a clone URL's userinfo token, an http.extraHeader basic-auth
+// value — workspaces.RedactGitSecrets), then any key material a build tool
+// echoed (the historic -----BEGIN guard).
 func logTail(out []byte) string {
-	return redactSecrets(tail(string(out), logTailBytes))
+	return redactPEM(workspaces.RedactGitSecrets(tail(string(out), logTailBytes)))
 }
 
 // redactErr renders an error for a user-visible field with secrets stripped.
@@ -341,10 +370,12 @@ func redactErr(err error) string {
 	if err == nil {
 		return ""
 	}
-	return redactSecrets(err.Error())
+	return redactPEM(workspaces.RedactGitSecrets(err.Error()))
 }
 
-func redactSecrets(s string) string {
+// redactPEM truncates at the first armored key header so an xcodebuild/tool
+// error echoing a certificate or signing key cannot leak its body.
+func redactPEM(s string) string {
 	const marker = "-----BEGIN"
 	if i := strings.Index(s, marker); i >= 0 {
 		s = s[:i] + "[redacted key material]"

@@ -13,11 +13,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
-)// Host-level tool install (currently Node.js). The node downloads the official
+) // Host-level tool install (currently Node.js). The node downloads the official
 // platform archive the server picked, extracts it under a node-managed tools
 // directory beside the state dir and puts that bin dir on the process PATH, so
 // every later LookPath-based probe (runtime launcher, editor install, version
@@ -156,20 +157,52 @@ func InstallHostTool(
 func installXcodeDetection(ctx context.Context, spec *agentcomposev2.NodeInstallHostTool, log *slog.Logger, _ proxySpec) error {
 	if v := probeHostTool(ctx, "xcodebuild", "-version"); v != "" {
 		log.Info("host-tool: xcode detected", "version", v)
+		acceptXcodeLicenseBestEffort(ctx, log)
 		return nil
 	}
-	// /usr/bin/xcodebuild exists on a CLT-only machine too, but it refuses to
-	// run without the full Xcode.app — which is exactly why the probe above
-	// failed. xcode-select -p turns that case into a sharper message.
-	if out, err := exec.Command("xcode-select", "-p").Output(); err == nil {
-		if strings.HasSuffix(strings.TrimSpace(string(out)), "CommandLineTools") {
-			return fmt.Errorf("本机只装了 Command Line Tools，运行不了 xcodebuild（iOS 构建需要完整 Xcode）。" +
-				"Xcode 只能从 App Store 手动安装（约 7GB，需 Apple ID 登录并接受许可协议），节点无法自动安装。" +
-				"安装完成后回到环境面板再次点击「检测 Xcode」；新版节点会立即刷新构建能力标签，旧版节点程序需重启一次。")
+
+	candidates := discoverXcodeApps()
+	for _, app := range candidates {
+		devDir := filepath.Join(app, "Contents", "Developer")
+		// A real Xcode carries its own xcodebuild inside the app bundle; the
+		// /usr/bin shim alone proves nothing (it exists on CLT-only boxes too).
+		if _, err := os.Stat(filepath.Join(devDir, "usr", "bin", "xcodebuild")); err != nil {
+			log.Debug("host-tool: skipping xcode candidate without toolchain", "app", app)
+			continue
+		}
+		mode := activateDeveloperDir(devDir, log)
+		if v := probeHostTool(ctx, "xcodebuild", "-version"); v != "" {
+			log.Info("host-tool: xcode detected after activation", "version", v, "app", app, "activation", mode)
+			acceptXcodeLicenseBestEffort(ctx, log)
+			return nil
 		}
 	}
-	return fmt.Errorf("未检测到完整 Xcode：xcodebuild 随完整 Xcode 提供，只能从 App Store 手动安装" +
-		"（约 7GB，需 Apple ID 登录并接受许可协议），节点无法自动安装。安装完成后重启节点进程，重新探测。")
+
+	return xcodeDetectionFailure(candidates)
+}
+
+// xcodeDetectionFailure builds the ack error when no Xcode on the host could
+// be made to run. It names the active developer directory (xcode-select -p):
+// the /usr/bin/xcodebuild shim exists on a CLT-only machine too but refuses to
+// run — naming it turns "detection failed" into the host's actual state.
+func xcodeDetectionFailure(candidates []string) error {
+	detail := ""
+	if out, err := exec.Command("xcode-select", "-p").Output(); err == nil {
+		if active := strings.TrimSpace(string(out)); active != "" {
+			detail = fmt.Sprintf("当前 xcode-select 指向 %s。", active)
+		}
+	}
+	if len(candidates) > 0 {
+		return fmt.Errorf("本机发现 Xcode（%s）但激活后 xcodebuild 仍无法运行，%s"+
+			"常见原因是首次启动未完成组件安装：打开一次 Xcode 让它装完组件，"+
+			"或在本机终端执行 sudo xcode-select -s <上述 Xcode>/Contents/Developer 与 "+
+			"sudo xcodebuild -license accept 后重试检测",
+			strings.Join(candidates, "、"), detail)
+	}
+	return fmt.Errorf("未在 /Applications、~/Applications、~/Downloads 找到 Xcode.app 或 Xcode-beta.app，%s"+
+		"Xcode 只能从 App Store 或 developer.apple.com 手动安装（约 7GB、需 Apple ID 登录并接受许可协议），"+
+		"节点无法自动下载安装。装完后回到环境面板再点一次「检测 Xcode」，节点会自动查找并激活它",
+		detail)
 }
 
 // installHostNodeJS downloads the official Node.js archive for this platform,
@@ -474,4 +507,128 @@ func npmBinary() string {
 		return "npm.cmd"
 	}
 	return "npm"
+}
+
+// ── Xcode discovery / activation ──────────────────────────────────────────────
+
+// discoverXcodeApps returns installed Xcode app bundles by preference: the
+// stable "Xcode.app" first, then "Xcode-beta.app", then any other Xcode*.app
+// (Apple also ships "Xcode 26.0 beta 2.app" style names). Scans /Applications,
+// ~/Applications and ~/Downloads — the latter because a freshly extracted xip
+// often never made it out of there.
+func discoverXcodeApps() []string {
+	home, _ := os.UserHomeDir()
+	dirs := []string{"/Applications"}
+	if home != "" {
+		dirs = append(dirs, filepath.Join(home, "Applications"), filepath.Join(home, "Downloads"))
+	}
+	return filterXcodeCandidates(dirs)
+}
+
+// filterXcodeCandidates is the testable core of discoverXcodeApps: glob each
+// dir for Xcode*.app, keep real directories, stable name first, then beta,
+// then anything else sorted.
+func filterXcodeCandidates(dirs []string) []string {
+	var exact, rest []string
+	for _, dir := range dirs {
+		matches, _ := filepath.Glob(filepath.Join(dir, "Xcode*.app"))
+		for _, m := range matches {
+			if info, err := os.Stat(m); err != nil || !info.IsDir() {
+				continue
+			}
+			switch filepath.Base(m) {
+			case "Xcode.app", "Xcode-beta.app":
+				exact = append(exact, m)
+			default:
+				rest = append(rest, m)
+			}
+		}
+	}
+	sort.Slice(exact, func(i, j int) bool {
+		// "Xcode.app" (stable) beats "Xcode-beta.app" — lexicographic order
+		// would put the beta first.
+		return filepath.Base(exact[i]) == "Xcode.app"
+	})
+	sort.Strings(rest)
+	return append(exact, rest...)
+}
+
+// activateDeveloperDir points the toolchain at devDir and returns how:
+// "xcode-select" (system-wide, needs root — the node often runs as root on
+// dedicated build hosts) or "DEVELOPER_DIR" (rootless, scoped to this process
+// and its children — the build runner included). The env fallback is
+// persisted via saveDeveloperDir and re-applied by EnsureDeveloperDir at
+// startup, so a restart keeps working without anyone re-clicking detect.
+func activateDeveloperDir(devDir string, log *slog.Logger) string {
+	if out, err := exec.Command("xcode-select", "-s", devDir).CombinedOutput(); err == nil {
+		return "xcode-select"
+	} else {
+		log.Debug("host-tool: xcode-select -s failed (root needed?), falling back to DEVELOPER_DIR",
+			"error", err, "output", strings.TrimSpace(string(out)))
+	}
+	os.Setenv("DEVELOPER_DIR", devDir)
+	if err := saveDeveloperDir(devDir); err != nil {
+		log.Warn("host-tool: persist DEVELOPER_DIR for restarts failed", "error", err)
+	}
+	return "DEVELOPER_DIR"
+}
+
+// developerDirPath is the state file recording the DEVELOPER_DIR fallback so
+// a node restart re-applies it before the register-time host probes.
+func developerDirPath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "developer-dir"), nil
+}
+
+func saveDeveloperDir(devDir string) error {
+	path, err := developerDirPath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(devDir), 0o644)
+}
+
+// EnsureDeveloperDir re-applies the persisted DEVELOPER_DIR fallback at
+// startup (before the register-time HostToolLabels probe), mirroring
+// EnsureManagedNodeOnPath. Idempotent; a stale entry (Xcode uninstalled) is
+// dropped so the state file never pins a dead path.
+func EnsureDeveloperDir() {
+	if os.Getenv("DEVELOPER_DIR") != "" {
+		return // operator-provided env wins; never override it
+	}
+	path, err := developerDirPath()
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	devDir := strings.TrimSpace(string(raw))
+	if devDir == "" {
+		return
+	}
+	if _, err := os.Stat(devDir); err != nil {
+		_ = os.Remove(path) // the Xcode it pointed at is gone; reset cleanly
+		return
+	}
+	os.Setenv("DEVELOPER_DIR", devDir)
+}
+
+// acceptXcodeLicenseBestEffort runs `xcodebuild -license accept` once the
+// toolchain runs. License acceptance needs root when the app bundle is
+// root-owned (the usual case); on a non-root node it fails fast and we only
+// log — detection (-version) succeeds unlicensed, the build would not, and
+// the operator can accept manually with sudo.
+func acceptXcodeLicenseBestEffort(ctx context.Context, log *slog.Logger) {
+	licenseCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(licenseCtx, "xcodebuild", "-license", "accept").CombinedOutput(); err != nil {
+		log.Debug("host-tool: xcodebuild -license accept not completed (non-root?)",
+			"error", err, "output", strings.TrimSpace(string(out)),
+			"hint", "build will prompt; run sudo xcodebuild -license accept on the host")
+	}
 }

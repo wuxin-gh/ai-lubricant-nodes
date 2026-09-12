@@ -24,19 +24,28 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$HERE/dist"
-rm -rf "$DIST"
-mkdir -p "$DIST"
 
 # Version stamped into both binaries' main.buildVersion via -ldflags -X. Prefer
-# an explicit VERSION env (a release tag); otherwise derive <utc-date>-<short-sha>
-# from git so every build self-identifies. The node reports this as the
-# client_version capability label the console shows.
+# an explicit VERSION env (a release tag); otherwise derive <local-date>-
+# <local-time>（YYYYMMDD-HHMM）——本地时间口径（2026-09-11 起；UTC 口径的
+# 20260911-0930 是最后一个 UTC 版本号，本地时间号恒大于它，排序不回退）。
+# 与 pack-release.sh 同口径，dev build 与 release 版本号同格式、可直接互比。
+# node 上报此值为 client_version 能力标签。
 VERSION="${VERSION:-}"
 if [ -z "$VERSION" ]; then
-  SHA="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  VERSION="$(date -u +%Y%m%d)-$SHA"
+  VERSION="$(date +%Y%m%d-%H%M)"
 fi
 echo "version: $VERSION"
+
+# 版本目录布局：产物直接进 ``dist/<version>/``（与 node_server/binaries.py 的
+# 版本目录解析对齐——``_resolve_candidate_root`` 取含二进制的最新版本子目录，
+# ``latest_node_version`` 把目录名当版本号）。release 打包脚本（pack-release.sh）
+# 走的就是这个布局；dev build 也用同一布局，服务端 ``/binaries/*`` 路由与
+# ``latest_node_version`` 零改动直接吃到新构建。每次构建清掉 dist 全量重建，
+# dev 不留历史版本（release 才累积）。
+rm -rf "$DIST"
+BUILD_DIR="$DIST/$VERSION"
+mkdir -p "$BUILD_DIR"
 
 # Marketplace-recognized artifact names. Keep in sync with
 # monkeycode_compat/marketplace/validator.py:identify_node_asset.
@@ -76,16 +85,15 @@ for role_pair in $ROLES; do
     [ "$os" = "windows" ] && ext=".exe"
     name="$label-$os-$arch$ext"
     assert_artifact_name "$name"
-    out="$DIST/$name"
+    out="$BUILD_DIR/$name"
     echo "building $out"
     ( cd "$HERE" && GOOS="$os" GOARCH="$arch" go build -ldflags="-s -w -X main.buildVersion=$VERSION" -o "$out" "./$role" )
   done
 done
 
-# Stamp the built version into dist/VERSION so the server can read the latest
-# available node version (see nodes_service.latest_node_version) and offer a
-# self-upgrade to nodes still reporting an older client_version.
-printf '%s\n' "$VERSION" > "$DIST/VERSION"
+# 版本目录布局下版本号=目录名（node_server/binaries.py 直接读目录名），不再
+# 单独写 VERSION 文件——release 打包脚本同口径。
+
 
 # Optional: package one platform-independent JavaScript runtime archive. The archive
 # content is identical on every OS/arch; the node runs it with the host's Node.js.
@@ -117,15 +125,15 @@ if [ -n "$RUNTIME_DIST" ]; then
       exit 1
     fi
   fi
-  echo "packaging $DIST/node-runtime.tar.gz"
-  ( cd "$STAGE" && tar -czf "$DIST/node-runtime.tar.gz" runtime )
-  printf '%s\n' "$RUNTIME_VERSION" > "$DIST/runtime-VERSION"
+  echo "packaging $BUILD_DIR/node-runtime.tar.gz"
+  ( cd "$STAGE" && tar -czf "$BUILD_DIR/node-runtime.tar.gz" runtime )
+  printf '%s\n' "$RUNTIME_VERSION" > "$BUILD_DIR/runtime-VERSION"
 else
   echo "skipping runtime packaging (set RUNTIME_DIST=<runtime dir with dist/cli.js> to include it)"
 fi
 
 echo "checksums"
-( cd "$DIST" && sha256sum -- * > checksums-sha256.txt )
+( cd "$BUILD_DIR" && sha256sum -- * > checksums-sha256.txt )
 
-echo "done; artifacts in $DIST:"
-ls -la "$DIST"
+echo "done; artifacts in $BUILD_DIR:"
+ls -la "$BUILD_DIR"

@@ -5,10 +5,19 @@
 #
 # Package set is the base image's (see nodes/docker/Dockerfile for why each is
 # needed) — this image only adds the bundled runtime and the pre-installed
-# review CLIs on top.
-FROM alpine:3.22
+# review CLIs on top. ALPINE_BASE / APK_MIRROR / NPM_REGISTRY mirror the base
+# image's China-mirror args (baked by the installer under MIRROR_MODE=cn).
+ARG ALPINE_BASE=alpine:3.22
+FROM ${ALPINE_BASE}
 
-RUN apk add --no-cache \
+ARG APK_MIRROR=
+ARG NPM_REGISTRY=
+
+# 国内部署：先把官方 apk CDN 换域名，再装包（路径结构一致）。
+RUN if [ -n "$APK_MIRROR" ]; then \
+        sed -i "s#dl-cdn.alpinelinux.org#$APK_MIRROR#g" /etc/apk/repositories; \
+    fi \
+ && apk add --no-cache \
     ca-certificates \
     docker-cli \
     git \
@@ -26,10 +35,15 @@ RUN chmod +x \
     /usr/local/bin/node-execution \
     /usr/local/bin/node-management \
     /usr/local/bin/node-entrypoint \
-    /usr/local/bin/agent-compose-runtime \
- && npm install -g \
-    @anthropic-ai/claude-code \
-    @alibaba-group/open-code-review \
+    /usr/local/bin/agent-compose-runtime
+RUN set -eu; \
+    if [ -n "$NPM_REGISTRY" ]; then npm install -g --registry="$NPM_REGISTRY" \
+        @anthropic-ai/claude-code \
+        @alibaba-group/open-code-review; \
+    else npm install -g \
+        @anthropic-ai/claude-code \
+        @alibaba-group/open-code-review; \
+    fi \
  && npm cache clean --force
 
 # Same bind-mount ownership reason as the base image.

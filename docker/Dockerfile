@@ -10,7 +10,14 @@
 # 这样管理容器与其拉起的子执行容器共用同一镜像，宿主机只缓存一份。
 #
 # docker-cli 让管理节点能在容器内 `docker run` 子执行节点（通过挂载的 docker.sock）。
-FROM alpine:3.22
+# ALPINE_BASE / APK_MIRROR / NPM_REGISTRY 三个 arg 由安装脚本按服务端 MIRROR_MODE=cn
+# 以 --build-arg 注入（见 user_platform/nodes_service.py 的镜像源烘焙）：海外直连时
+# 全空 = 与官方源逐字节一致的行为；国内时分别换成加速器镜像、阿里云 apk 源、npmmirror。
+ARG ALPINE_BASE=alpine:3.22
+FROM ${ALPINE_BASE}
+
+ARG APK_MIRROR=
+ARG NPM_REGISTRY=
 
 # 节点容器要能跑 agent 会话、clone 仓库、装编辑器 CLI，光有两个二进制不够。每个包都
 # 对应节点运行时确实会 exec 的外部命令，缺一个对应链路就断：
@@ -24,7 +31,11 @@ FROM alpine:3.22
 #   docker-cli     — 管理节点 + 执行节点 docker driver 经 docker.sock 拉子执行容器。
 #   ca-certificates — TLS：git/npm/服务端 HTTPS 出站校验。
 #   tini           — PID1 + 信号 reap（ENTRYPOINT 用）。
-RUN apk add --no-cache \
+# 国内部署 APK_MIRROR 非空时先把官方 CDN 换成国内镜像（路径结构一致，只替换域名）。
+RUN if [ -n "$APK_MIRROR" ]; then \
+        sed -i "s#dl-cdn.alpinelinux.org#$APK_MIRROR#g" /etc/apk/repositories; \
+    fi \
+ && apk add --no-cache \
     ca-certificates \
     docker-cli \
     git \
@@ -61,11 +72,18 @@ RUN mkdir -p /opt/agent-compose/state \
 # claude/codex/gemini/opencode。执行节点注册时探测 PATH 上这些 CLI 上报 providers，镜像自带
 # 即满足审批「至少一个编辑器」门禁。Cursor 不是 npm 包（官方 curl 安装器），无法作为
 # 可复现的非交互 Alpine build 输入；它需要时再从节点详情单独安装。
-RUN npm install -g \
-    @anthropic-ai/claude-code \
-    @openai/codex \
-    @google/gemini-cli \
-    opencode-ai \
+RUN set -eu; \
+    if [ -n "$NPM_REGISTRY" ]; then npm install -g --registry="$NPM_REGISTRY" \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+        @google/gemini-cli \
+        opencode-ai; \
+    else npm install -g \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+        @google/gemini-cli \
+        opencode-ai; \
+    fi \
  && npm cache clean --force
 
 # System mode is disabled in container nodes by default: the container HOME is

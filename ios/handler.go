@@ -189,6 +189,27 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		}
 		c.SendAck(frameID, h.jobs.Cancel(payload.IosJobCancel.GetJobId()), nil)
 
+	case *agentcomposev2.NodeDownstreamFrame_IosRunnerControl:
+		if h.manager == nil {
+			c.SendAck(frameID, errNoManager, nil)
+			return
+		}
+		// Start/stop/restart drives the persistent device loop: it can cancel
+		// and relaunch a runner, which is off-dispatch-loop work. Ack carries
+		// the transition result (a no-op START on an already-running device is
+		// still ok).
+		go func(req *agentcomposev2.NodeIosRunnerControl) {
+			err := h.manager.ControlRunner(ctx, req)
+			if err != nil {
+				c.Logger().Warn("ios runner control failed",
+					"udid", req.GetUdid(), "action", req.GetAction(), "error", err)
+			} else {
+				c.Logger().Info("ios runner control",
+					"udid", req.GetUdid(), "action", req.GetAction())
+			}
+			c.SendAck(frameID, err, nil)
+		}(payload.IosRunnerControl)
+
 	case *agentcomposev2.NodeDownstreamFrame_CreateSession,
 		*agentcomposev2.NodeDownstreamFrame_DeleteSession,
 		*agentcomposev2.NodeDownstreamFrame_ListSessions,

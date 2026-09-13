@@ -39,6 +39,15 @@ import (
 	"device-control/ios/devicecontrol"
 )
 
+// Default automation runner. go-ios 1.3.2 ships DeviceKit as the default UI
+// backend; the legacy WebDriverAgent bundle is kept as a documented fallback
+// (override the artifact's target_bundle_id / xctest_config_name from the
+// server to ship a WDA runner ipa instead).
+const (
+	defaultDeviceKitBundleID = "com.deviceboxhq.goios.devicekit.runner"
+	defaultDeviceKitXctest   = "devicekit-iosUITests.xctest"
+)
+
 // downloadResolver supplies the node's egress-proxy-aware download route.
 // *agent.Client implements it; nil means download directly with no URL rewrite.
 type downloadResolver interface {
@@ -237,7 +246,7 @@ func (s *goiosWdaSteps) PrepareSigning(ctx context.Context, req *agentcomposev2.
 			IssuerID:   mat.GetAscIssuerId(),
 			PrivateKey: mat.GetAscPrivateKey(),
 		}
-		bundleID := firstNonEmpty(req.GetArtifact().GetTargetBundleId(), "com.devicecontrol.WebDriverAgentRunner")
+		bundleID := firstNonEmpty(req.GetArtifact().GetTargetBundleId(), defaultDeviceKitBundleID)
 		p12Path := filepath.Join(workDir, "identity.p12")
 		profilePath := filepath.Join(workDir, "profile.mobileprovision")
 		// Password protects the p12 at rest inside the job work dir only; the
@@ -335,10 +344,10 @@ func (s *goiosWdaSteps) Install(ctx context.Context, udid, signedPath string) er
 // device ready — an installed-but-unreachable WDA must never look "ready".
 func (s *goiosWdaSteps) Launch(ctx context.Context, udid, bundleID, xctestConfig string, stage func(agentcomposev2.IosJobStage)) (int, error) {
 	if bundleID == "" {
-		return 0, errors.New("launch: WDA bundle id is empty")
+		return 0, errors.New("launch: runner bundle id is empty")
 	}
 	if xctestConfig == "" {
-		xctestConfig = "WebDriverAgentRunner.xctest"
+		xctestConfig = defaultDeviceKitXctest
 	}
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_STARTING_RUNNER)
 
@@ -358,10 +367,10 @@ func (s *goiosWdaSteps) Launch(ctx context.Context, udid, bundleID, xctestConfig
 	defer link.Close()
 
 	// Smoke test: a real screen read proves the whole chain (runner → forward →
-	// HTTP → session → accessibility tree), not just that a port is open.
+	// control RPC → accessibility tree), not just that a port is open.
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_VERIFYING_CONTROL)
 	if _, err := link.Source(ctx); err != nil {
-		return 0, fmt.Errorf("wda control check: %w", err)
+		return 0, fmt.Errorf("runner control check: %w", err)
 	}
 	return 0, nil
 }

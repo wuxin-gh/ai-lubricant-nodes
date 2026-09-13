@@ -166,6 +166,24 @@ type managedDevice struct {
 	log    *slog.Logger
 }
 
+// defaultRunnerBundle returns v when set, else the DeviceKit runner bundle id
+// (go-ios 1.3.2's default UI backend). Used when seeding devices from
+// devices.json so a bare `pair` produces a runnable DeviceKit device.
+func defaultRunnerBundle(v string) string {
+	if v = strings.TrimSpace(v); v != "" {
+		return v
+	}
+	return "com.deviceboxhq.goios.devicekit.runner"
+}
+
+// defaultRunnerXctest returns v when set, else the DeviceKit xctest config.
+func defaultRunnerXctest(v string) string {
+	if v = strings.TrimSpace(v); v != "" {
+		return v
+	}
+	return "devicekit-iosUITests.xctest"
+}
+
 // NewDeviceManager builds a manager, filling in production seams.
 func NewDeviceManager(cfg ManagerConfig) *DeviceManager {
 	m := &DeviceManager{
@@ -213,8 +231,8 @@ func (m *DeviceManager) adoptConfiguredDevices() {
 			udid:           d.UDID,
 			name:           d.Name,
 			transport:      d.Transport,
-			wdaBundle:      d.WDABundle,
-			xctest:         d.XCTest,
+			wdaBundle:      defaultRunnerBundle(d.WDABundle),
+			xctest:         defaultRunnerXctest(d.XCTest),
 			hostWDAPort:    d.WDAPort,
 			credentialPath: d.CredentialPath,
 			claimed:        d.CredentialPath != "",
@@ -334,6 +352,93 @@ func (m *DeviceManager) Claim(ctx context.Context, req *agentcomposev2.NodeIosCl
 	m.reportLocked()
 	m.mu.Unlock()
 	return cred.DeviceID, nil
+}
+
+// ControlRunner starts/stops/restarts the long-lived device-control loop on a
+// claimed device, without touching its claim, device_id, credential or cached
+// wda state — so STOP followed by START picks back up without re-claiming.
+//
+//   - START: idempotent. A loop already running (dev.cancel != nil) is a no-op
+//     success. A device with no credential on disk (never claimed) is refused
+//     — there is nothing for startDeviceLocked's runner to authenticate with.
+//   - STOP: idempotent. A stopped device is a no-op success. The goroutine is
+//     cancelled and waited (bounded) so the ack reflects the actual state.
+//   - RESTART: stop then start. Equivalent to a config-change restart.
+//
+// device_control_online in the inventory report reflects the resulting state
+// on the next report.
+func (m *DeviceManager) ControlRunner(ctx context.Context, req *agentcomposev2.NodeIosRunnerControl) error {
+	action := req.GetAction()
+	udid := strings.TrimSpace(req.GetUdid())
+	deviceID := strings.TrimSpace(req.GetDeviceId())
+
+	m.mu.Lock()
+	dev := m.findLocked(deviceID, udid)
+	if dev == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("runner control: device %s not found on this host", describeTarget(deviceID, udid))
+	}
+	if dev.credentialPath == "" {
+		m.mu.Unlock()
+		return fmt.Errorf("runner control: device %s is not claimed (no credential on disk)", dev.udid)
+	}
+
+	switch action {
+	case agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START:
+		// Idempotent: already running is a success.
+		if dev.cancel == nil && !m.stopped.Load() {
+			m.startDeviceLocked(ctx, dev)
+			m.markDirtyLocked()
+			m.reportLocked()
+		}
+		m.mu.Unlock()
+		return nil
+
+	case agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP,
+		agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_RESTART:
+		// Drop the handle under the lock; wait for the goroutine outside so the
+		// OnState callback (which re-takes m.mu) cannot deadlock.
+		cancel := dev.cancel
+		done := dev.done
+		dev.cancel = nil
+		dev.done = nil
+		// For STOP, reflect "intentionally off" by clearing the device_control
+		// flag immediately; the goroutine will also clear it on exit, but the
+		// flag flip lets the next report surface "stopped" without waiting for
+		// the goroutine to wind down.
+		dev.deviceControlOn = false
+		m.markDirtyLocked()
+		m.reportLocked()
+		m.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+			if done != nil {
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					dev.log.Warn("runner control: device loop did not stop in time")
+				}
+			}
+		}
+
+		if action == agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_RESTART {
+			m.mu.Lock()
+			// Re-resolve: a wipe could have flipped claimed during stop; respect it.
+			dev = m.findLocked(deviceID, udid)
+			if dev != nil && dev.credentialPath != "" && !m.stopped.Load() {
+				m.startDeviceLocked(ctx, dev)
+				m.markDirtyLocked()
+				m.reportLocked()
+			}
+			m.mu.Unlock()
+		}
+		return nil
+
+	default:
+		m.mu.Unlock()
+		return fmt.Errorf("runner control: unknown action %d", action)
+	}
 }
 
 // Release stops driving a device and optionally deletes its local credential.

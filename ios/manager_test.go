@@ -728,3 +728,120 @@ func TestConfigureStoresRenewBeforeDays(t *testing.T) {
 		t.Fatalf("renewBeforeDays = %d, want 7", got)
 	}
 }
+
+func TestControlRunnerStopThenStartKeepsClaim(t *testing.T) {
+	m, _, _, runner, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Rescan(ctx)
+
+	if _, err := m.Claim(ctx, claimReq("udid-a")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "device loop live after claim")
+
+	// STOP: loop winds down, but claim + device_id + credential stay.
+	if err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP,
+	}); err != nil {
+		t.Fatalf("STOP: %v", err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 0 }, "device loop stopped")
+	m.mu.Lock()
+	dev := m.devices["udid-a"]
+	claimIntact := dev.claimed && dev.deviceID != "" && dev.credentialPath != "" && dev.cancel == nil
+	m.mu.Unlock()
+	if !claimIntact {
+		t.Fatal("STOP must preserve claim/device_id/credential and clear cancel")
+	}
+
+	// START: loop comes back; no second pair / no re-claim.
+	if err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START,
+	}); err != nil {
+		t.Fatalf("START: %v", err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "device loop live after START")
+	// startCount is 2 (claim + explicit start), not 3 (no re-pair/re-claim path).
+	if n := runner.startCount("udid-a"); n != 2 {
+		t.Fatalf("start count = %d, want 2 (claim + start)", n)
+	}
+}
+
+func TestControlRunnerStartIsIdempotent(t *testing.T) {
+	m, _, _, runner, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Rescan(ctx)
+	if _, err := m.Claim(ctx, claimReq("udid-a")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "loop live after claim")
+
+	// START while running is a no-op success; does not spawn a second goroutine.
+	if err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START,
+	}); err != nil {
+		t.Fatalf("idempotent START: %v", err)
+	}
+	if n := runner.startCount("udid-a"); n != 1 {
+		t.Fatalf("idempotent start must not spawn: start count = %d, want 1", n)
+	}
+}
+
+func TestControlRunnerRestartCyclesLoop(t *testing.T) {
+	m, _, _, runner, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Rescan(ctx)
+	if _, err := m.Claim(ctx, claimReq("udid-a")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return runner.startCount("udid-a") == 1 }, "first start")
+
+	if err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_RESTART,
+	}); err != nil {
+		t.Fatalf("RESTART: %v", err)
+	}
+	waitFor(t, func() bool { return runner.startCount("udid-a") == 2 }, "restart starts a second loop")
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "exactly one loop live after restart")
+}
+
+func TestControlRunnerRejectsUnclaimedDevice(t *testing.T) {
+	m, _, _, _, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Rescan(ctx)
+
+	// Never claimed: a START must be refused (no credential to authenticate).
+	err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		Udid:   "udid-a",
+		Action: agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START,
+	})
+	if err == nil {
+		t.Fatal("START on an unclaimed device must error")
+	}
+}
+
+func TestControlRunnerUnknownDevice(t *testing.T) {
+	m, _, _, _, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Rescan(ctx)
+
+	if err := m.ControlRunner(ctx, &agentcomposev2.NodeIosRunnerControl{
+		Udid:   "udid-ghost",
+		Action: agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP,
+	}); err == nil {
+		t.Fatal("STOP on an unknown UDID must error")
+	}
+}

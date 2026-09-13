@@ -38,9 +38,9 @@ func cmdPair(args []string) {
 	udid := fs.String("udid", "", "device UDID (from `go-ios list` / `idevice_id -l`; empty means first available at run time)")
 	name := fs.String("name", "", "human label for this device (default: the UDID, or 'device')")
 	transport := fs.String("transport", "usb", "usb|network")
-	wdaBundle := fs.String("wda-bundle", "", "WebDriverAgent Runner bundle id (e.g. com.you.WebDriverAgentRunner.xctrunner)")
-	xctest := fs.String("xctest", "WebDriverAgentRunner.xctest", "xctest config name inside the runner")
-	wdaPort := fs.Int("wda-port", 0, "forwarded WDA HTTP port (the port WDA prints on start)")
+	wdaBundle := fs.String("wda-bundle", "", "automation runner bundle id (default: com.deviceboxhq.goios.devicekit.runner, the DeviceKit runner; override with a WebDriverAgent bundle to use WDA)")
+	xctest := fs.String("xctest", "devicekit-iosUITests.xctest", "xctest config name inside the runner (devicekit-iosUITests.xctest for DeviceKit, WebDriverAgentRunner.xctest for WDA)")
+	wdaPort := fs.Int("wda-port", 0, "forwarded runner HTTP port (0 = dynamic allocation; DeviceKit listens on 12004 on the device)")
 	// host-node-id associates this sidecar with an existing agent-compose node
 	// (typically the execution node on the same host) WITHOUT registering a
 	// second NodeConnect identity: the id is carried in each device's register
@@ -93,11 +93,19 @@ func cmdPair(args []string) {
 		cfg.HostNodeID = hostNodeIDVal
 	}
 
+	// Default the runner bundle to DeviceKit when the caller didn't pass one.
+	// (Empty would silently disable launch later; pin the default here so a bare
+	// `pair` invocation produces a runnable device.)
+	wdaBundleVal := strings.TrimSpace(*wdaBundle)
+	if wdaBundleVal == "" {
+		wdaBundleVal = "com.deviceboxhq.goios.devicekit.runner"
+	}
+
 	dev := cfg.Upsert(DeviceConfig{
 		Name:           deviceName,
 		UDID:           udidVal,
 		Transport:      strings.TrimSpace(*transport),
-		WDABundle:      strings.TrimSpace(*wdaBundle),
+		WDABundle:      wdaBundleVal,
 		XCTest:         strings.TrimSpace(*xctest),
 		WDAPort:        *wdaPort,
 		CredentialPath: credPath,

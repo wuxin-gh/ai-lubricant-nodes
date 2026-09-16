@@ -16,7 +16,7 @@
 // profile) arrives per job over the authenticated NodeConnect stream, is written
 // 0600 under the host's own state dir, and must never appear in a job event, an
 // ack, or a log line. redactErr is the single funnel for error text.
-package main
+package ioshost
 
 import (
 	"context"
@@ -79,15 +79,15 @@ type WdaJobManager struct {
 	emit     JobEmitter
 	steps    WdaSteps
 	stateDir string
-	logger   logger
+	Logger   Logger
 
 	mu   sync.Mutex
 	jobs map[string]*wdaJob
 }
 
-// logger is the subset of slog.Logger the engine uses (kept narrow so tests can
+// Logger is the subset of slog.Logger the engine uses (kept narrow so tests can
 // pass a no-op).
-type logger interface {
+type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 	Debug(msg string, args ...any)
@@ -104,12 +104,12 @@ type wdaJob struct {
 
 // NewWdaJobManager builds the job engine. stateDir is where per-job work
 // directories (artifacts, signing material) are created.
-func NewWdaJobManager(emit JobEmitter, steps WdaSteps, stateDir string, log logger) *WdaJobManager {
+func NewWdaJobManager(emit JobEmitter, steps WdaSteps, stateDir string, log Logger) *WdaJobManager {
 	return &WdaJobManager{
 		emit:     emit,
 		steps:    steps,
 		stateDir: stateDir,
-		logger:   log,
+		Logger:   log,
 		jobs:     map[string]*wdaJob{},
 	}
 }
@@ -220,7 +220,7 @@ func (m *WdaJobManager) runJob(ctx context.Context, j *wdaJob, req *agentcompose
 	// behind after the job ends.
 	defer func() {
 		if err := os.RemoveAll(workDir); err != nil {
-			m.logger.Warn("wda job: work dir cleanup failed", "job_id", j.id, "error", err)
+			m.Logger.Warn("wda job: work dir cleanup failed", "job_id", j.id, "error", err)
 		}
 	}()
 
@@ -356,7 +356,7 @@ func (m *WdaJobManager) finish(j *wdaJob, req *agentcomposev2.NodeIosWdaJobReque
 		msg = "job failed: " + out.errCode
 	}
 	m.event(j, terminal, msg, 0, redactErr(out.err))
-	m.logger.Info("wda job finished", "job_id", j.id, "udid", j.udid,
+	m.Logger.Info("wda job finished", "job_id", j.id, "udid", j.udid,
 		"ok", ok, "stage", jobStageName(out.stage), "error_code", out.errCode)
 
 	res := &agentcomposev2.NodeIosJobResult{
@@ -378,7 +378,7 @@ func (m *WdaJobManager) finish(j *wdaJob, req *agentcomposev2.NodeIosWdaJobReque
 	if err := m.emit(&agentcomposev2.NodeUpstreamFrame{
 		Frame: &agentcomposev2.NodeUpstreamFrame_IosJobResult{IosJobResult: res},
 	}); err != nil {
-		m.logger.Warn("wda job: result not sent", "job_id", j.id, "error", err)
+		m.Logger.Warn("wda job: result not sent", "job_id", j.id, "error", err)
 	}
 }
 
@@ -401,7 +401,7 @@ func (m *WdaJobManager) event(j *wdaJob, stage agentcomposev2.IosJobStage, msg s
 	if err := m.emit(&agentcomposev2.NodeUpstreamFrame{
 		Frame: &agentcomposev2.NodeUpstreamFrame_IosJobEvent{IosJobEvent: ev},
 	}); err != nil {
-		m.logger.Debug("wda job: event not sent", "job_id", j.id, "stage", stage.String(), "error", err)
+		m.Logger.Debug("wda job: event not sent", "job_id", j.id, "stage", stage.String(), "error", err)
 	}
 }
 

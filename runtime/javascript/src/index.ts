@@ -9,6 +9,7 @@ export { createInteractiveSession } from "./interactive.js";
 export type { InteractiveSession, TurnSnapshot } from "./interactive.js";
 export { ClaudeRunner } from "./runners/claude.js";
 export { CodexRunner } from "./runners/codex.js";
+export { DshRunner } from "./runners/dsh.js";
 export { GeminiRunner } from "./runners/gemini.js";
 export { OpenCodeRunner } from "./runners/opencode.js";
 export { BaseAcpRunner, type AcpSpawnSpec } from "./runners/acp/base.js";

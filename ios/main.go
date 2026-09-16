@@ -38,6 +38,7 @@ import (
 
 	"ai-lubricant-nodes/common/agent"
 	"ai-lubricant-nodes/common/build"
+	"ai-lubricant-nodes/common/ioshost"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
 
@@ -109,7 +110,7 @@ func cmdRun(args []string) {
 	// spawn a WS connection per device against the same device_id, which the
 	// spec carries one device_id each. No rebind flow — iOS has no TOTP node
 	// identity to verify the old process against; the operator stops it manually.
-	release, err := acquireLock()
+	release, err := ioshost.AcquireLock()
 	if err != nil {
 		logger.Error("acquire instance lock", "error", err)
 		os.Exit(1)
@@ -123,7 +124,7 @@ func cmdRun(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, path, err := LoadDevicesConfig(*configPath)
+	cfg, path, err := ioshost.LoadDevicesConfig(*configPath)
 	if err != nil {
 		logger.Error("load devices config", "error", err)
 		os.Exit(1)
@@ -143,7 +144,7 @@ func cmdRun(args []string) {
 	// go-ios's tunnel manager so the host needs no separate `ios tunnel start`
 	// process. Degraded start (port conflict, unwritable state dir) only
 	// affects 17+ phones — iOS ≤16 keeps working.
-	tunnels := startTunnelAgent(ctx, logger, stateDir(path))
+	tunnels := ioshost.StartTunnelAgent(ctx, logger, stateDir(path))
 	defer tunnels.Close()
 
 	var wg sync.WaitGroup
@@ -161,7 +162,7 @@ func cmdRun(args []string) {
 		// The manager owns discovery and the per-device connection loops; the job
 		// engine owns WDA preparation. Both report upstream through the client's
 		// stable EmitUpstream, which is why they are built after the client.
-		manager := NewDeviceManager(ManagerConfig{
+		manager := ioshost.NewDeviceManager(ioshost.ManagerConfig{
 			Logger:        logger,
 			ConfigPath:    path,
 			DevicesConfig: cfg,
@@ -172,7 +173,7 @@ func cmdRun(args []string) {
 				})
 			},
 		})
-		jobs := NewWdaJobManager(client.EmitUpstream, newGoiosWdaSteps(logger, client), stateDir(path), logger)
+		jobs := ioshost.NewWdaJobManager(client.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, client), stateDir(path), logger)
 		// A macOS iOS host is also the project-page build node (xcodebuild
 		// lives here). The runner is always wired; the server picks hosts by
 		// the xcodebuild_version capability label, so non-macOS hosts simply
@@ -183,7 +184,7 @@ func cmdRun(args []string) {
 		// installs run here where the hours-long pipeline fits.
 		xcodeJobs := agent.NewXcodeJobRunner(client.EmitUpstream, logger, client.DownloadProxy)
 
-		client.SetHandler(NewHandler(client, manager, jobs, builds, xcodeJobs))
+		client.SetHandler(ioshost.NewHandler(client, manager, jobs, builds, xcodeJobs))
 		manager.Start(ctx)
 		manager.StartClaimedDevices(ctx)
 		defer manager.Stop()
@@ -231,7 +232,7 @@ func stateDir(configPath string) string {
 // a node that advertises it, so an older node-ios — which would log-and-drop
 // them — never gets one, and the console can tell the user to upgrade instead of
 // leaving a button that times out.
-func nodeClientOptions(id *NodeIdentity) agent.Options {
+func nodeClientOptions(id *ioshost.NodeIdentity) agent.Options {
 	name := id.NodeName
 	if name == "" {
 		name = agent.DefaultNodeName()
@@ -260,7 +261,7 @@ func nodeClientOptions(id *NodeIdentity) agent.Options {
 //
 // nodeID, when non-empty, is carried in the device's register frame so the
 // server can join this device to its hosting node (version / online / upgrade).
-func runDevice(ctx context.Context, logger *slog.Logger, dev DeviceConfig, nodeID string) {
+func runDevice(ctx context.Context, logger *slog.Logger, dev ioshost.DeviceConfig, nodeID string) {
 	log := logger.With("device", dev.Name, "udid", dev.UDID)
 	log.Info("device connecting")
 

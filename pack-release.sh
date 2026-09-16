@@ -131,20 +131,33 @@ if [ -n "$RUNTIME_SRC" ]; then
   rm -rf "$STAGE/runtime/node_modules" "$STAGE/runtime/release" \
          "$STAGE/runtime/coverage" "$STAGE/runtime/test"
 
-  echo "==> 安装 runtime 生产依赖（不含 dev / SDK 自带平台 CLI）"
+  echo "==> 安装 runtime 生产依赖（含原生平台包，事后剔除 SDK 自带平台 CLI）"
   if [ ! -f "$STAGE/runtime/package-lock.json" ]; then
     echo "runtime 源缺少 package-lock.json，无法可复现地装依赖" >&2
     exit 1
   fi
-  # claude-agent-sdk / codex-sdk 把各平台 CLI 二进制声明为 optionalDependencies。
-  # runtime 本身通过 resolveExecutable 使用节点已安装、管理员批准的 claude/codex
-  # CLI，因此这些可选平台包既重复又有害：Windows stage 会把数百 MB 的 .exe 塞进
-  # Linux/macOS 归档。只保留 SDK JS 本体及 commander 等真正的生产依赖。
-  ( cd "$STAGE/runtime" && npm ci --omit=dev --omit=optional --no-audit --no-fund )
+  # 这里刻意**不用** --omit=optional。optional 里混着两类完全不同的东西：
+  #
+  #   1. claude-agent-sdk 的平台 CLI（@anthropic-ai/claude-agent-sdk-{darwin,linux,win32}-*）
+  #      —— 各平台数百 MB 的原生二进制。runtime 通过 resolveExecutable 走 PATH 取节点
+  #      已安装、管理员批准的 CLI，SDK 永不回退到自带包（见 claude.ts 的注释），所以
+  #      这些既重复又有害。装完后单独删掉。
+  #   2. dsh 依赖的原生模块平台包（@koromix/koffi-*、node-addon-require-builtin-*）
+  #      —— 单个 0.2~2.3MB，全平台合计约 11MB。这些是**必需的**：koffi 被
+  #      dsh-session-persistence-jsonl / dsh-subprocess-local 等核心包直接依赖，
+  #      拿不到平台二进制就回退源码编译（需 CMake/编译器），节点镜像是 alpine 且
+  #      不带构建工具链，必然失败；node-addon-require-builtin 则直接 fail closed。
+  #      用 --omit=optional 会把它们一并跳过，导致 dsh 在节点上根本起不来。
+  #
+  # 所以：完整安装（保留所有 optional），然后精确删除第 1 类。这样既拿到 dsh 必需
+  # 的原生包，又不把数百 MB 的 SDK 平台 CLI 塞进归档。
+  ( cd "$STAGE/runtime" && npm ci --omit=dev --no-audit --no-fund )
   if [ ! -d "$STAGE/runtime/node_modules" ]; then
     echo "npm ci 之后仍无 node_modules，拒绝打出跑不起来的包" >&2
     exit 1
   fi
+  echo "==> 剔除 claude-agent-sdk 自带的平台 CLI 二进制"
+  rm -rf "$STAGE/runtime/node_modules/@anthropic-ai/claude-agent-sdk-"* 2>/dev/null || true
 
   # 自检：归档的内容必须真的能启动。以前删了 node_modules 打出 114KB 的"空壳包",
   # 装到节点上才发现跑不起来；这道门禁把那类问题挡在打包阶段。

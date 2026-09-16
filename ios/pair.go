@@ -11,6 +11,7 @@ import (
 	"device-control/ios/devicecontrol"
 
 	"ai-lubricant-nodes/common/agent"
+	"ai-lubricant-nodes/common/ioshost"
 )
 
 // newFlagSet builds a flag set that reports parse errors without os.Exit, so the
@@ -24,7 +25,7 @@ func newFlagSet(name string) *flag.FlagSet {
 // configFlag registers the shared --config flag (empty = default location).
 func configFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", "",
-		"path to the devices config JSON (env "+configEnvOverride+"); default is <user-config-dir>/agent-compose/ios/devices.json")
+		"path to the devices config JSON (env "+ioshost.ConfigEnvOverride+"); default is <user-config-dir>/agent-compose/ios/devices.json")
 }
 
 // cmdPair redeems a pairing code, stores the credential, and records the device
@@ -72,12 +73,12 @@ func cmdPair(args []string) {
 		os.Exit(2)
 	}
 
-	cfg, path, err := LoadDevicesConfig(*configPath)
+	cfg, path, err := ioshost.LoadDevicesConfig(*configPath)
 	if err != nil {
 		logger.Error("load devices config", "error", err)
 		os.Exit(1)
 	}
-	credPath := defaultCredentialPath(path, deviceName)
+	credPath := ioshost.DefaultCredentialPath(path, deviceName)
 
 	// Pair redeems the code (POST /pair, probing the /mcp/device-control prefix)
 	// and writes the 0600 credential holding the probe-effective server URL. run
@@ -101,7 +102,7 @@ func cmdPair(args []string) {
 		wdaBundleVal = "com.deviceboxhq.goios.devicekit.runner"
 	}
 
-	dev := cfg.Upsert(DeviceConfig{
+	dev := cfg.Upsert(ioshost.DeviceConfig{
 		Name:           deviceName,
 		UDID:           udidVal,
 		Transport:      strings.TrimSpace(*transport),
@@ -110,7 +111,7 @@ func cmdPair(args []string) {
 		WDAPort:        *wdaPort,
 		CredentialPath: credPath,
 	})
-	if err := SaveDevicesConfig(path, cfg); err != nil {
+	if err := ioshost.SaveDevicesConfig(path, cfg); err != nil {
 		logger.Error("save devices config", "error", err)
 		os.Exit(1)
 	}

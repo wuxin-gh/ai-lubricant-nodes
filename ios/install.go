@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"ai-lubricant-nodes/common/agent"
+	"ai-lubricant-nodes/common/ioshost"
 )
 
 // cmdInstall saves the NodeConnect identity (server/node-id/secret) into the
@@ -37,7 +38,7 @@ func cmdInstall(args []string) {
 		os.Exit(2)
 	}
 
-	cfg, path, err := LoadDevicesConfig(*configPath)
+	cfg, path, err := ioshost.LoadDevicesConfig(*configPath)
 	if err != nil {
 		logger.Error("load devices config", "error", err)
 		os.Exit(1)
@@ -47,14 +48,14 @@ func cmdInstall(args []string) {
 	if nodeName == "" {
 		nodeName = agent.DefaultNodeName()
 	}
-	cfg.Node = &NodeIdentity{
+	cfg.Node = &ioshost.NodeIdentity{
 		Server:      strings.TrimRight(serverVal, "/"),
 		NodeID:      nodeIDVal,
 		Secret:      secretVal,
 		NodeName:    nodeName,
 		TLSInsecure: *tlsInsecure,
 	}
-	if err := SaveDevicesConfig(path, cfg); err != nil {
+	if err := ioshost.SaveDevicesConfig(path, cfg); err != nil {
 		logger.Error("save devices config", "error", err)
 		os.Exit(1)
 	}

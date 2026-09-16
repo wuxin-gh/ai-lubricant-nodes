@@ -1,4 +1,4 @@
-package main
+package ioshost
 
 import (
 	"os"
@@ -121,7 +121,7 @@ func TestSanitizeFileName(t *testing.T) {
 }
 
 func TestDefaultCredentialPath(t *testing.T) {
-	got := defaultCredentialPath(filepath.Join("dir", "devices.json"), "phone-1")
+	got := DefaultCredentialPath(filepath.Join("dir", "devices.json"), "phone-1")
 	want := filepath.Join("dir", "credentials", "phone-1.json")
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -132,15 +132,15 @@ func TestDefaultCredentialPath(t *testing.T) {
 // which is the whole point of the iOS-scoped instance lock.
 func TestAcquireLockIsExclusive(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(configEnvOverride, dir)
+	t.Setenv(ConfigEnvOverride, dir)
 
-	release, err := acquireLock()
+	release, err := AcquireLock()
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	defer release()
 
-	if _, err := acquireLock(); err != agent.ErrAlreadyRunning {
+	if _, err := AcquireLock(); err != agent.ErrAlreadyRunning {
 		t.Fatalf("second acquire: want ErrAlreadyRunning, got %v", err)
 	}
 }

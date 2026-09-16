@@ -30,6 +30,11 @@ import (
 type editorInstallSpec struct {
 	// npmPackage is the published package installed with `npm i -g <pkg>@latest`.
 	npmPackage string
+	// npmTag overrides the dist-tag/version appended to npmPackage. Empty means
+	// "@latest". Set this when the package's `latest` tag is stale relative to
+	// what the runtime's SDK dependency requires (dsh publishes prereleases
+	// under `next` while `latest` lags several releases behind).
+	npmTag string
 	// selfUpgrade, when non-empty, is the editor's own upgrade subcommand
 	// (argv after the editor binary). Used only when the editor is present.
 	selfUpgrade []string
@@ -47,6 +52,15 @@ var editorInstallSpecs = map[string]editorInstallSpec{
 	// codex / gemini have no self-updater: reinstall the latest npm package.
 	"codex":  {npmPackage: "@openai/codex"},
 	"gemini": {npmPackage: "@google/gemini-cli"},
+	// DeepSeek Harness ships as the npm CLI `@deepseek-ai/dsh` (bin `dsh`).
+	// The runner drives it through the SDK, but the SDK resolves the same
+	// same-version `@deepseek-ai/dsh` package as its runtime peer — installing
+	// the CLI globally is what makes the runner's `import` resolvable and the
+	// `dsh` binary probeable. No self-updater: reinstall.
+	// npmTag "next": dsh's `latest` dist-tag lags several releases behind the
+	// prereleases the SDK ships under `next` (0.1.5-rc.x). Installing @latest
+	// would give a version the SDK refuses to pair with.
+	"dsh": {npmPackage: "@deepseek-ai/dsh", npmTag: "next"},
 	// Cursor CLI installs via its official script and self-upgrades with
 	// `agent update` (its binary is named ``agent``, see agent.EditorCommandName).
 	// It is not published as an npm package, so installs point at the official
@@ -151,7 +165,11 @@ func editorCommand(editor string, spec editorInstallSpec, upgrade, installed boo
 	if err != nil {
 		return "", nil, fmt.Errorf("npm is required to install %s but was not found on PATH: %w", editor, err)
 	}
-	return npm, []string{"install", "-g", spec.npmPackage + "@latest"}, nil
+	tag := spec.npmTag
+	if tag == "" {
+		tag = "latest"
+	}
+	return npm, []string{"install", "-g", spec.npmPackage + "@" + tag}, nil
 }
 
 // probeVersion re-reads the editor/tool's version after a successful command. An

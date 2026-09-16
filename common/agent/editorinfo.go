@@ -18,7 +18,7 @@ import (
 
 // SupportedEditors is the set of provider CLIs this system can install,
 // upgrade, and report versions for.
-var SupportedEditors = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+var SupportedEditors = []string{"claude", "codex", "gemini", "opencode", "cursor", "dsh"}
 
 // HostTools are non-editor CLIs the node probes and reports as capability
 // labels (git / node / npm / agent-compose-runtime / ocr). Each entry maps the
@@ -373,6 +373,7 @@ var editorVersionArgs = map[string][]string{
 	"claude": {"--version"}, "codex": {"--version"},
 	"gemini": {"--version"}, "opencode": {"--version"},
 	"cursor": {"--version"},
+	"dsh":    {"--version"},
 }
 
 var versionNumberRe = regexp.MustCompile(`\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?`)
@@ -457,6 +458,8 @@ func EditorCapabilities(ctx context.Context) []*agentcomposev2.EditorCapability 
 			capability.Modes = probeNamedModes(ctx, provider, []string{"default", "auto_edit", "yolo"})
 		case "cursor":
 			capability.Modes = probeCursorModes(ctx)
+		case "dsh":
+			capability.Modes = probeNamedModes(ctx, provider, []string{"default", "plan", "full"})
 		}
 		if len(capability.Modes) == 0 {
 			capability.ProbeStatus = "partial"

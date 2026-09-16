@@ -1,4 +1,4 @@
-package main
+package ioshost
 
 import (
 	"encoding/json"
@@ -59,16 +59,16 @@ type NodeIdentity struct {
 	TLSInsecure bool   `json:"tls_insecure,omitempty"`
 }
 
-// configEnvOverride relocates the iOS config dir (tests, packaging). Single env
+// ConfigEnvOverride relocates the iOS config dir (tests, packaging). Single env
 // var for both the flag default and the dir override — there is no separate
 // "_DIR" form to confuse an operator into setting the wrong one.
-const configEnvOverride = "AGENT_COMPOSE_IOS_CONFIG_DIR"
+const ConfigEnvOverride = "AGENT_COMPOSE_IOS_CONFIG_DIR"
 
 // configDir returns <user-config-dir>/agent-compose/ios, honoring the env
 // override. Delegates to the shared agent.ResolveStateDir so the resolution
 // algorithm cannot drift from the other node binaries' config dir.
 func configDir() (string, error) {
-	return agent.ResolveStateDir(configEnvOverride, "ios")
+	return agent.ResolveStateDir(ConfigEnvOverride, "ios")
 }
 
 // resolveConfigPath returns the config path to use: the explicit flag when set,
@@ -84,11 +84,18 @@ func resolveConfigPath(explicit string) (string, error) {
 	return filepath.Join(dir, "devices.json"), nil
 }
 
-// defaultCredentialPath returns the credential file path for a device, beside the
+// DefaultCredentialPath returns the credential file path for a device, beside the
 // config as credentials/<safe-name>.json, so a device's long-lived token lives
 // next to the config that references it.
-func defaultCredentialPath(configPath, deviceName string) string {
+func DefaultCredentialPath(configPath, deviceName string) string {
 	return filepath.Join(filepath.Dir(configPath), "credentials", sanitizeFileName(deviceName)+".json")
+}
+
+// StateDir returns the directory WDA jobs use for scratch space (downloaded
+// artifacts, signing material). It sits beside devices.json so everything the
+// host writes lives under one owner-only tree.
+func StateDir(configPath string) string {
+	return filepath.Dir(configPath)
 }
 
 // lockPath returns the iOS-scoped single-instance lock file. It sits in the iOS
@@ -103,12 +110,12 @@ func lockPath() (string, error) {
 	return filepath.Join(dir, "ios.lock"), nil
 }
 
-// acquireLock takes the iOS-scoped single-instance lock. Reuses the shared
+// AcquireLock takes the iOS-scoped single-instance lock. Reuses the shared
 // platform LockFile (kernel-held, auto-released on process death). Returns
 // ErrAlreadyRunning if another node-ios holds it — there is no rebind/replacement
 // flow here because iOS has no TOTP node identity to verify the old process
 // against; the operator stops the old one manually.
-func acquireLock() (func() error, error) {
+func AcquireLock() (func() error, error) {
 	path, err := lockPath()
 	if err != nil {
 		return nil, err

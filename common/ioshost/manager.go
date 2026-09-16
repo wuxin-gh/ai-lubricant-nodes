@@ -16,7 +16,7 @@
 // run against a physical iPhone yet. The Enumerator and PairClient seams are
 // indirected so the reconcile/claim/release logic is unit-tested without
 // usbmuxd.
-package main
+package ioshost
 
 import (
 	"context"
@@ -319,7 +319,7 @@ func (m *DeviceManager) Claim(ctx context.Context, req *agentcomposev2.NodeIosCl
 	}
 	m.mu.Unlock()
 
-	credPath := defaultCredentialPath(m.configPath(), name)
+	credPath := DefaultCredentialPath(m.configPath(), name)
 	cred, err := m.pair.Pair(ctx, server, code, credPath)
 
 	m.mu.Lock()

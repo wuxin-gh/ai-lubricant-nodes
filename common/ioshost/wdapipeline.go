@@ -14,7 +14,7 @@
 //
 // SECURITY: signing material is written 0600 into the job work dir and deleted
 // with it. Nothing here logs a key, a password, or a profile body.
-package main
+package ioshost
 
 import (
 	"context"
@@ -48,29 +48,29 @@ const (
 	defaultDeviceKitXctest   = "devicekit-iosUITests.xctest"
 )
 
-// downloadResolver supplies the node's egress-proxy-aware download route.
+// DownloadResolver supplies the node's egress-proxy-aware download route.
 // *agent.Client implements it; nil means download directly with no URL rewrite.
-type downloadResolver interface {
+type DownloadResolver interface {
 	ResolveDownloadURL(string) string
 	DownloadHTTPClient(time.Duration) (*http.Client, error)
 }
 
-// goiosWdaSteps is the production WdaSteps.
-type goiosWdaSteps struct {
-	logger logger
+// GoiosWdaSteps is the production WdaSteps.
+type GoiosWdaSteps struct {
+	Logger Logger
 	// httpClient downloads artifacts when no resolver is wired (direct egress).
 	// Bounded timeout: a WDA .ipa is tens of MB.
 	httpClient *http.Client
 	// dl, when set, routes Fetch through the node's egress proxy (URL rewrite +
 	// proxy transport) — the same download path self-upgrade takes for release
 	// assets. Read per fetch, so a runtime proxy-config update applies.
-	dl downloadResolver
+	dl DownloadResolver
 }
 
-// newGoiosWdaSteps builds the production pipeline. dl may be nil (direct).
-func newGoiosWdaSteps(log logger, dl downloadResolver) *goiosWdaSteps {
-	return &goiosWdaSteps{
-		logger:     log,
+// NewGoiosWdaSteps builds the production pipeline. dl may be nil (direct).
+func NewGoiosWdaSteps(log Logger, dl DownloadResolver) *GoiosWdaSteps {
+	return &GoiosWdaSteps{
+		Logger:     log,
 		httpClient: &http.Client{Timeout: 15 * time.Minute},
 		dl:         dl,
 	}
@@ -84,7 +84,7 @@ const artifactSizeLimit = 512 << 20
 // Fetch downloads the artifact and verifies its sha256 before it ever reaches
 // the device. An unpinned or mismatched artifact is refused: this is the one
 // gate between "the server named a URL" and "we install code on a phone".
-func (s *goiosWdaSteps) Fetch(ctx context.Context, art *agentcomposev2.NodeIosWdaArtifact, workDir string, progress func(int)) (string, error) {
+func (s *GoiosWdaSteps) Fetch(ctx context.Context, art *agentcomposev2.NodeIosWdaArtifact, workDir string, progress func(int)) (string, error) {
 	fetchURL := strings.TrimSpace(art.GetUrl())
 	if fetchURL == "" {
 		return "", errors.New("artifact url is empty")
@@ -182,7 +182,7 @@ func artifactExt(url string) string {
 // EnableDeveloperMode asks the device to turn Developer Mode on (iOS 16+). The
 // device shows its own confirmation and reboots, so success here means
 // "requested", not "enabled" — the launch stage is what proves it took.
-func (s *goiosWdaSteps) EnableDeveloperMode(ctx context.Context, udid string) error {
+func (s *GoiosWdaSteps) EnableDeveloperMode(ctx context.Context, udid string) error {
 	entry, err := deviceByUDID(udid)
 	if err != nil {
 		return err
@@ -200,7 +200,7 @@ func (s *goiosWdaSteps) EnableDeveloperMode(ctx context.Context, udid string) er
 //
 // The presigned path short-circuits: the operator already signed the artifact
 // (free Apple ID), so there is nothing to provision.
-func (s *goiosWdaSteps) PrepareSigning(ctx context.Context, req *agentcomposev2.NodeIosWdaJobRequest, workDir string, stage func(agentcomposev2.IosJobStage)) (SigningAssets, error) {
+func (s *GoiosWdaSteps) PrepareSigning(ctx context.Context, req *agentcomposev2.NodeIosWdaJobRequest, workDir string, stage func(agentcomposev2.IosJobStage)) (SigningAssets, error) {
 	mat := req.GetSigning()
 	mode := mat.GetMode()
 	if req.GetAction() == agentcomposev2.IosWdaJobAction_IOS_WDA_JOB_ACTION_INSTALL_SIGNED ||
@@ -301,7 +301,7 @@ func (s *goiosWdaSteps) PrepareSigning(ctx context.Context, req *agentcomposev2.
 
 // Sign re-signs the artifact with the prepared identity, rewriting the bundle
 // id so a free/dev profile can host it.
-func (s *goiosWdaSteps) Sign(ctx context.Context, artifactPath string, assets SigningAssets, targetBundleID, workDir string) (string, error) {
+func (s *GoiosWdaSteps) Sign(ctx context.Context, artifactPath string, assets SigningAssets, targetBundleID, workDir string) (string, error) {
 	if assets.Presigned {
 		return artifactPath, nil
 	}
@@ -322,7 +322,7 @@ func (s *goiosWdaSteps) Sign(ctx context.Context, artifactPath string, assets Si
 
 // Install pushes the signed artifact onto the device over zipconduit (the same
 // service Xcode uses; no Apple Configurator or macOS needed).
-func (s *goiosWdaSteps) Install(ctx context.Context, udid, signedPath string) error {
+func (s *GoiosWdaSteps) Install(ctx context.Context, udid, signedPath string) error {
 	entry, err := deviceByUDID(udid)
 	if err != nil {
 		return err
@@ -342,7 +342,7 @@ func (s *goiosWdaSteps) Install(ctx context.Context, udid, signedPath string) er
 // testmanagerd + port-forward lifecycle), waits for WDA to answer, and runs a
 // control smoke test. Only if all of that passes does the caller mark the
 // device ready — an installed-but-unreachable WDA must never look "ready".
-func (s *goiosWdaSteps) Launch(ctx context.Context, udid, bundleID, xctestConfig string, stage func(agentcomposev2.IosJobStage)) (int, error) {
+func (s *GoiosWdaSteps) Launch(ctx context.Context, udid, bundleID, xctestConfig string, stage func(agentcomposev2.IosJobStage)) (int, error) {
 	if bundleID == "" {
 		return 0, errors.New("launch: runner bundle id is empty")
 	}
@@ -434,4 +434,4 @@ func isDeveloperModeError(err error) bool {
 }
 
 // compile-time check.
-var _ WdaSteps = (*goiosWdaSteps)(nil)
+var _ WdaSteps = (*GoiosWdaSteps)(nil)

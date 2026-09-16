@@ -126,3 +126,32 @@ export function resolveCursorMode(mode?: string): string {
   }
   return CURSOR_ALIASES[key] || CURSOR_DEFAULT_MODE;
 }
+
+// ── dsh (DeepSeek Harness) ────────────────────────────────────────────────────
+// dsh's SDK profile runs with its own file policy and approval settings,
+// configured through the base profile. The SDK profile is non-interactive
+// (no ask_user prompts reach the user — approvals auto-skip). The mode string
+// we accept is our normalized vocabulary; dsh doesn't expose a CLI flag for
+// permission mode in SDK mode, so this resolver currently maps our standard
+// names to dsh's base policy defaults and is a placeholder for future
+// fine-grained mapping. Empty/unknown → the base profile's default.
+const DSH_MODES = new Set(["default", "plan", "full", ""]);
+const DSH_ALIASES: Record<string, string> = {
+  readonly: "plan",
+  "read-only": "plan",
+  edit: "default",
+  auto: "default",
+  "danger-full-access": "full",
+  yolo: "full",
+  "bypassPermissions": "full",
+};
+
+export const DSH_DEFAULT_MODE = "default";
+
+export function resolveDshMode(mode?: string): string {
+  const key = (mode || "").trim();
+  if (DSH_MODES.has(key)) {
+    return key;
+  }
+  return DSH_ALIASES[key] || DSH_DEFAULT_MODE;
+}

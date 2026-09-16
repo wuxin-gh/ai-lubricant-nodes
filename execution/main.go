@@ -75,7 +75,7 @@ func main() {
 		"providers", strings.Join(opts.Providers, ","))
 
 	client := agent.NewClient(opts, logger)
-	client.SetHandler(NewHandler(client, workRoot, opts.Providers, opts.Docker, systemEnvAllowed))
+	client.SetHandler(NewHandler(client, opts.NodeID, workRoot, opts.Providers, opts.Docker, systemEnvAllowed, opts.IosMgmtAllowed))
 
 	if err := client.Run(ctx); err != nil && ctx.Err() == nil {
 		logger.Error("node-execution exited with error", "error", err)
@@ -113,6 +113,12 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 		// credentials) to any task the node runs, and a container's HOME is the
 		// image's, not the operator's. on/off force it either way.
 		allowSystemEnv = fs.String("allow-system-env", agent.EnvOr("AGENT_COMPOSE_NODE_ALLOW_SYSTEM_ENV", "auto"), "allow sessions to run against this node's real user HOME (env_mode=system): auto|on|off (auto = on for a host install, off inside a container) (env AGENT_COMPOSE_NODE_ALLOW_SYSTEM_ENV)")
+		// ios advertises the ios_mgmt capability: this host can enumerate and
+		// drive iPhones (go-ios + usbmuxd). auto (the default) probes for
+		// usbmuxd, so a node on a machine with Apple's device service installed
+		// offers it with no operator action; off keeps the platform from driving
+		// a phone plugged into this workstation.
+		iosFlag = fs.String("ios", agent.EnvOr("AGENT_COMPOSE_NODE_IOS", "auto"), "offer iOS device management (enumerate/drive attached iPhones): auto|on|off (auto = detect usbmuxd) (env AGENT_COMPOSE_NODE_IOS)")
 		// autostart asks once whether to install a per-user login entry
 		// (launchd / systemd user / schtasks ONLOGON). auto prompts on an
 		// interactive host when no entry exists and no answer is recorded;
@@ -126,6 +132,10 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 	// Resolve once here so both launch paths and the handler share one verdict;
 	// an invalid explicit value is a usage error, not a silent fallback.
 	systemEnvAllowed, err := agent.ResolveSystemEnvCapability(*allowSystemEnv)
+	if err != nil {
+		return agent.Options{}, "", nil, false, err
+	}
+	iosMgmtAllowed, err := agent.ResolveIosMgmtCapability(*iosFlag)
 	if err != nil {
 		return agent.Options{}, "", nil, false, err
 	}
@@ -164,6 +174,7 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 			TLSInsecure:      *tlsInsecure,
 			Docker:           dockerEnabled,
 			SystemEnvAllowed: systemEnvAllowed,
+			IosMgmtAllowed:   iosMgmtAllowed,
 			MinBackoff:       time.Second,
 			MaxBackoff:       30 * time.Second,
 			Heartbeat:        *heartbeat,
@@ -241,6 +252,7 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 		TLSInsecure:      cfg.TLSInsecure,
 		Docker:           dockerEnabled,
 		SystemEnvAllowed: systemEnvAllowed,
+		IosMgmtAllowed:   iosMgmtAllowed,
 		MinBackoff:       time.Second,
 		MaxBackoff:       30 * time.Second,
 		Heartbeat:        *heartbeat,

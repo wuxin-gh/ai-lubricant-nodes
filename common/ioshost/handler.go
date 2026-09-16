@@ -1,4 +1,4 @@
-package main
+package ioshost
 
 import (
 	"context"
@@ -23,10 +23,9 @@ import (
 // never waits out its timeout.
 type Handler struct {
 	logger *slog.Logger
-	// manager is nil in pure device mode (no NodeConnect identity), in which
-	// case the iOS management frames are rejected as unsupported.
-	manager *DeviceManager
-	jobs    *WdaJobManager
+	// ios serves the device management frames. Its manager is nil in pure device
+	// mode (no NodeConnect identity), in which case those frames error-ack.
+	ios *FrameHandler
 	// builds may be nil (build runner not wired); HandleBuildFrame is nil-safe.
 	builds *build.Runner
 	// xcode may be nil; HandleHostToolJobFrame is nil-safe.
@@ -37,7 +36,12 @@ type Handler struct {
 // device mode); the iOS management frames then error-ack. builds and xcode may
 // be nil.
 func NewHandler(c *agent.Client, manager *DeviceManager, jobs *WdaJobManager, builds *build.Runner, xcode *agent.XcodeJobRunner) *Handler {
-	return &Handler{logger: c.Logger(), manager: manager, jobs: jobs, builds: builds, xcode: xcode}
+	return &Handler{
+		logger: c.Logger(),
+		ios:    NewFrameHandler(manager, jobs),
+		builds: builds,
+		xcode:  xcode,
+	}
 }
 
 // ActiveSessionIDs implements agent.DownstreamHandler: an iOS host runs no
@@ -57,14 +61,9 @@ func (h *Handler) StopAll() {}
 // role" from a transient handler failure if it ever inspects ack errors.
 var errNotSupported = errors.New("iOS host does not run sessions or launch nodes")
 
-// errNoManager is the ack error for an iOS management frame that arrived at a
-// host running in pure device mode (no NodeConnect-managed device inventory).
-// The server gates these frames on the ios_mgmt capability label, so this is a
-// defensive reply rather than an expected path.
-var errNoManager = errors.New("iOS device management is not enabled on this host")
-
 // HandleFrame implements agent.DownstreamHandler: accept the two upgrade frames
-// (copied verbatim in shape from management/handler.go), explicitly reject the
+// (copied verbatim in shape from management/handler.go), serve the iOS device
+// management frames via the shared FrameHandler, explicitly reject the
 // session/launch/terminal/host-exec frames so the server does not wait on an ack
 // that never comes, and log-and-drop anything unknown.
 func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agentcomposev2.NodeDownstreamFrame) {
@@ -73,6 +72,9 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		return
 	}
 	if h.xcode.HandleHostToolJobFrame(ctx, c, frame) {
+		return
+	}
+	if h.ios.HandleIosFrame(ctx, c, frame) {
 		return
 	}
 	switch payload := frame.GetFrame().(type) {
@@ -110,106 +112,11 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		}(payload.InstallHostTool)
 
 	// ─── iOS device management ───────────────────────────────────────────────
-	case *agentcomposev2.NodeDownstreamFrame_IosDiscover:
-		if h.manager == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		// Ack immediately, then rescan: enumeration is a USB/network round trip
-		// per device and must not block the dispatch loop (heartbeats and other
-		// frames keep flowing). The inventory arrives as its own upstream frame.
-		c.SendAck(frameID, nil, nil)
-		go func(requestID string) {
-			h.manager.Rescan(ctx)
-			if err := c.EmitUpstream(&agentcomposev2.NodeUpstreamFrame{
-				Frame: &agentcomposev2.NodeUpstreamFrame_IosDevicesReport{
-					IosDevicesReport: h.manager.Snapshot(requestID),
-				},
-			}); err != nil {
-				c.Logger().Debug("ios discover: report not sent", "error", err)
-			}
-		}(payload.IosDiscover.GetRequestId())
-
-	case *agentcomposev2.NodeDownstreamFrame_IosClaimDevice:
-		if h.manager == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		// Claim redeems a pairing code over HTTP; off the dispatch loop.
-		go func(req *agentcomposev2.NodeIosClaimDevice) {
-			deviceID, err := h.manager.Claim(ctx, req)
-			if err != nil {
-				c.Logger().Warn("ios claim failed", "udid", req.GetUdid(), "error", err)
-			} else {
-				c.Logger().Info("ios device claimed", "udid", req.GetUdid(), "device_id", deviceID)
-			}
-			c.SendAck(frameID, err, nil)
-		}(payload.IosClaimDevice)
-
-	case *agentcomposev2.NodeDownstreamFrame_IosReleaseDevice:
-		if h.manager == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		go func(req *agentcomposev2.NodeIosReleaseDevice) {
-			err := h.manager.Release(req)
-			if err != nil {
-				c.Logger().Warn("ios release failed", "udid", req.GetUdid(), "error", err)
-			}
-			c.SendAck(frameID, err, nil)
-		}(payload.IosReleaseDevice)
-
-	case *agentcomposev2.NodeDownstreamFrame_IosConfigureDevice:
-		if h.manager == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		// Applying config can restart a device's connection loop, so run it off
-		// the dispatch loop and reply with the revision actually in effect.
-		go func(req *agentcomposev2.NodeIosConfigureDevice) {
-			applied, err := h.manager.ConfigureDevice(ctx, req)
-			c.SendConfigAck(frameID, err, uint64(applied), uint64(applied), false)
-		}(payload.IosConfigureDevice)
-
-	case *agentcomposev2.NodeDownstreamFrame_IosWdaJob:
-		if h.manager == nil || h.jobs == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		// Start is non-blocking: it registers the job and returns. Progress and
-		// the terminal result stream back as their own upstream frames, so the
-		// ack means "accepted", never "finished".
-		err := h.jobs.Start(ctx, payload.IosWdaJob)
-		c.SendAck(frameID, err, nil)
-
-	case *agentcomposev2.NodeDownstreamFrame_IosJobCancel:
-		if h.jobs == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		c.SendAck(frameID, h.jobs.Cancel(payload.IosJobCancel.GetJobId()), nil)
-
-	case *agentcomposev2.NodeDownstreamFrame_IosRunnerControl:
-		if h.manager == nil {
-			c.SendAck(frameID, errNoManager, nil)
-			return
-		}
-		// Start/stop/restart drives the persistent device loop: it can cancel
-		// and relaunch a runner, which is off-dispatch-loop work. Ack carries
-		// the transition result (a no-op START on an already-running device is
-		// still ok).
-		go func(req *agentcomposev2.NodeIosRunnerControl) {
-			err := h.manager.ControlRunner(ctx, req)
-			if err != nil {
-				c.Logger().Warn("ios runner control failed",
-					"udid", req.GetUdid(), "action", req.GetAction(), "error", err)
-			} else {
-				c.Logger().Info("ios runner control",
-					"udid", req.GetUdid(), "action", req.GetAction())
-			}
-			c.SendAck(frameID, err, nil)
-		}(payload.IosRunnerControl)
-
+	// The iOS device management frames (discover/claim/release/configure/WDA
+	// job/runner control) are served by the shared FrameHandler above — this is
+	// the standalone iOS host's copy; an execution node delegates to the same
+	// FrameHandler from its own HandleFrame. The frame semantics live once, in
+	// frames.go.
 	case *agentcomposev2.NodeDownstreamFrame_CreateSession,
 		*agentcomposev2.NodeDownstreamFrame_DeleteSession,
 		*agentcomposev2.NodeDownstreamFrame_ListSessions,

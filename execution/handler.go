@@ -13,6 +13,7 @@ import (
 
 	"ai-lubricant-nodes/common/agent"
 	"ai-lubricant-nodes/common/build"
+	"ai-lubricant-nodes/common/ioshost"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
 
@@ -34,19 +35,30 @@ type sessionOptions struct {
 // Handler is the execution node's downstream command handler. It owns the
 // session manager and routes each session command onto it, acking back through
 // the shared client's stream. It also serves build frames so a macOS execution
-// host can build WDA (or future user-app recipes) from the project page.
+// host can build WDA (or future user-app recipes) from the project page, and —
+// on a host where usbmuxd is reachable (--ios auto) — the iOS device management
+// frames, so a Mac/Windows box with an iPhone attached can be scanned and driven
+// without installing a separate node-ios binary.
 type Handler struct {
 	sessions  *sessionManager
 	terminals *agent.TerminalManager
 	toolruns  *agent.ToolRunManager
 	builds    *build.Runner
 	xcode     *agent.XcodeJobRunner
+	// ios serves the iOS device management frames. Nil when this host does not
+	// offer the capability (no usbmuxd, or --ios off), in which case those
+	// frames fall through to the default branch below.
+	ios *ioshost.FrameHandler
 }
 
 // NewHandler builds an execution handler bound to the given client. The session
 // manager's upstream callbacks send on the client's live stream, so output and
 // results survive reconnects (the client re-points the stream underneath).
-func NewHandler(c *agent.Client, workRoot string, providers []string, docker bool, systemEnvAllowed bool) *Handler {
+//
+// iosMgmtAllowed mirrors the advertised ios_mgmt capability: when false, no
+// device manager is constructed at all and the iOS frames are rejected by the
+// default branch (the server gates on the label, so this is defensive).
+func NewHandler(c *agent.Client, nodeID, workRoot string, providers []string, docker bool, systemEnvAllowed, iosMgmtAllowed bool) *Handler {
 	opts := sessionOptions{workRoot: workRoot, providers: providers, docker: docker, systemEnvAllowed: systemEnvAllowed}
 	sessions := newSessionManager(opts, c.Logger(), c.EmitUpstream, c.EmitUpstream, c.EmitUpstream, c.EmitUpstream)
 	// MCP wire specs now carry a relative path; the node resolves it against the
@@ -63,15 +75,53 @@ func NewHandler(c *agent.Client, workRoot string, providers []string, docker boo
 		toolruns:  toolruns,
 		builds:    builds,
 		xcode:     agent.NewXcodeJobRunner(c.EmitUpstream, c.Logger(), c.DownloadProxy),
+		ios:       newIosFrameHandler(c, nodeID, iosMgmtAllowed),
 	}
 }
 
 // ActiveSessionIDs implements agent.DownstreamHandler.
 func (h *Handler) ActiveSessionIDs() []string { return h.sessions.activeIDs() }
-
-// ActiveToolRuns reports tunnel daemons that survived a control-stream drop.
 func (h *Handler) ActiveToolRuns() []*agentcomposev2.NodeActiveToolRun {
 	return h.toolruns.ActiveRuns()
+}
+
+// newIosFrameHandler wires the iOS device manager for this execution node, or
+// returns nil when the host does not offer the capability.
+//
+// The device list lives in its own directory (agent-compose/ios), the same one
+// the standalone node-ios binary uses: the config format is identical, so an
+// operator can move between the two shapes, and it stays clear of the execution
+// node's own config/lock in agent-compose/node. nodeID is stamped into each
+// device's register frame so the server joins device ↔ node.
+func newIosFrameHandler(c *agent.Client, nodeID string, allowed bool) *ioshost.FrameHandler {
+	if !allowed {
+		return nil
+	}
+	logger := c.Logger()
+	cfg, path, err := ioshost.LoadDevicesConfig("")
+	if err != nil {
+		// A broken devices.json must not take the node down: the capability was
+		// advertised, so serve the frames but start from an empty inventory.
+		logger.Warn("ios: devices config unreadable; starting with none", "error", err)
+		cfg, path = &ioshost.DevicesConfig{}, ""
+	}
+	manager := ioshost.NewDeviceManager(ioshost.ManagerConfig{
+		Logger:        logger,
+		ConfigPath:    path,
+		DevicesConfig: cfg,
+		NodeID:        nodeID,
+		OnReport: func(rep *agentcomposev2.NodeIosDevicesReport) error {
+			return c.EmitUpstream(&agentcomposev2.NodeUpstreamFrame{
+				Frame: &agentcomposev2.NodeUpstreamFrame_IosDevicesReport{IosDevicesReport: rep},
+			})
+		},
+	})
+	jobs := ioshost.NewWdaJobManager(c.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, c), ioshost.StateDir(path), logger)
+	// The device loops and the WDA job engine both outlive a control-stream drop;
+	// the manager is started here and stopped by the client's ctx.
+	go manager.Start(context.Background())
+	go manager.StartClaimedDevices(context.Background())
+	return ioshost.NewFrameHandler(manager, jobs)
 }
 
 // StopAll implements agent.DownstreamHandler: on a connection drop, stop the
@@ -90,6 +140,12 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		return
 	}
 	if h.xcode.HandleHostToolJobFrame(ctx, c, frame) {
+		return
+	}
+	// iOS device management frames (discover/claim/release/configure/WDA job/
+	// runner control). nil on a host without the capability — the frame then
+	// falls through to the switch below and is rejected there.
+	if h.ios != nil && h.ios.HandleIosFrame(ctx, c, frame) {
 		return
 	}
 	frameID := frame.GetServerFrameId()

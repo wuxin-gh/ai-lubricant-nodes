@@ -9,7 +9,7 @@
 // (pair-record creation, quic tunnel handshake, RSD query) has not been
 // exercised against a physical iOS 17+ iPhone yet. iOS <17 devices are
 // untouched by all of this (usbmuxd path, no tunnel).
-package main
+package ioshost
 
 import (
 	"context"
@@ -22,7 +22,7 @@ import (
 	"github.com/danielpaulus/go-ios/ios/tunnel"
 )
 
-// startTunnelAgent runs go-ios's tunnel manager in-process (userspace mode —
+// StartTunnelAgent runs go-ios's tunnel manager in-process (userspace mode —
 // gVisor netstack, no root/sudo needed). It reconciles every second: tunnels
 // come up for connected USB devices, go down on unplug, and failed starts
 // back off. devicelink picks the tunnels up through the tunnel-info HTTP
@@ -38,14 +38,14 @@ import (
 // Failure to start is degraded, not fatal: hosts driving only iOS ≤16 phones
 // never touch the tunnel, so a bind conflict (an external `ios tunnel start`
 // agent already on 60106) or a state-dir problem must not take node-ios down.
-func startTunnelAgent(ctx context.Context, logger *slog.Logger, stateDir string) *tunnelAgent {
+func StartTunnelAgent(ctx context.Context, logger *slog.Logger, stateDir string) *TunnelAgent {
 	if tunnel.IsAgentRunning() {
 		// An operator-run `ios tunnel start` already serves tunnel info on the
 		// endpoint; reuse it instead of fighting over the port. Its tunnels are
 		// equivalent for devicelink's RSD lookup.
 		logger.Info("ios tunnel: reusing existing go-ios agent",
 			"endpoint", ios.HttpApiHost(), "port", ios.HttpApiPort())
-		return &tunnelAgent{}
+		return &TunnelAgent{}
 	}
 
 	// go-ios creates selfIdentity.plist and peers/*.plist inside the record
@@ -54,13 +54,13 @@ func startTunnelAgent(ctx context.Context, logger *slog.Logger, stateDir string)
 	if err := os.MkdirAll(records, 0o700); err != nil {
 		logger.Warn("ios tunnel: cannot create pair-record dir; tunnels disabled",
 			"dir", records, "error", err)
-		return &tunnelAgent{}
+		return &TunnelAgent{}
 	}
 	pm, err := tunnel.NewPairRecordManager(records)
 	if err != nil {
 		logger.Warn("ios tunnel: cannot init pair records; tunnels disabled",
 			"error", err)
-		return &tunnelAgent{}
+		return &TunnelAgent{}
 	}
 
 	tm := tunnel.NewTunnelManager(pm, true)
@@ -86,19 +86,19 @@ func startTunnelAgent(ctx context.Context, logger *slog.Logger, stateDir string)
 	logger.Info("ios tunnel: manager started (userspace, no root)",
 		"endpoint", ios.HttpApiHost(), "port", ios.HttpApiPort(),
 		"pair_records", records)
-	return &tunnelAgent{tm: tm}
+	return &TunnelAgent{tm: tm}
 }
 
-// tunnelAgent owns the embedded tunnel manager's lifecycle. A nil tm means the
+// TunnelAgent owns the embedded tunnel manager's lifecycle. A nil tm means the
 // agent reused an external one or degraded at startup — Close is then a no-op
 // (and the zero value keeps the cmdRun wiring uniform).
-type tunnelAgent struct {
+type TunnelAgent struct {
 	tm *tunnel.TunnelManager
 }
 
 // Close tears down every tunnel this manager created. Safe on the zero value
 // and idempotent (TunnelManager.Close is closeOnce-guarded).
-func (a *tunnelAgent) Close() error {
+func (a *TunnelAgent) Close() error {
 	if a == nil || a.tm == nil {
 		return nil
 	}

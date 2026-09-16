@@ -5,6 +5,7 @@ import { readRuntimeActivationConfig, resolveEffectiveMCPConfig } from "./mcp-co
 import { buildPromptRuntimeOptions } from "./prompt.js";
 import { ClaudeRunner } from "./runners/claude.js";
 import { CodexRunner } from "./runners/codex.js";
+import { DshRunner } from "./runners/dsh.js";
 import { GeminiRunner } from "./runners/gemini.js";
 import { OpenCodeRunner } from "./runners/opencode.js";
 import { CursorAcpRunner } from "./runners/acp/cursor.js";
@@ -369,6 +370,7 @@ function createRunner(options: RunnerOptions): Runner {
   if (provider === "claude") return new ClaudeRunner(options);
   if (provider === "opencode") return new OpenCodeRunner(options);
   if (provider === "cursor") return new CursorAcpRunner(options);
+  if (provider === "dsh") return new DshRunner(options);
   return new GeminiRunner(options);
 }
 

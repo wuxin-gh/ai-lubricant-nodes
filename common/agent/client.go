@@ -62,6 +62,12 @@ type Options struct {
 	// env_mode=system sessions (editor runs against the operator's real HOME).
 	// Set from --allow-system-env; off by default.
 	SystemEnvAllowed bool
+	// IosMgmtAllowed advertises the ios_mgmt capability: this host can enumerate
+	// and drive iPhones (go-ios + usbmuxd). Set from --ios; "auto" probes for
+	// usbmuxd, so a node on a machine with Apple's device service installed
+	// offers it with no operator action. The server gates iOS device management
+	// frames on this label, independent of the node role.
+	IosMgmtAllowed bool
 	TLSInsecure      bool
 	MinBackoff       time.Duration
 	MaxBackoff       time.Duration
@@ -410,6 +416,14 @@ func (c *Client) capabilityLabels(ctx context.Context) map[string]string {
 	// task form can enable the system tier only where the node allows it.
 	if c.opts.SystemEnvAllowed {
 		labels["system_env"] = "true"
+	}
+	// ios_mgmt advertises that this host can enumerate/drive iPhones (usbmuxd
+	// reachable). Hardcoded like terminal/host_exec: it is a host capability, not
+	// an operator label, so user configuration cannot fake or clear it. The
+	// server gates iOS device management frames on this label alone — role is
+	// irrelevant, so an execution node with a phone attached is drivable.
+	if c.opts.IosMgmtAllowed {
+		labels["ios_mgmt"] = "true"
 	}
 	// startup_method reports how this node is actually started on its host:
 	// "autostart" when a per-user login entry (launchd/systemd/schtasks) the

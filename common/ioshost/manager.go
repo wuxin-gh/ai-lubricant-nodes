@@ -155,6 +155,13 @@ type managedDevice struct {
 	deviceControlOn  bool
 	wdaState         agentcomposev2.IosWdaState
 	profileExpiresAt string
+	// wdaProgress/wdaStage mirror the running WDA job's progress onto the DEVICE
+	// so the console can render "initializing 42%" from the durable inventory.
+	// The job snapshot in the server is keyed to one connection and vanishes on
+	// restart; these ride the device report and survive it. Only meaningful while
+	// wdaState == PREPARING.
+	wdaProgress int
+	wdaStage    string
 	// renewBeforeDays 来自 NodeIosConfigureDevice（默认 14）。watchLoop 的周期
 	// Rescan 据此把 READY 设备提前 RENEWAL_DUE，让自动续签徽章与节点 inventory
 	// 一致。autoPrepare 仍不启用节点自主派发——续签 job 一律由服务端扫描器派发。
@@ -895,6 +902,114 @@ func (m *DeviceManager) onDeviceWipe(d *managedDevice) func() {
 	}
 }
 
+// ── WDA job state write-back ─────────────────────────────────────────────
+//
+// The WDA job engine (WdaJobManager) owns the pipeline, but the DEVICE owns the
+// state the console renders. These methods are the bridge: the engine calls them
+// on progress and on terminal outcome, and the change is reported upstream
+// immediately so the device list reflects it without polling the job snapshot.
+//
+// Why this exists: before it, wdaState only ever went UNSPECIFIED (claim) or
+// READY→RENEWAL_DUE/EXPIRED (clock). A finished job never touched it, so the
+// inventory reported UNSPECIFIED forever and the console could only learn the
+// outcome from the in-memory job snapshot — which dies with the server process.
+
+// NoteWdaJobStarted marks a device PREPARING as a job begins. Idempotent.
+func (m *DeviceManager) NoteWdaJobStarted(udid string) {
+	m.noteWdaState(udid, func(d *managedDevice) {
+		d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_PREPARING
+		d.wdaProgress = 0
+		d.wdaStage = "queued"
+	})
+}
+
+// NoteWdaJobProgress records the running job's progress onto the device.
+//
+// Only applied while the device is PREPARING: a late progress event arriving
+// after the terminal result must not resurrect a finished job's state.
+func (m *DeviceManager) NoteWdaJobProgress(udid string, percent int, stage string) {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	m.noteWdaState(udid, func(d *managedDevice) {
+		if d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_PREPARING {
+			return
+		}
+		d.wdaProgress = percent
+		if s := strings.TrimSpace(stage); s != "" {
+			d.wdaStage = s
+		}
+	})
+}
+
+// NoteWdaJobResult records a job's terminal outcome onto the device.
+//
+//   - ok            → READY, with the signed profile's expiry so the clock can
+//     later demote it to RENEWAL_DUE / EXPIRED.
+//   - cancelled     → no state change. A user-initiated cancel is not a failure;
+//     leaving the previous state (typically MISSING) lets them retry.
+//   - anything else → FAILED, keeping the error for the console.
+func (m *DeviceManager) NoteWdaJobResult(udid string, ok bool, cancelled bool, errorCode string, profileExpiresAt string) {
+	m.noteWdaState(udid, func(d *managedDevice) {
+		d.wdaProgress = 0
+		d.wdaStage = ""
+		if cancelled {
+			// Back to "claimed but not initialized" unless it was already READY
+			// (a cancelled renew must not discard a working WDA).
+			if d.wdaState == agentcomposev2.IosWdaState_IOS_WDA_STATE_PREPARING {
+				d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_MISSING
+			}
+			return
+		}
+		if ok {
+			d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
+			if exp := strings.TrimSpace(profileExpiresAt); exp != "" {
+				d.profileExpiresAt = exp
+			}
+			d.lastError = ""
+			return
+		}
+		d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_FAILED
+		if code := strings.TrimSpace(errorCode); code != "" {
+			d.lastError = code
+		}
+	})
+}
+
+// noteWdaState applies fn to the device identified by UDID (or device_id) under
+// the lock and reports the new snapshot if anything changed. A missing device is
+// a no-op: the job may outlive a release, and that must not panic the engine.
+func (m *DeviceManager) noteWdaState(udid string, fn func(*managedDevice)) {
+	udid = strings.TrimSpace(udid)
+	if udid == "" {
+		return
+	}
+	m.mu.Lock()
+	d := m.findLocked("", udid)
+	if d == nil {
+		m.mu.Unlock()
+		return
+	}
+	before := wdaStateKey(d)
+	fn(d)
+	if wdaStateKey(d) == before {
+		m.mu.Unlock()
+		return
+	}
+	m.markDirtyLocked()
+	m.reportLocked()
+	m.mu.Unlock()
+}
+
+// wdaStateKey collapses the reported WDA fields so noteWdaState can tell whether
+// fn actually changed anything (avoiding a report storm on no-op progress).
+func wdaStateKey(d *managedDevice) string {
+	return fmt.Sprintf("%d|%d|%s|%s|%s", d.wdaState, d.wdaProgress, d.wdaStage, d.profileExpiresAt, d.lastError)
+}
+
 // findLocked resolves a device by server device_id or UDID. Caller holds m.mu.
 func (m *DeviceManager) findLocked(deviceID, udid string) *managedDevice {
 	if id := strings.TrimSpace(deviceID); id != "" {
@@ -978,6 +1093,8 @@ func (d *managedDevice) toProto() *agentcomposev2.NodeIosDevice {
 		ProfileExpiresAt:      d.profileExpiresAt,
 		LastError:             d.lastError,
 		ConfigRevisionApplied: d.configRevision,
+		WdaProgress:           int32(d.wdaProgress),
+		WdaStage:              d.wdaStage,
 	}
 }
 

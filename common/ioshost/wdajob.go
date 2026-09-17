@@ -81,6 +81,13 @@ type WdaJobManager struct {
 	stateDir string
 	Logger   Logger
 
+	// OnProgress mirrors a running job's progress onto the device (percent +
+	// stage name). Optional; nil disables the write-back.
+	OnProgress func(udid string, percent int, stage string)
+	// OnTerminal reports a job's terminal outcome so the device's wda_state
+	// reflects it (READY / FAILED / unchanged on cancel). Optional.
+	OnTerminal func(udid string, ok bool, cancelled bool, errorCode string, profileExpiresAt string)
+
 	mu   sync.Mutex
 	jobs map[string]*wdaJob
 }
@@ -380,6 +387,13 @@ func (m *WdaJobManager) finish(j *wdaJob, req *agentcomposev2.NodeIosWdaJobReque
 	}); err != nil {
 		m.Logger.Warn("wda job: result not sent", "job_id", j.id, "error", err)
 	}
+
+	// Mirror the terminal outcome onto the DEVICE. This is what makes the
+	// console's "initializing" state survive a server restart: the device row is
+	// persisted and re-reported, the job snapshot is not.
+	if onTerminal := m.OnTerminal; onTerminal != nil {
+		onTerminal(j.udid, ok, out.errCode == "cancelled", out.errCode, out.profileExpiresAt)
+	}
 }
 
 // event emits one progress frame with a monotonic sequence number.
@@ -387,7 +401,17 @@ func (m *WdaJobManager) event(j *wdaJob, stage agentcomposev2.IosJobStage, msg s
 	m.mu.Lock()
 	j.seq++
 	seq := j.seq
+	// Snapshot the callback under the lock; call it after unlocking so a slow
+	// observer can never block the job engine (or deadlock on DeviceManager.mu).
+	onProgress := m.OnProgress
+	udid := j.udid
 	m.mu.Unlock()
+
+	// Mirror progress onto the DEVICE so the console can render "initializing N%"
+	// from the durable inventory rather than the volatile job snapshot.
+	if onProgress != nil {
+		onProgress(udid, percent, jobStageName(stage))
+	}
 
 	ev := &agentcomposev2.NodeIosJobEvent{
 		JobId:      j.id,

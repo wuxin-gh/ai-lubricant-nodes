@@ -88,7 +88,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			"download_url", payload.SelfUpgrade.GetDownloadUrl())
 		c.SendAck(frameID, nil, nil)
 		go func(spec *agentcomposev2.NodeSelfUpgrade) {
-			if err := agent.SelfUpgrade(ctx, spec, c.Logger(), c.DownloadProxy()); err != nil {
+			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy()); err != nil {
 				if agent.IsRestartExit(err) {
 					c.Logger().Info("self-upgrade: restarting into new binary")
 					os.Exit(0)
@@ -97,17 +97,23 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			}
 		}(payload.SelfUpgrade)
 	case *agentcomposev2.NodeDownstreamFrame_RuntimeUpgrade:
+		// Detached from the stream ctx: the download can take minutes and a
+		// reconnect must not abort it (see agent.DetachStreamContext).
 		go func(spec *agentcomposev2.NodeRuntimeUpgrade) {
-			err := agent.RuntimeUpgrade(ctx, spec, c.Logger(), c.DownloadProxy())
+			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
+			if err != nil {
+				c.Logger().Error("runtime-upgrade failed", "error", err)
+			}
 			c.SendAck(frameID, err, nil)
 		}(payload.RuntimeUpgrade)
 	case *agentcomposev2.NodeDownstreamFrame_InstallHostTool:
 		// A macOS iOS host is the project-page build node, so it serves the same
 		// host-tool surface as a management node — notably the xcodebuild
 		// detection the build tab's install guidance drives. Same shape as
-		// management/handler.go; installs share the managed-tools dir.
+		// management/handler.go; installs share the managed-tools dir. Detached
+		// from the stream ctx: the ack waits on the download.
 		go func(spec *agentcomposev2.NodeInstallHostTool) {
-			nodeV, npmV, xcodeV, err := agent.InstallHostTool(ctx, spec, c.Logger(), c.DownloadProxy())
+			nodeV, npmV, xcodeV, err := agent.InstallHostTool(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
 			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
 		}(payload.InstallHostTool)
 

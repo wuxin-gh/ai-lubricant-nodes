@@ -174,6 +174,13 @@ func cmdRun(args []string) {
 			},
 		})
 		jobs := ioshost.NewWdaJobManager(client.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, client), stateDir(path), logger)
+		// Mirror job progress/terminal onto the device's wda_state (same pattern
+		// as the execution handler): the console reads from the durable device
+		// inventory, not the volatile job snapshot.
+		jobs.OnProgress = manager.NoteWdaJobProgress
+		jobs.OnTerminal = func(udid string, ok bool, cancelled bool, errCode string, profileExpiresAt string) {
+			manager.NoteWdaJobResult(udid, ok, cancelled, errCode, profileExpiresAt)
+		}
 		// A macOS iOS host is also the project-page build node (xcodebuild
 		// lives here). The runner is always wired; the server picks hosts by
 		// the xcodebuild_version capability label, so non-macOS hosts simply

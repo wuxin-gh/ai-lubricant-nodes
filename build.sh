@@ -71,7 +71,7 @@ assert_artifact_name() {
 }
 
 # role:label  ->  import-path
-ROLES="execution:node-execution management:agent-compose-node-management ios:node-ios"
+ROLES="execution:node-execution management:agent-compose-node-management"
 # os/arch pairs
 TARGETS="linux:amd64 linux:arm64 darwin:amd64 darwin:arm64 windows:amd64 windows:arm64"
 

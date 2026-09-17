@@ -58,7 +58,7 @@ type Handler struct {
 // iosMgmtAllowed mirrors the advertised ios_mgmt capability: when false, no
 // device manager is constructed at all and the iOS frames are rejected by the
 // default branch (the server gates on the label, so this is defensive).
-func NewHandler(c *agent.Client, nodeID, workRoot string, providers []string, docker bool, systemEnvAllowed, iosMgmtAllowed bool) *Handler {
+func NewHandler(ctx context.Context, c *agent.Client, nodeID, workRoot string, providers []string, docker bool, systemEnvAllowed, iosMgmtAllowed bool) *Handler {
 	opts := sessionOptions{workRoot: workRoot, providers: providers, docker: docker, systemEnvAllowed: systemEnvAllowed}
 	sessions := newSessionManager(opts, c.Logger(), c.EmitUpstream, c.EmitUpstream, c.EmitUpstream, c.EmitUpstream)
 	// MCP wire specs now carry a relative path; the node resolves it against the
@@ -75,7 +75,7 @@ func NewHandler(c *agent.Client, nodeID, workRoot string, providers []string, do
 		toolruns:  toolruns,
 		builds:    builds,
 		xcode:     agent.NewXcodeJobRunner(c.EmitUpstream, c.Logger(), c.DownloadProxy),
-		ios:       newIosFrameHandler(c, nodeID, iosMgmtAllowed),
+		ios:       newIosFrameHandler(ctx, c, nodeID, iosMgmtAllowed),
 	}
 }
 
@@ -93,7 +93,11 @@ func (h *Handler) ActiveToolRuns() []*agentcomposev2.NodeActiveToolRun {
 // operator can move between the two shapes, and it stays clear of the execution
 // node's own config/lock in agent-compose/node. nodeID is stamped into each
 // device's register frame so the server joins device ↔ node.
-func newIosFrameHandler(c *agent.Client, nodeID string, allowed bool) *ioshost.FrameHandler {
+//
+// ctx is the process-lifetime context: the tunnel agent and the device loops
+// must outlive a control-stream drop, so they are not tied to the client's
+// per-stream context.
+func newIosFrameHandler(ctx context.Context, c *agent.Client, nodeID string, allowed bool) *ioshost.FrameHandler {
 	if !allowed {
 		return nil
 	}
@@ -105,6 +109,15 @@ func newIosFrameHandler(c *agent.Client, nodeID string, allowed bool) *ioshost.F
 		logger.Warn("ios: devices config unreadable; starting with none", "error", err)
 		cfg, path = &ioshost.DevicesConfig{}, ""
 	}
+	// iOS 17+ only exposes testmanagerd (which launches the WDA XCTest runner)
+	// through a CoreDevice RSD tunnel; go-ios's RunTestWithConfig refuses to
+	// launch on 17+ unless the device entry carries an RSD provider, which only
+	// a running tunnel agent supplies. The standalone node-ios binary starts
+	// this agent in its main; an execution node driving an attached iPhone must
+	// start the same agent here, or WDA Launch (and the device-control runner
+	// loop) fails on 17+ with "no RSD tunnel". Reuses an external
+	// `ios tunnel start` if one is already up. iOS ≤16 never touches it.
+	ioshost.StartTunnelAgent(ctx, logger, ioshost.StateDir(path))
 	manager := ioshost.NewDeviceManager(ioshost.ManagerConfig{
 		Logger:        logger,
 		ConfigPath:    path,
@@ -117,6 +130,13 @@ func newIosFrameHandler(c *agent.Client, nodeID string, allowed bool) *ioshost.F
 		},
 	})
 	jobs := ioshost.NewWdaJobManager(c.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, c), ioshost.StateDir(path), logger)
+	// Wire job progress/terminal outcome back into the device's wda_state so the
+	// console renders "initializing 42%" / "ready" / "failed" from the durable
+	// inventory — surviving a server restart (the job snapshot does not).
+	jobs.OnProgress = manager.NoteWdaJobProgress
+	jobs.OnTerminal = func(udid string, ok bool, cancelled bool, errCode string, profileExpiresAt string) {
+		manager.NoteWdaJobResult(udid, ok, cancelled, errCode, profileExpiresAt)
+	}
 	// The device loops and the WDA job engine both outlive a control-stream drop;
 	// the manager is started here and stopped by the client's ctx.
 	go manager.Start(context.Background())
@@ -209,16 +229,22 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		// Install/upgrade an editor CLI on this host. Runs in its own goroutine:
 		// a global npm install takes tens of seconds and must not block the
 		// dispatch loop (heartbeats and session commands keep flowing).
+		//
+		// Detached from the stream ctx: an install acks only on completion, so
+		// inheriting the per-stream ctx meant a reconnect (server restart, link
+		// blip) killed npm mid-install — "exit status 0xffffffff", no output,
+		// and a useless install-failed error. See agent.DetachStreamContext.
 		go func(spec *agentcomposev2.NodeManageEditor) {
-			version, err := manageEditor(ctx, spec)
+			version, err := manageEditor(agent.DetachStreamContext(ctx), spec)
 			c.SendEditorAck(frameID, err, version)
 		}(payload.ManageEditor)
 	case *agentcomposev2.NodeDownstreamFrame_InstallHostTool:
 		// Install a host-level runtime dependency (currently Node.js). A full
 		// Node.js tarball is ~30 MB; download/extract must not block heartbeats
-		// or session dispatch.
+		// or session dispatch. Detached from the stream ctx for the same reason
+		// as ManageEditor: the install acks only after the download finishes.
 		go func(spec *agentcomposev2.NodeInstallHostTool) {
-			nodeV, npmV, xcodeV, err := agent.InstallHostTool(ctx, spec, c.Logger(), c.DownloadProxy())
+			nodeV, npmV, xcodeV, err := agent.InstallHostTool(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
 			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
 		}(payload.InstallHostTool)
 	case *agentcomposev2.NodeDownstreamFrame_ManageEnvironment:
@@ -232,9 +258,10 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 	case *agentcomposev2.NodeDownstreamFrame_SyncEnvironment:
 		// Environment maintenance: download/lay out the desired skill+plugin set
 		// in the env HOME. These are real downloads (same path as session resource
-		// sync), so it must run off the dispatch loop.
+		// sync), so it must run off the dispatch loop — and detached from the
+		// stream ctx, since the ack only lands once the downloads finish.
 		go func(spec *agentcomposev2.NodeSyncEnvironment) {
-			err := h.sessions.syncEnvironment(ctx, spec)
+			err := h.sessions.syncEnvironment(agent.DetachStreamContext(ctx), spec)
 			c.SendAck(frameID, err, nil)
 		}(payload.SyncEnvironment)
 	case *agentcomposev2.NodeDownstreamFrame_InspectEnvironment:
@@ -256,16 +283,18 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 	case *agentcomposev2.NodeDownstreamFrame_SyncSystemEnv:
 		// Install platform resources into the operator's HOME / remove
 		// platform-installed ones. Real downloads, so off the dispatch loop. The
-		// ack carries the per-entry outcome (installed/skipped/removed).
+		// ack carries the per-entry outcome (installed/skipped/removed) and only
+		// lands once the downloads finish, so it is detached from the stream ctx.
 		go func(spec *agentcomposev2.NodeSyncSystemEnv) {
-			touched, err := h.sessions.syncSystemEnv(ctx, spec)
+			touched, err := h.sessions.syncSystemEnv(agent.DetachStreamContext(ctx), spec)
 			c.SendSystemEnvInventoryAck(frameID, err, touched)
 		}(payload.SyncSystemEnv)
 	case *agentcomposev2.NodeDownstreamFrame_ArchiveSystemEnvResource:
 		// Tar one resource out of the operator's HOME and POST it back so it can
-		// enter the platform library. Network + disk, so off the dispatch loop.
+		// enter the platform library. Network + disk, so off the dispatch loop —
+		// and detached from the stream ctx, since the ack waits on the upload.
 		go func(spec *agentcomposev2.NodeArchiveSystemEnvResource) {
-			err := h.sessions.archiveSystemEnvResource(ctx, spec)
+			err := h.sessions.archiveSystemEnvResource(agent.DetachStreamContext(ctx), spec)
 			c.SendAck(frameID, err, nil)
 		}(payload.ArchiveSystemEnvResource)
 	case *agentcomposev2.NodeDownstreamFrame_SelfUpgrade:
@@ -278,7 +307,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			"download_url", payload.SelfUpgrade.GetDownloadUrl())
 		c.SendAck(frameID, nil, nil)
 		go func(spec *agentcomposev2.NodeSelfUpgrade) {
-			if err := agent.SelfUpgrade(ctx, spec, c.Logger(), c.DownloadProxy()); err != nil {
+			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy()); err != nil {
 				if agent.IsRestartExit(err) {
 					c.Logger().Info("self-upgrade: restarting into new binary")
 					os.Exit(0)
@@ -289,9 +318,18 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 	case *agentcomposev2.NodeDownstreamFrame_RuntimeUpgrade:
 		// Runtime replacement does not restart the Go node. Ack only after the
 		// archive has been verified and activated so the service can refresh its
-		// runtime_version label immediately.
+		// runtime_version label immediately. Detached from the stream ctx: the
+		// download can take minutes, and a reconnect must not abort it (the
+		// archive is swapped in on disk regardless, so killing it mid-way only
+		// loses the ack and the version label).
 		go func(spec *agentcomposev2.NodeRuntimeUpgrade) {
-			err := agent.RuntimeUpgrade(ctx, spec, c.Logger(), c.DownloadProxy())
+			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
+			if err != nil {
+				// Previously only the ack carried the error, so a failed runtime
+				// upgrade left nothing in the node log — the operator saw a
+				// generic failure and the cause had to be reconstructed by hand.
+				c.Logger().Error("runtime-upgrade failed", "error", err)
+			}
 			c.SendAck(frameID, err, nil)
 		}(payload.RuntimeUpgrade)
 	case *agentcomposev2.NodeDownstreamFrame_TerminalOpen:

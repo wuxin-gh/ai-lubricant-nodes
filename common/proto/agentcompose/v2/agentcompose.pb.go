@@ -22350,8 +22350,17 @@ type NodeIosDevice struct {
 	// Whether the device has Developer Mode enabled (iOS 16+). A false value with
 	// present=true is the most common reason WDA cannot be launched.
 	DeveloperModeEnabled bool `protobuf:"varint,15,opt,name=developer_mode_enabled,json=developerModeEnabled,proto3" json:"developer_mode_enabled,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Progress (0-100) and stage name of the WDA job currently running against
+	// this device. Only meaningful while wda_state == PREPARING.
+	//
+	// Carried on the DEVICE (not only on the job stream) so the console can show
+	// "initializing 42%" from the durable inventory: job snapshots live in server
+	// memory keyed to one connection and vanish on restart, while the device row
+	// is persisted and re-reported on every reconnect.
+	WdaProgress   int32  `protobuf:"varint,16,opt,name=wda_progress,json=wdaProgress,proto3" json:"wda_progress,omitempty"`
+	WdaStage      string `protobuf:"bytes,17,opt,name=wda_stage,json=wdaStage,proto3" json:"wda_stage,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NodeIosDevice) Reset() {
@@ -22487,6 +22496,20 @@ func (x *NodeIosDevice) GetDeveloperModeEnabled() bool {
 		return x.DeveloperModeEnabled
 	}
 	return false
+}
+
+func (x *NodeIosDevice) GetWdaProgress() int32 {
+	if x != nil {
+		return x.WdaProgress
+	}
+	return 0
+}
+
+func (x *NodeIosDevice) GetWdaStage() string {
+	if x != nil {
+		return x.WdaStage
+	}
+	return ""
 }
 
 // Node -> server: the host's full device inventory. Always a complete snapshot
@@ -26031,7 +26054,7 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"0\n" +
 	"\x0fNodeIosDiscover\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\"\xe2\x04\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\"\xa2\x05\n" +
 	"\rNodeIosDevice\x12\x12\n" +
 	"\x04udid\x18\x01 \x01(\tR\x04udid\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -26049,7 +26072,9 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\n" +
 	"last_error\x18\r \x01(\tR\tlastError\x126\n" +
 	"\x17config_revision_applied\x18\x0e \x01(\x03R\x15configRevisionApplied\x124\n" +
-	"\x16developer_mode_enabled\x18\x0f \x01(\bR\x14developerModeEnabled\"\xe6\x01\n" +
+	"\x16developer_mode_enabled\x18\x0f \x01(\bR\x14developerModeEnabled\x12!\n" +
+	"\fwda_progress\x18\x10 \x01(\x05R\vwdaProgress\x12\x1b\n" +
+	"\twda_stage\x18\x11 \x01(\tR\bwdaStage\"\xe6\x01\n" +
 	"\x14NodeIosDevicesReport\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12+\n" +

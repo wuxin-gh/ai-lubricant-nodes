@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -175,10 +176,15 @@ type nodeSession struct {
 	// runtime stdin. Same-id replays (gateway timeout retry, control-plane
 	// re-delivery) are ACKed but never delivered twice. Guarded by mu.
 	seenMessageIDs map[string]bool
-	// pendingInputs buffers user messages that arrived before the runtime process
-	// was up. When state transitions from provisioning → provisioned/running, the
-	// buffer is flushed to the executor. Guarded by mu.
+	// pendingInputs holds user frames that arrived before the runtime could take
+	// them — still provisioning, or spawned-but-stdin-not-yet-attached. It is a
+	// strict FIFO drained in arrival order, so a frame that lands in the spawn
+	// window cannot overtake one already queued. Guarded by mu.
 	pendingInputs []*agentcomposev2.NodeSessionInput
+	// drainMu serializes the drain loop so exactly one goroutine writes to the
+	// runtime at a time (deliverInput and the post-start drain both call it).
+	// Never taken while mu is held — the order is drainMu → mu.
+	drainMu sync.Mutex
 
 	// services maps a reverse-proxy service name (e.g. "files", "jupyter") to the
 	// local base URL the node forwards tunneled requests to. Populated at session
@@ -390,17 +396,17 @@ func (m *sessionManager) provisionSession(ctx context.Context, session *nodeSess
 		}
 	}
 
-	// Provisioning complete: transition from sessionProvisioning to sessionProvisioned
-	// and flush any buffered input that arrived while we were preparing.
+	// Provisioning complete: transition from sessionProvisioning to sessionProvisioned.
+	// Buffered input is left in pendingInputs — it is drained once the runtime is
+	// actually ready (see startRuntime's flush and drainPending), not here: at this
+	// point the executor is still nil, so flushing would drop every frame as
+	// "session is not interactive". That was the silent-loss path for any first
+	// message that arrived during provisioning.
 	session.mu.Lock()
 	session.state = sessionProvisioned
 	session.mu.Unlock()
 
 	m.logger.Info("session provisioned", "session_id", sessionID, "provider", session.provider, "work_dir", workDir)
-
-	// Flush buffered input now that the session is fully provisioned (before
-	// starting the runtime, so the first message can trigger the turn).
-	m.flushPendingInputs(session)
 
 	// Backward compatibility: the classic single-shot DispatchSession caller packs
 	// full config into CreateSession and expects immediate execution. defer_start
@@ -424,23 +430,6 @@ func (m *sessionManager) removeFailedSession(sessionID string) {
 	delete(m.sessions, sessionID)
 	m.mu.Unlock()
 	m.logger.Warn("session removed after provisioning failure", "session_id", sessionID)
-}
-
-// flushPendingInputs delivers all buffered input to the session's executor.
-// Called after provisioning completes and before starting the runtime.
-func (m *sessionManager) flushPendingInputs(session *nodeSession) {
-	session.mu.Lock()
-	pending := session.pendingInputs
-	session.pendingInputs = nil
-	session.mu.Unlock()
-
-	if len(pending) == 0 {
-		return
-	}
-	m.logger.Info("flushing pending input", "session_id", session.id, "count", len(pending))
-	for _, input := range pending {
-		m.deliverInput(input)
-	}
 }
 
 // execution is the running provider process, abstracted over where it runs
@@ -590,6 +579,9 @@ func (m *sessionManager) run(ctx context.Context, session *nodeSession, exectr e
 		// the last stage that can fail before the provider owns the outcome, so
 		// name it here: without this the only signal was a synthetic exit code 1.
 		m.reportStage(session.id, agentcomposev2.SessionStage_SESSION_STAGE_RUNTIME_START, false, "", err)
+		// Anything queued while the spawn was in flight can never run now. Report
+		// it as failed so the gateway does not leave those messages in-flight.
+		m.failPendingInputs(session, err.Error())
 		m.reportResult(session, 1, false, err.Error(), "")
 		m.markStopped(session)
 		return
@@ -600,6 +592,14 @@ func (m *sessionManager) run(ctx context.Context, session *nodeSession, exectr e
 	// Process is alive and its pipes are attached: preparation is done and
 	// anything after this point is the agent's own behaviour, not setup.
 	m.reportStage(session.id, agentcomposev2.SessionStage_SESSION_STAGE_RUNNING, true, "运行中", nil)
+
+	// Drain input that arrived during the spawn window. startRuntime marks the
+	// session running the instant it launches this goroutine, but the stdin pipe
+	// only exists now (a few hundred ms later) — a first message sent in that
+	// window was buffered by deliverInput and is delivered here. This is the fix
+	// for the "发送消息没反应" bug: previously such a frame hit a nil pipe, was
+	// dropped with only a Warn, and the message row stuck at ``dispatching``.
+	m.drainPending(session)
 
 	var resultJSON string
 	var wg sync.WaitGroup
@@ -628,6 +628,10 @@ func (m *sessionManager) run(ctx context.Context, session *nodeSession, exectr e
 		}
 	}
 	m.reportResult(session, int32(exitCode), success, errMsg, resultJSON)
+	// The stream is gone: anything still queued (arrived after the last drain,
+	// or raced the exit) can never run. Report it failed rather than leaving
+	// those messages in-flight.
+	m.failPendingInputs(session, "session runtime exited before the message was delivered")
 	m.markStopped(session)
 	m.logger.Info("session finished", "session_id", session.id, "exit_code", exitCode, "success", success)
 }
@@ -1306,12 +1310,20 @@ func (m *sessionManager) reportResult(session *nodeSession, exitCode int32, succ
 // interactive session's running stream process. Non-interactive sessions have
 // no stream executor, so input is a no-op logged for observability.
 //
+// Every frame is appended to the session's FIFO and drained by drainPending,
+// which is the single writer to the runtime's stdin. That is what closes the
+// spawn window: startRuntime marks a session running the moment it launches the
+// goroutine that spawns the process, but the stdin pipe only exists a few
+// hundred ms later (process spawn + Node module load). A frame arriving in that
+// window used to be written into a nil pipe and silently lost — the turn never
+// ran, no failure was reported, and the gateway's message row stuck at
+// ``dispatching`` while the page span "生成中" forever.
+//
 // For human_message, if the caller did not supply a config snapshot the node
 // stamps the session's current model/mode/llm onto the frame so the runtime
-// re-prepares the provider with the latest config for this turn.
-//
-// When the session is still provisioning (git clone / skill downloads in flight),
-// input is buffered in pendingInputs and flushed once provisioning completes.
+// re-prepares the provider with the latest config for this turn. Stamping
+// happens at arrival so a buffered frame carries the config resolved when it
+// was sent.
 func (m *sessionManager) deliverInput(input *agentcomposev2.NodeSessionInput) {
 	sessionID := strings.TrimSpace(input.GetSessionId())
 	m.mu.Lock()
@@ -1322,20 +1334,10 @@ func (m *sessionManager) deliverInput(input *agentcomposev2.NodeSessionInput) {
 		return
 	}
 
-	// If the session is still provisioning, buffer the input for later delivery.
-	session.mu.Lock()
-	if session.state == sessionProvisioning {
-		session.pendingInputs = append(session.pendingInputs, input)
-		session.mu.Unlock()
-		m.logger.Info("session input buffered during provisioning", "session_id", sessionID, "client_message_id", input.GetClientMessageId())
-		// Emit received status immediately so the gateway knows we accepted it,
-		// even though the runtime hasn't processed it yet.
-		if messageID := strings.TrimSpace(input.GetClientMessageId()); messageID != "" {
-			m.emitInputStatus(sessionID, messageID, input.GetDeliveryAttempt(), "received")
-		}
-		return
+	kind := strings.TrimSpace(input.GetKind())
+	if kind == "human_message" || kind == "" {
+		m.stampInputSnapshot(session, input)
 	}
-	session.mu.Unlock()
 
 	// 端到端消息幂等：同一 (client_message_id, delivery_attempt) 的
 	// human_message 只投递一次。网关侧的幂等保证「同 key 只投递一」，节点侧
@@ -1344,25 +1346,57 @@ func (m *sessionManager) deliverInput(input *agentcomposev2.NodeSessionInput) {
 	// 放行。检查 + 预留在同一临界区完成，并发重复帧没有窗口；投递失败撤销
 	// 预留（重试可在 runtime 恢复后再进来），已见过的 key 只回 ACK。
 	messageID := strings.TrimSpace(input.GetClientMessageId())
-	kind := strings.TrimSpace(input.GetKind())
 	dedupe := messageID != "" && (kind == "human_message" || kind == "")
-	dedupeKey := messageKey(input)
 	if dedupe {
 		session.mu.Lock()
 		if session.seenMessageIDs == nil {
 			session.seenMessageIDs = map[string]bool{}
 		}
-		if session.seenMessageIDs[dedupeKey] {
+		if session.seenMessageIDs[messageKey(input)] {
 			session.mu.Unlock()
 			m.logger.Info("session input replay dropped", "session_id", sessionID, "client_message_id", messageID, "delivery_attempt", input.GetDeliveryAttempt())
-			m.emitInputStatus(sessionID, messageID, input.GetDeliveryAttempt(), "received")
+			m.emitInputStatus(sessionID, messageID, input.GetDeliveryAttempt(), "received", "")
 			return
 		}
-		session.seenMessageIDs[dedupeKey] = true
+		session.seenMessageIDs[messageKey(input)] = true
 		session.mu.Unlock()
 	}
+
+	// A session whose executor exists but is not a stream has no stdin at all
+	// (one-shot local/docker run): input can never be delivered. Report it rather
+	// than buffering forever.
 	session.mu.Lock()
 	exectr := session.executor
+	_, isStream := exectr.(*streamExecutor)
+	if exectr != nil && !isStream {
+		session.mu.Unlock()
+		m.logger.Warn("session input dropped: session is not interactive", "session_id", sessionID)
+		m.reportInputFailure(session, input, "session is not interactive")
+		return
+	}
+	// Queue in arrival order. The drain is the only writer, so a frame landing
+	// while another is mid-write simply waits its turn instead of interleaving.
+	session.pendingInputs = append(session.pendingInputs, input)
+	session.mu.Unlock()
+
+	// ACK receipt as soon as the node owns the frame. The gateway advances the
+	// message row dispatching → received on this, so a long provisioning step
+	// (clone / skill download) does not leave the UI showing "发送中". Delivery
+	// into the runtime re-ACKs on success — a no-op for the state machine, since
+	// received → received is not an accepted transition. A frame that can never
+	// be delivered is reported failed instead (see reportInputFailure).
+	if messageID != "" {
+		m.emitInputStatus(sessionID, messageID, input.GetDeliveryAttempt(), "received", "")
+	}
+
+	m.drainPending(session)
+}
+
+// stampInputSnapshot fills in the session's current model/mode/llm on a
+// human_message that arrived without a snapshot, so the runtime re-prepares the
+// provider for this turn. A caller that supplied its own snapshot wins.
+func (m *sessionManager) stampInputSnapshot(session *nodeSession, input *agentcomposev2.NodeSessionInput) {
+	session.mu.Lock()
 	mode := session.mode
 	llm := session.llm
 	// Prefer the live LLM config's model (updated by ConfigureSessionLLM); fall
@@ -1375,43 +1409,112 @@ func (m *sessionManager) deliverInput(input *agentcomposev2.NodeSessionInput) {
 		model = strings.TrimSpace(session.spec.GetModel())
 	}
 	session.mu.Unlock()
-	// Stamp the session's current config onto a human_message that arrived
-	// without a snapshot, so the runtime re-prepares the provider for this turn.
-	// This runs before the stream cast: even a not-yet-started (deferred) session
-	// gets the snapshot filled, and a non-interactive session still benefits from
-	// the caller seeing the resolved config.
-	if kind == "human_message" || kind == "" {
-		if strings.TrimSpace(input.GetModel()) == "" && model != "" {
-			input.Model = model
-		}
-		if strings.TrimSpace(input.GetMode()) == "" && mode != "" {
-			input.Mode = mode
-		}
-		if input.GetLlm() == nil && llm != nil {
-			input.Llm = llm
-		}
+
+	if strings.TrimSpace(input.GetModel()) == "" && model != "" {
+		input.Model = model
 	}
-	stream, ok := exectr.(*streamExecutor)
-	if !ok {
-		m.logger.Warn("session input dropped: session is not interactive", "session_id", sessionID)
-		return
+	if strings.TrimSpace(input.GetMode()) == "" && mode != "" {
+		input.Mode = mode
 	}
-	if err := stream.deliver(input); err != nil {
-		if dedupe {
-			// 投递失败撤销预留：runtime 未收到，同 key 重试必须能再进来。
-			session.mu.Lock()
-			delete(session.seenMessageIDs, messageKey(input))
+	if input.GetLlm() == nil && llm != nil {
+		input.Llm = llm
+	}
+}
+
+// drainPending delivers buffered frames to the runtime in FIFO order.
+//
+// It is the single writer to the stream, serialized by drainMu, so a frame
+// arriving while another is mid-write waits rather than interleaving. It stops
+// at the first frame the runtime cannot take yet (stdin not attached) and
+// returns — the flush that follows the process spawn picks the queue back up.
+// A stream that is closed for good fails the whole queue instead of leaving it
+// stuck: an unreported drop is what made the page spin "生成中" with no reason.
+func (m *sessionManager) drainPending(session *nodeSession) {
+	session.drainMu.Lock()
+	defer session.drainMu.Unlock()
+
+	for {
+		session.mu.Lock()
+		if len(session.pendingInputs) == 0 {
 			session.mu.Unlock()
+			return
 		}
-		m.logger.Warn("session input delivery failed", "session_id", sessionID, "error", err)
+		stream, ok := session.executor.(*streamExecutor)
+		if !ok {
+			// Not an interactive session (or no executor yet): leave the queue
+			// alone. A non-interactive session already reported its frames failed
+			// at enqueue time.
+			session.mu.Unlock()
+			return
+		}
+		if stream.isClosed() {
+			// Terminal: nothing buffered can ever run. Fail the queue so the
+			// gateway marks those messages failed rather than in-flight.
+			pending := session.pendingInputs
+			session.pendingInputs = nil
+			session.mu.Unlock()
+			for _, input := range pending {
+				m.reportInputFailure(session, input, errStreamClosed.Error())
+			}
+			return
+		}
+		if !stream.ready() {
+			// Spawned but the pipe is not attached yet — see errStreamNotReady.
+			session.mu.Unlock()
+			return
+		}
+		input := session.pendingInputs[0]
+		session.pendingInputs = session.pendingInputs[1:]
+		session.mu.Unlock()
+
+		err := stream.deliver(input)
+		if err == nil {
+			// The node already ACKed this frame as received when it enqueued it
+			// (see deliverInput) — that is the signal the gateway needs to move
+			// the row off ``dispatching``, and it must not wait for a slow spawn.
+			// Re-ACKing here would be a duplicate: the runtime emits its own
+			// input_status(received) once it reads the frame.
+			continue
+		}
+		if errors.Is(err, errStreamNotReady) {
+			// Lost a race with a restart: put the frame back at the head and stop.
+			// The next flush drains it.
+			session.mu.Lock()
+			session.pendingInputs = append([]*agentcomposev2.NodeSessionInput{input}, session.pendingInputs...)
+			session.mu.Unlock()
+			return
+		}
+		m.logger.Warn("session input delivery failed", "session_id", session.id, "error", err)
+		m.reportInputFailure(session, input, err.Error())
+	}
+}
+
+// failPendingInputs reports every buffered frame as failed and clears the queue.
+// Used when the runtime can never take them: the spawn failed, the process
+// exited, or the session was torn down.
+func (m *sessionManager) failPendingInputs(session *nodeSession, reason string) {
+	session.mu.Lock()
+	pending := session.pendingInputs
+	session.pendingInputs = nil
+	session.mu.Unlock()
+	for _, input := range pending {
+		m.reportInputFailure(session, input, reason)
+	}
+}
+
+// reportInputFailure emits input_status(failed) for a frame that will never run
+// and un-reserves its dedupe key so a same-id retry can re-enter. Frames with no
+// client message id have nothing to report against (legacy callers) and are
+// only logged.
+func (m *sessionManager) reportInputFailure(session *nodeSession, input *agentcomposev2.NodeSessionInput, reason string) {
+	messageID := strings.TrimSpace(input.GetClientMessageId())
+	if messageID == "" {
 		return
 	}
-	// 写入 stdin 成功才回执：网关据此把消息行从 dispatching 推进到 received。
-	// runtime 随后的 input_status / agent_turn_started 等事件同样按 message id
-	// 关联（见 streamExecutor.deliver），这里只兜「runtime 不回执」的旧形态。
-	if messageID != "" {
-		m.emitInputStatus(sessionID, messageID, input.GetDeliveryAttempt(), "received")
-	}
+	session.mu.Lock()
+	delete(session.seenMessageIDs, messageKey(input))
+	session.mu.Unlock()
+	m.emitInputStatus(session.id, messageID, input.GetDeliveryAttempt(), "failed", reason)
 }
 
 // messageKey is the node-side dedupe key for one execution of a user message:
@@ -1433,19 +1536,27 @@ func messageKey(input *agentcomposev2.NodeSessionInput) string {
 // a schema-light structured event (event_type=input_status), reusing the
 // runtime event channel — no new proto oneof needed. The gateway's SSE consumer
 // advances the mc_task_events row's delivery_status on receipt.
-func (m *sessionManager) emitInputStatus(sessionID, messageID string, deliveryAttempt uint32, status string) {
+//
+// reason is carried only for status=failed and becomes the row's
+// failure_reason, so a turn the node could not hand to the runtime is visible on
+// the page instead of leaving the message in-flight forever.
+func (m *sessionManager) emitInputStatus(sessionID, messageID string, deliveryAttempt uint32, status string, reason string) {
 	if m.emitStructured == nil || messageID == "" {
 		return
 	}
 	if deliveryAttempt == 0 {
 		deliveryAttempt = 1
 	}
-	payload, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"message_id":       messageID,
 		"status":           status,
 		"delivery_attempt": deliveryAttempt,
 		"session_id":       sessionID,
-	})
+	}
+	if status == "failed" && strings.TrimSpace(reason) != "" {
+		payload["error"] = reason
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -1463,7 +1574,7 @@ func (m *sessionManager) emitInputStatus(sessionID, messageID string, deliveryAt
 		SessionId:   sessionID,
 		Seq:         seq,
 		EventType:   "input_status",
-		PayloadJson: string(payload),
+		PayloadJson: string(raw),
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	upstream := &agentcomposev2.NodeUpstreamFrame{
@@ -1496,6 +1607,9 @@ func (m *sessionManager) delete(sessionID string) error {
 	if runDone != nil {
 		<-runDone
 	}
+	// The session is gone from the map: anything still queued can never run, so
+	// report it failed rather than leaving those messages in-flight upstream.
+	m.failPendingInputs(session, "session deleted before the message was delivered")
 	if session.fileService != nil {
 		session.fileService.stop()
 	}

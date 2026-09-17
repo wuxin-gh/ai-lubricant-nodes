@@ -12,6 +12,7 @@ require (
 	github.com/docker/docker v28.5.1+incompatible
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.41.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -69,7 +70,6 @@ require (
 	golang.org/x/image v0.45.0 // indirect
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect

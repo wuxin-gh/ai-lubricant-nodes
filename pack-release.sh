@@ -24,8 +24,12 @@
 # 产物布局（nodes/dist/<version>/，全部拖进上传弹框）：
 #   node-execution-<os>-<arch>[.exe]
 #   agent-compose-node-management-<os>-<arch>[.exe]
-#   node-ios-<os>-<arch>[.exe]
 #   node-runtime.tar.gz                               (除非 SKIP_RUNTIME=1；通用包，一份)
+#
+# node-ios 不再打包（2026-09-17）：iOS 设备管理能力已折进 node-execution（含
+# iOS 17+ 的 RSD 隧道 agent），执行节点插着 iPhone 即可扫设备/跑 WDA。独立
+# node-ios 二进制停发——历史版本仍在市场里，已装的 ios_host 节点照常升级到
+# 自己的旧线；市场识别器与安装脚本的 ios_host 分支保留，只是新包不再产出。
 #
 # 注意：上传弹框里版本号要手填，必须填脚本打印的版本号（跟烧进二进制的一致），
 # 否则节点自报的 client_version 与市场 manifest 的 version 对不上，升级判定会错。
@@ -110,7 +114,6 @@ for ta in $PLATFORMS; do
   os="${ta%%/*}"; arch="${ta##*/}"
   build_binary execution node-execution "$os" "$arch"
   build_binary management agent-compose-node-management "$os" "$arch"
-  build_binary ios node-ios "$os" "$arch"
 done
 
 # ── runtime tar.gz（通用包，一份）─────────────────────────────────────────
@@ -198,7 +201,7 @@ echo "  版本号: $VERSION_TAG"
 echo "  上传弹框里版本号填这个，跟烧进二进制的一致（节点靠它判定要不要升级）"
 echo "================================================================"
 echo "下一步：把 $OUT/ 下的文件拖进市场管理页「上传新版本」弹框。"
-echo "  弹框只认 node-execution-* / agent-compose-node-management-* / node-ios-* / node-runtime.tar.gz，版本说明/状态在弹框里填。"
+echo "  弹框只认 node-execution-* / agent-compose-node-management-* / node-runtime.tar.gz，版本说明/状态在弹框里填。"
 echo "  上传后服务端自动写 node-releases/version.json，无需手动提交。"
 
 # ── 清理打包缓存 ────────────────────────────────────────────────────────────

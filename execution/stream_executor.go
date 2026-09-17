@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,22 @@ import (
 	"ai-lubricant-nodes/common/agent"
 	agentcomposev2 "ai-lubricant-nodes/common/proto/agentcompose/v2"
 )
+
+// errStreamNotReady reports that the stream process has been spawned but its
+// stdin is not attached yet. startRuntime marks a session running the instant
+// it launches the goroutine that calls start(), so there is a window (process
+// spawn + Node module load, a few hundred ms) where the session looks runnable
+// but writeFrame has no pipe to write to.
+//
+// This is not a failure: the caller buffers the frame and the post-start flush
+// delivers it. Treating it as a hard error was the silent-loss bug — the turn
+// never reached the runtime, no input_status(failed) was emitted, and the
+// gateway's message row stuck at ``dispatching`` while the page span "生成中".
+var errStreamNotReady = errors.New("stream process is not ready for input")
+
+// errStreamClosed reports that the process has exited or been cleaned up.
+// Input can never be delivered, so the caller must report the failure upstream.
+var errStreamClosed = errors.New("stream process is closed")
 
 // streamExecutor runs agent-compose-runtime in its long-lived "stream" mode: the
 // runtime process stays alive across turns, reading NDJSON input frames on
@@ -208,11 +225,34 @@ func (e *streamExecutor) writeFrame(frame map[string]any) error {
 	data = append(data, '\n')
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed || e.stdin == nil {
-		return fmt.Errorf("stream process is not accepting input")
+	if e.closed {
+		return errStreamClosed
+	}
+	if e.stdin == nil {
+		// Spawned but the pipe is not attached yet — see errStreamNotReady.
+		return errStreamNotReady
 	}
 	_, err = e.stdin.Write(data)
 	return err
+}
+
+// ready reports whether the stream process's stdin is attached, i.e. whether
+// deliver() can write a frame right now. A session that is "running" but not
+// yet ready must have its input buffered rather than written.
+func (e *streamExecutor) ready() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.closed && e.stdin != nil
+}
+
+// isClosed reports whether the process has exited or been cleaned up, i.e.
+// whether buffered input can never be delivered. Distinct from !ready(): a
+// closed stream is terminal (fail the queue), a not-ready one is transient
+// (keep buffering until the post-start flush).
+func (e *streamExecutor) isClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closed
 }
 
 func (e *streamExecutor) nextSeq() int {

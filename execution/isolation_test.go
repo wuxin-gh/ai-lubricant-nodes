@@ -776,3 +776,218 @@ func TestDeliverInputStampsSnapshot(t *testing.T) {
 type nopWriteCloser struct{ *strings.Builder }
 
 func (nopWriteCloser) Close() error { return nil }
+
+// captureUpstream installs an emitStructured sink and returns the collected
+// frames. Tests assert on the input_status events the node reports.
+func captureUpstream(m *sessionManager) *[]*agentcomposev2.NodeUpstreamFrame {
+	var frames []*agentcomposev2.NodeUpstreamFrame
+	m.emitStructured = func(frame *agentcomposev2.NodeUpstreamFrame) error {
+		frames = append(frames, frame)
+		return nil
+	}
+	return &frames
+}
+
+// inputStatusEvents returns the (message_id, status) pairs of the input_status
+// events in the captured frames, in order.
+func inputStatusEvents(frames []*agentcomposev2.NodeUpstreamFrame) [][2]string {
+	var out [][2]string
+	for _, frame := range frames {
+		evt := frame.GetSessionEvent()
+		if evt.GetEventType() != "input_status" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(evt.GetPayloadJson()), &payload); err != nil {
+			continue
+		}
+		out = append(out, [2]string{
+			str(payload["message_id"]), str(payload["status"]),
+		})
+	}
+	return out
+}
+
+func str(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// TestDeliverInputBuffersDuringSpawnWindow covers the "发送消息没反应" bug.
+//
+// startRuntime marks a session running the instant it launches the goroutine
+// that spawns the process, but the stdin pipe only exists a few hundred ms later
+// (process spawn + Node module load). A first message sent in that window used
+// to hit a nil pipe, get dropped with only a Warn, and leave the gateway's
+// message row stuck at ``dispatching`` with the page spinning "生成中" forever.
+// It must instead be buffered and delivered once the stream is ready.
+func TestDeliverInputBuffersDuringSpawnWindow(t *testing.T) {
+	m, _ := newTestManager(t)
+	sessA, _ := twoClaudeSessions(t, m)
+	upstream := captureUpstream(m)
+
+	// Executor exists and is "running" but its stdin is not attached yet — the
+	// exact state startRuntime leaves behind while m.run is still spawning.
+	exec := &streamExecutor{mgr: m}
+	sessA.mu.Lock()
+	sessA.executor = exec
+	sessA.state = sessionRunning
+	sessA.mu.Unlock()
+
+	m.deliverInput(&agentcomposev2.NodeSessionInput{
+		SessionId:       sessA.id,
+		Kind:            "human_message",
+		Text:            "hello",
+		ClientMessageId: "msg-window",
+		DeliveryAttempt: 1,
+	})
+
+	// Buffered, not dropped, and ACKed so the gateway leaves ``dispatching``.
+	sessA.mu.Lock()
+	queued := len(sessA.pendingInputs)
+	sessA.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("frame in the spawn window was not buffered: pending=%d", queued)
+	}
+	if got := inputStatusEvents(*upstream); len(got) != 1 || got[0] != [2]string{"msg-window", "received"} {
+		t.Fatalf("expected one received ACK, got %v", got)
+	}
+
+	// The spawn completes: stdin is attached. The post-start drain delivers it.
+	var stdin strings.Builder
+	exec.mu.Lock()
+	exec.stdin = nopWriteCloser{&stdin}
+	exec.mu.Unlock()
+	m.drainPending(sessA)
+
+	if got := strings.Count(stdin.String(), `"type":"human_message"`); got != 1 {
+		t.Fatalf("buffered frame not delivered after spawn: writes=%d stdin=%q", got, stdin.String())
+	}
+	if !strings.Contains(stdin.String(), `"messageId":"msg-window"`) {
+		t.Fatalf("delivered frame lost its message id: %s", stdin.String())
+	}
+	sessA.mu.Lock()
+	left := len(sessA.pendingInputs)
+	sessA.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("queue not drained: %d left", left)
+	}
+}
+
+// TestDeliverInputFailsWhenStreamClosed pins the other half of the bug: a frame
+// that can never be delivered must be reported failed (so the gateway marks the
+// message row and the page stops waiting), and its dedupe key released so a
+// same-id retry can re-enter.
+func TestDeliverInputFailsWhenStreamClosed(t *testing.T) {
+	m, _ := newTestManager(t)
+	sessA, _ := twoClaudeSessions(t, m)
+	upstream := captureUpstream(m)
+
+	exec := &streamExecutor{mgr: m}
+	exec.mu.Lock()
+	exec.closed = true
+	exec.mu.Unlock()
+	sessA.mu.Lock()
+	sessA.executor = exec
+	sessA.state = sessionRunning
+	sessA.mu.Unlock()
+
+	m.deliverInput(&agentcomposev2.NodeSessionInput{
+		SessionId:       sessA.id,
+		Kind:            "human_message",
+		Text:            "hello",
+		ClientMessageId: "msg-dead",
+		DeliveryAttempt: 1,
+	})
+
+	// One received ACK at enqueue, then the failed report once the drain sees a
+	// closed stream. Never a silent drop.
+	got := inputStatusEvents(*upstream)
+	if len(got) != 2 || got[0] != [2]string{"msg-dead", "received"} || got[1] != [2]string{"msg-dead", "failed"} {
+		t.Fatalf("expected received then failed, got %v", got)
+	}
+
+	// The dedupe reservation is released: a retry with the same id is accepted
+	// rather than swallowed as a replay.
+	sessA.mu.Lock()
+	seen := sessA.seenMessageIDs[messageKey(&agentcomposev2.NodeSessionInput{
+		ClientMessageId: "msg-dead", DeliveryAttempt: 1,
+	})]
+	sessA.mu.Unlock()
+	if seen {
+		t.Fatal("failed delivery left its dedupe key reserved; same-id retry would be dropped")
+	}
+}
+
+// TestFailPendingInputsReportsEveryQueuedFrame covers the spawn-failed and
+// process-exited paths: whatever is still queued can never run, so each frame
+// must be reported failed instead of leaving the gateway guessing.
+func TestFailPendingInputsReportsEveryQueuedFrame(t *testing.T) {
+	m, _ := newTestManager(t)
+	sessA, _ := twoClaudeSessions(t, m)
+	upstream := captureUpstream(m)
+
+	sessA.mu.Lock()
+	sessA.pendingInputs = []*agentcomposev2.NodeSessionInput{
+		{SessionId: sessA.id, Kind: "human_message", Text: "a", ClientMessageId: "m-1", DeliveryAttempt: 1},
+		{SessionId: sessA.id, Kind: "human_message", Text: "b", ClientMessageId: "m-2", DeliveryAttempt: 1},
+		// A legacy frame with no message id has nothing to report against.
+		{SessionId: sessA.id, Kind: "human_message", Text: "c"},
+	}
+	sessA.mu.Unlock()
+
+	m.failPendingInputs(sessA, "spawn failed")
+
+	got := inputStatusEvents(*upstream)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 failed reports (id-less frame skipped), got %v", got)
+	}
+	if got[0] != [2]string{"m-1", "failed"} || got[1] != [2]string{"m-2", "failed"} {
+		t.Fatalf("wrong failure reports: %v", got)
+	}
+	sessA.mu.Lock()
+	left := len(sessA.pendingInputs)
+	sessA.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("queue not cleared after failure: %d left", left)
+	}
+}
+
+// TestDrainPendingPreservesFIFO confirms the drain is order-preserving: frames
+// that arrive while a spawn is in flight are delivered in the order they were
+// sent, so a message cannot overtake one already queued.
+func TestDrainPendingPreservesFIFO(t *testing.T) {
+	m, _ := newTestManager(t)
+	sessA, _ := twoClaudeSessions(t, m)
+	captureUpstream(m)
+
+	exec := &streamExecutor{mgr: m}
+	sessA.mu.Lock()
+	sessA.executor = exec
+	sessA.state = sessionRunning
+	sessA.mu.Unlock()
+
+	for _, id := range []string{"first", "second", "third"} {
+		m.deliverInput(&agentcomposev2.NodeSessionInput{
+			SessionId:       sessA.id,
+			Kind:            "human_message",
+			Text:            id,
+			ClientMessageId: id,
+			DeliveryAttempt: 1,
+		})
+	}
+
+	var stdin strings.Builder
+	exec.mu.Lock()
+	exec.stdin = nopWriteCloser{&stdin}
+	exec.mu.Unlock()
+	m.drainPending(sessA)
+
+	body := stdin.String()
+	first := strings.Index(body, `"messageId":"first"`)
+	second := strings.Index(body, `"messageId":"second"`)
+	third := strings.Index(body, `"messageId":"third"`)
+	if first < 0 || second < 0 || third < 0 || !(first < second && second < third) {
+		t.Fatalf("frames delivered out of order: first=%d second=%d third=%d\n%s", first, second, third, body)
+	}
+}

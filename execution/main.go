@@ -75,7 +75,7 @@ func main() {
 		"providers", strings.Join(opts.Providers, ","))
 
 	client := agent.NewClient(opts, logger)
-	client.SetHandler(NewHandler(client, opts.NodeID, workRoot, opts.Providers, opts.Docker, systemEnvAllowed, opts.IosMgmtAllowed))
+	client.SetHandler(NewHandler(ctx, client, opts.NodeID, workRoot, opts.Providers, opts.Docker, systemEnvAllowed, opts.IosMgmtAllowed))
 
 	if err := client.Run(ctx); err != nil && ctx.Err() == nil {
 		logger.Error("node-execution exited with error", "error", err)

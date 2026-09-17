@@ -672,12 +672,20 @@ func (c *Client) publicIPReport() *agentcomposev2.NodePublicIPReport {
 // (session output pumps, tunnels) outlive individual dispatch calls, so they
 // reach the stream through this accessor; if the connection has dropped, output
 // stays queued and this returns ErrStreamGone.
+//
+// Every upstream frame passes through here, so this is the single choke point
+// that keeps an ack/result sendable when a child process emitted non-UTF-8 text
+// (a Windows GBK npm error would otherwise fail the whole marshal and the
+// server would time out instead of surfacing the real reason). Sanitizing is a
+// walk over string fields only when one is invalid — cheap on the hot path,
+// where session output carries its payload as a `bytes` field.
 func (c *Client) EmitUpstream(frame *agentcomposev2.NodeUpstreamFrame) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.currentStream == nil {
 		return ErrStreamGone
 	}
+	SanitizeProtoStrings(frame)
 	return c.currentStream.Send(frame)
 }
 

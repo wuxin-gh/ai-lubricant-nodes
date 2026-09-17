@@ -114,6 +114,10 @@ func (h *FrameHandler) HandleIosFrame(ctx context.Context, c *agent.Client, fram
 			c.SendAck(frameID, errNoManager, nil)
 			return true
 		}
+		// Mark the device PREPARING before the job registers, so the console sees
+		// "initializing" from the device inventory the moment work starts — not
+		// only from the job snapshot (which a server restart would drop).
+		h.manager.NoteWdaJobStarted(payload.IosWdaJob.GetUdid())
 		// Start is non-blocking: it registers the job and returns. Progress and
 		// the terminal result stream back as their own upstream frames, so the
 		// ack means "accepted", never "finished".

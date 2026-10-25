@@ -22,6 +22,13 @@ require (
 // parent workspace. Only ./ios imports it — execution/management are unaffected.
 replace device-control/ios => ../device-control/ios
 
+// go-ios is forked at third_party/go-ios with a minimal, fork-only patch:
+// a userspace (rootless) LAN/RemotePairing tunnel entry point + external-tunnel
+// injection on TunnelManager. Everything else is byte-identical to upstream
+// v1.3.2. When bumping go-ios, re-apply the two patches (network_tunnel.go +
+// the "external" markers in tunnel_api.go).
+replace github.com/danielpaulus/go-ios => ./third_party/go-ios
+
 require (
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect

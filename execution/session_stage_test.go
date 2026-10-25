@@ -270,3 +270,49 @@ func TestStageFramesCarrySessionIDAndTimestamp(t *testing.T) {
 		}
 	}
 }
+
+// startRuntime must be a no-op while a session is still provisioning, not an
+// error. The gateway probes an existing handle with StartSessionRuntime to tell
+// a live session from a stale one; if that probe lands during the clone, an
+// error would be read as "stale handle" (re-dispatch, colliding with the
+// in-flight create) and a success would report stage=running before the working
+// tree exists — unblocking the file/terminal buttons against a file service that
+// is not up yet, and letting the end-of-provisioning auto-start spawn a second
+// editor process.
+func TestStartRuntimeDeferredWhileProvisioning(t *testing.T) {
+	m, rec := newStageManager(t)
+	spec := &agentcomposev2.NodeCreateSession{
+		SessionId:  "sess-stage-prov",
+		Provider:   "claude",
+		DeferStart: true,
+	}
+	if err := m.create(context.Background(), spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Wait until the session is registered and its provisioning has begun, then
+	// race the guard: while state is still provisioning, startRuntime must
+	// return nil without emitting the preflight/start stages.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		sess, ok := m.sessions["sess-stage-prov"]
+		m.mu.Unlock()
+		if !ok {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		sess.mu.Lock()
+		provisioning := sess.state == sessionProvisioning
+		sess.mu.Unlock()
+		if !provisioning {
+			break
+		}
+		if err := m.startRuntime("sess-stage-prov"); err != nil {
+			t.Fatalf("startRuntime during provisioning returned error %v, want nil no-op", err)
+		}
+		if rec.find(agentcomposev2.SessionStage_SESSION_STAGE_RUNTIME_START, true) != nil {
+			t.Fatal("startRuntime emitted a runtime-start stage while provisioning")
+		}
+		break
+	}
+}

@@ -145,6 +145,14 @@ if [ -n "$RUNTIME_SRC" ]; then
   #      —— 各平台数百 MB 的原生二进制。runtime 通过 resolveExecutable 走 PATH 取节点
   #      已安装、管理员批准的 CLI，SDK 永不回退到自带包（见 claude.ts 的注释），所以
   #      这些既重复又有害。装完后单独删掉。
+  #   1b. codex 的平台 CLI（@openai/codex-{darwin,linux,win32}-*）—— 同一个道理：
+  #      codex-sdk 把真身 codex.exe（单文件 341MB）作为平台 optional 包带进来，
+  #      而 runtime 的 resolveCodexPath()（codex-path.ts）同样走 CODEX_BIN/PATH 取
+  #      宿主已装的 codex，SDK 用 codexPathOverride 指过去，归档里的自带二进制
+  #      没有任何代码路径会加载。不删的话一个包就顶整个归档一半体积。
+  #      注意只能按 `codex-<platform>-*` 通配，不能裸删 @openai/codex-*——
+  #      @openai/codex-sdk（被 runners/codex.ts 真正 import）和 @openai/codex
+  #      （codex-sdk 的依赖，bin 入口）是必需的。
   #   2. dsh 依赖的原生模块平台包（@koromix/koffi-*、node-addon-require-builtin-*）
   #      —— 单个 0.2~2.3MB，全平台合计约 11MB。这些是**必需的**：koffi 被
   #      dsh-session-persistence-jsonl / dsh-subprocess-local 等核心包直接依赖，
@@ -159,8 +167,11 @@ if [ -n "$RUNTIME_SRC" ]; then
     echo "npm ci 之后仍无 node_modules，拒绝打出跑不起来的包" >&2
     exit 1
   fi
-  echo "==> 剔除 claude-agent-sdk 自带的平台 CLI 二进制"
+  echo "==> 剔除 claude-agent-sdk / codex 自带的平台 CLI 二进制"
   rm -rf "$STAGE/runtime/node_modules/@anthropic-ai/claude-agent-sdk-"* 2>/dev/null || true
+  rm -rf "$STAGE/runtime/node_modules/@openai/codex-"linux-* \
+         "$STAGE/runtime/node_modules/@openai/codex-"darwin-* \
+         "$STAGE/runtime/node_modules/@openai/codex-"win32-* 2>/dev/null || true
 
   # 自检：归档的内容必须真的能启动。以前删了 node_modules 打出 114KB 的"空壳包",
   # 装到节点上才发现跑不起来；这道门禁把那类问题挡在打包阶段。

@@ -3,6 +3,8 @@ import type { Readable, Writable } from "node:stream";
 import { runRuntimeCommand, type RuntimeCommandRequest } from "./command.js";
 import { decodeFrame, encodeFrame, FRAME_VERSION, type StreamFrame } from "./frame.js";
 import { createInteractiveSession, type InteractiveSession, type TurnSnapshot } from "./interactive.js";
+import { seedResumeThread } from "./session-state.js";
+import type { Provider } from "./types.js";
 
 export interface RunStreamOptions {
   stdin?: Readable;
@@ -74,6 +76,23 @@ export async function runStreamCommand(options: RunStreamOptions = {}): Promise<
             finished = true;
             lines.close();
             break;
+          }
+          // resumeThreadId: 外部会话采用成平台任务后，服务端把它随 tags 传下来。
+          // 那个会话不是我们 runtime 起的，<scope>/providers/<provider>.json 里没有
+          // 记录——stored 是 null，runner 的 resume 链条就断了，会话会被当成全新的。
+          // 种子只在「该 scope 还没有任何 thread」时落盘（详见 seedResumeThread）。
+          //
+          // 必须在 createInteractiveSession **之前**：它当场读一次 state 并把
+          // threadId 报进 started 帧，晚一步页面拿到的会话 id 就是空的。
+          const resumeHint = stringField(frame, "resumeThreadId");
+          if (resumeHint) {
+            const startProvider = (stringField(frame, "provider") || "claude") as Provider;
+            await seedResumeThread(
+              stringField(frame, "stateRoot") || "",
+              startProvider,
+              resumeHint,
+              stringField(frame, "editorSessionId") || stringField(frame, "sessionId") || "",
+            );
           }
           session = await createInteractiveSession({
             provider: stringField(frame, "provider"),

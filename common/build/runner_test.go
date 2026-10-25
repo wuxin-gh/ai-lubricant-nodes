@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -486,5 +488,64 @@ func TestRunnerCloneNetworkModeInjectsProxyArgs(t *testing.T) {
 
 	if !se.invoked(joined) {
 		t.Errorf("network mode did not inject -c proxy args\ninvoked: %v", se.calls)
+	}
+}
+
+// source_no_proxy must skip the url_prefix rewrite entirely — an internal
+// source a github mirror would mangle into a broken prefixed URL stays direct.
+func TestRunnerCloneNoProxySkipsURLPrefixRewrite(t *testing.T) {
+	spec := agent.ProxySpec{Mode: "url_prefix", URLPrefix: "https://ghmirror.example"}
+	r, se, em := newProxyRunner(t, spec)
+	rewritten := "git clone --depth 1 --branch v1.0.0 https://ghmirror.example/https://example.invalid/wda.git src"
+	direct := "git clone --depth 1 --branch v1.0.0 https://example.invalid/wda.git src"
+	se.script[direct] = scriptEntry{}
+
+	req := happyReq("b-noproxy")
+	req.SourceNoProxy = true
+	runAndWait(t, r, req, em)
+
+	if se.invoked(rewritten) {
+		t.Error("source_no_proxy still let the url_prefix rewrite the clone URL")
+	}
+	if !se.invoked(direct) {
+		t.Errorf("source_no_proxy did not clone direct\ninvoked: %v", se.calls)
+	}
+}
+
+// Same flag on the archive path: the download URL must stay untouched.
+func TestRunnerArchiveNoProxyKeepsURLDirect(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write(tarGzBytes(t, map[string]string{"repo-x/README.md": "hi"}))
+	}))
+	defer srv.Close()
+
+	em := &captureEmitter{}
+	r := NewRunner(em.emit, fakeRunnerLogger{}, fakeProxyReader{spec: agent.ProxySpec{Mode: "url_prefix", URLPrefix: "https://ghmirror.example"}})
+	se := &scriptExec{script: map[string]scriptEntry{}}
+	se.script["sh -c build"] = scriptEntry{}
+	r.execFn = func(ctx context.Context, dir, name string, args []string) ([]byte, error) {
+		if name == "sh" {
+			rel := filepath.FromSlash("out.ipa")
+			_ = os.WriteFile(filepath.Join(dir, rel), []byte("ipa"), 0o644)
+		}
+		return se.call(ctx, dir, name, args)
+	}
+	r.uploadFn = func(ctx context.Context, url, token, path, filename string) error { return nil }
+
+	req := archiveReq("b-arch-noproxy", srv.URL+"/x.tar.gz")
+	req.SourceNoProxy = true
+	req.Steps = []string{"build"}
+	req.ArtifactGlob = "out.ipa"
+	runAndWait(t, r, req, em)
+
+	if res := em.buildResult(); res == nil || !res.GetOk() {
+		t.Fatalf("no-proxy archive build failed: %v %s", res.GetErrorCode(), res.GetErrorMessage())
+	}
+	// The request must have hit the httptest server at its own path — i.e. the
+	// url_prefix rewrite never happened (it would have gone to the mirror).
+	if gotPath != "/x.tar.gz" {
+		t.Errorf("download hit path %q, want /x.tar.gz (source_no_proxy must skip the rewrite)", gotPath)
 	}
 }

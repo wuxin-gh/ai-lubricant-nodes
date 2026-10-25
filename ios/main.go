@@ -173,14 +173,35 @@ func cmdRun(args []string) {
 				})
 			},
 		})
-		jobs := ioshost.NewWdaJobManager(client.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, client), stateDir(path), logger)
+		jobs := ioshost.NewWdaJobManager(client.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, client).WithArtifactCache(stateDir(path)), stateDir(path), logger)
 		// Mirror job progress/terminal onto the device's wda_state (same pattern
 		// as the execution handler): the console reads from the durable device
 		// inventory, not the volatile job snapshot.
 		jobs.OnProgress = manager.NoteWdaJobProgress
-		jobs.OnTerminal = func(udid string, ok bool, cancelled bool, errCode string, profileExpiresAt string) {
-			manager.NoteWdaJobResult(udid, ok, cancelled, errCode, profileExpiresAt)
+		jobs.OnTerminal = func(udid string, ok bool, cancelled bool, installed bool, errCode string, message string, profileExpiresAt string) {
+			manager.NoteWdaJobResult(udid, ok, cancelled, installed, errCode, message, profileExpiresAt)
 		}
+		// Tunnel stability during jobs: pause go-ios's tunnel reconcile while a
+		// WDA job runs so a transient ListDevices failure can't tear down the
+		// healthy tunnel mid-launch (see execution/handler.go).
+		jobs.OnActiveChanged = func(running bool) {
+			if running {
+				tunnels.Pause()
+			} else {
+				tunnels.Resume()
+			}
+		}
+		// A job for an unplugged phone parks until the phone is back, rather than
+		// failing at the install stage. Presence is USB-or-LAN: the LAN tunnel
+		// agent keeps an unplugged phone "online" when it can be reached over Wi-Fi.
+		jobs.IsPresent = manager.IsPresent
+		// LAN (no-USB) control: the tunnel agent keeps an RSD tunnel alive for a
+		// claimed phone usbmuxd cannot see, and reports the one human step (the
+		// on-device Trust prompt) back as last_error.
+		tunnels.SetLanHooks(ctx, logger, manager.ClaimedUDIDs, ioshost.LanHostHooks{
+			Reachable:      manager.NoteLanReachable,
+			PairingPending: manager.NoteLanPairingPending,
+		})
 		// A macOS iOS host is also the project-page build node (xcodebuild
 		// lives here). The runner is always wired; the server picks hosts by
 		// the xcodebuild_version capability label, so non-macOS hosts simply
@@ -193,7 +214,14 @@ func cmdRun(args []string) {
 
 		client.SetHandler(ioshost.NewHandler(client, manager, jobs, builds, xcodeJobs))
 		manager.Start(ctx)
-		manager.StartClaimedDevices(ctx)
+		// Approval gate (see execution/handler.go): a PENDING node must not put
+		// the phone into Automation for an identity nobody has adopted yet.
+		go func() {
+			if err := client.WaitApproved(ctx); err != nil {
+				return
+			}
+			manager.StartClaimedDevices(ctx)
+		}()
 		defer manager.Stop()
 		defer jobs.StopAll()
 		defer builds.StopAll()

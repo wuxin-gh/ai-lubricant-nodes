@@ -81,14 +81,44 @@ func UsbmuxdAvailable() bool {
 // node. "off" exists because a workstation with a phone plugged in should not
 // have to let the platform drive it: same risk shape as --allow-system-env.
 func ResolveIosMgmtCapability(value string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "auto":
+	switch normalizeIosMgmt(value) {
+	case "auto":
 		return UsbmuxdAvailable(), nil
-	case "on", "true", "1", "yes":
+	case "on":
 		return true, nil
-	case "off", "false", "0", "no":
+	case "off":
 		return false, nil
 	default:
 		return false, fmt.Errorf("invalid --ios %q: want auto|on|off", value)
 	}
+}
+
+// normalizeIosMgmt maps every accepted --ios spelling onto auto|on|off. An empty
+// value is "auto" (the default), so the ios_mgmt label is probed rather than
+// asserted.
+func normalizeIosMgmt(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
+		return "auto"
+	case "on", "true", "1", "yes":
+		return "on"
+	case "off", "false", "0", "no":
+		return "off"
+	default:
+		return ""
+	}
+}
+
+// IosMgmtProbed reports whether the ios_mgmt capability should be decided by
+// probing usbmuxd *now* rather than by a verdict resolved at process start.
+//
+// This exists because the Apple Mobile Device Service is a host service the node
+// does not control: it can be down (or simply not yet started) when the node
+// boots and up a minute later. A single boot-time probe made that verdict
+// permanent — the label disappeared from the register frame, every iOS surface in
+// the console silently vanished, and only a node restart could bring it back. The
+// caller distinguishes an explicit operator `--ios on/off` (sticky, deliberate)
+// from `auto` (a fact about the host, so re-read every time facts are collected).
+func IosMgmtProbed(mode string) bool {
+	return normalizeIosMgmt(mode) == "auto"
 }

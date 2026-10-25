@@ -484,6 +484,127 @@ describe("ClaudeRunner", () => {
   });
 });
 
+describe("ClaudeRunner plugin discovery", () => {
+  /** Lay down a plugin package with a manifest declaring `name`. */
+  async function writePlugin(root: string, name: string): Promise<string> {
+    const dir = path.join(root, name);
+    await fs.mkdir(path.join(dir, ".claude-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name }),
+    );
+    return dir;
+  }
+
+  /** Write claude's own install ledger the way `claude plugin install` does. */
+  async function writeLedger(home: string, entries: Record<string, string>): Promise<void> {
+    const dir = path.join(home, ".claude", "plugins");
+    await fs.mkdir(dir, { recursive: true });
+    const plugins: Record<string, unknown[]> = {};
+    for (const [key, installPath] of Object.entries(entries)) {
+      plugins[key] = [{ scope: "user", installPath, version: "1.0.0" }];
+    }
+    await fs.writeFile(path.join(dir, "installed_plugins.json"), JSON.stringify({ version: 2, plugins }));
+  }
+
+  it("loads plugins from claude's own tree, not just the node-synced one", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      const installed = await writePlugin(path.join(home, ".claude", "plugins", "cache", "mp"), "claude-mem");
+      await writeLedger(home, { "claude-mem@thedotmack": installed });
+
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      const plugins = options.plugins as { path: string }[];
+      expect(plugins.map((entry) => entry.path)).toEqual([installed]);
+    });
+  });
+
+  it("loads both trees together", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      const synced = await writePlugin(path.join(home, ".agents", "plugins"), "synced");
+      const native = await writePlugin(path.join(home, ".claude", "plugins", "cache", "mp"), "native");
+      await writeLedger(home, { "native@mp": native });
+
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      const paths = (options.plugins as { path: string }[]).map((entry) => entry.path).sort();
+      expect(paths).toEqual([native, synced].sort());
+    });
+  });
+
+  it("loads a plugin present in both trees only once", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      const synced = await writePlugin(path.join(home, ".agents", "plugins"), "superpowers");
+      const native = await writePlugin(path.join(home, ".claude", "plugins", "cache", "mp"), "superpowers");
+      await writeLedger(home, { "superpowers@mp": native });
+
+      // Two copies of one plugin would double-register every skill and hook.
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      expect((options.plugins as unknown[]).length).toBe(1);
+      // The `.agents/plugins` copy wins: it is the tree the runtime has always
+      // loaded, so an operator with a plugin in both places keeps the copy that
+      // was already in effect rather than silently switching.
+      expect((options.plugins as { path: string }[])[0].path).toBe(synced);
+    });
+  });
+
+  it("dedupes the same plugin installed from two marketplaces", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      const a = await writePlugin(path.join(home, ".claude", "plugins", "cache", "m1"), "frontend-design");
+      const b = await writePlugin(path.join(home, ".claude", "plugins", "cache", "m2"), "frontend-design");
+      await writeLedger(home, {
+        "frontend-design@marketplace-one": a,
+        "frontend-design@marketplace-two": b,
+      });
+
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      expect((options.plugins as unknown[]).length).toBe(1);
+    });
+  });
+
+  it("narrows to the activated subset by name and by name@marketplace", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      const keep = await writePlugin(path.join(home, ".claude", "plugins", "cache", "m1"), "claude-mem");
+      const other = await writePlugin(path.join(home, ".claude", "plugins", "cache", "m2"), "frontend-design");
+      await writeLedger(home, { "claude-mem@thedotmack": keep, "frontend-design@mp": other });
+
+      const byName = new ClaudeRunner({
+        ...runnerOptions(root, "", "claude"),
+        plugins: ["claude-mem"],
+      }).queryOptions(null);
+      expect((byName.plugins as { path: string }[]).map((e) => e.path)).toEqual([keep]);
+
+      // The console sends the ledger key form; both must select the plugin.
+      const byKey = new ClaudeRunner({
+        ...runnerOptions(root, "", "claude"),
+        plugins: ["frontend-design@mp"],
+      }).queryOptions(null);
+      expect((byKey.plugins as { path: string }[]).map((e) => e.path)).toEqual([other]);
+    });
+  });
+
+  it("ignores a ledger entry whose install path is gone", async () => {
+    await withTempSession(async (root) => {
+      const home = path.join(root, "home");
+      await writeLedger(home, { "ghost@mp": path.join(home, ".claude", "plugins", "cache", "mp", "ghost") });
+      // A plugin uninstalled from disk but still in the ledger must not produce
+      // a plugins entry pointing at nothing.
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      expect(options.plugins).toBeUndefined();
+    });
+  });
+
+  it("yields no plugins when neither tree exists", async () => {
+    await withTempSession(async (root) => {
+      const options = new ClaudeRunner(runnerOptions(root, "", "claude")).queryOptions(null);
+      expect(options.plugins).toBeUndefined();
+    });
+  });
+});
+
 describe("GeminiRunner", () => {
   it("can be constructed with compatible options", async () => {
     await withTempSession(async (root) => {
@@ -644,6 +765,57 @@ describe("OpenCodeRunner", () => {
       expect(config.provider).toEqual({ openai: { npm: "@ai-sdk/openai" } });
       expect(config.model).toBe("openai/gpt-test");
       expect(config.skills.paths).toEqual([`${root}/home/.agents/skills`]);
+    });
+  });
+
+  it("writes OMO agents/categories tables to oh-my-openagent.json beside the temp opencode config", async () => {
+    await withTempSession(async (root) => {
+      const fs = await import("node:fs/promises");
+      const path = await import("node:path");
+      vi.stubEnv(
+        "OPENCODE_AGENT_CONFIG",
+        JSON.stringify({
+          agents: {
+            sisyphus: { model: "agent-compose/m1", fallback_models: ["agent-compose/m2"] },
+            explore: { model: "agent-compose/m2" },
+          },
+          categories: {
+            quick: { model: "agent-compose/m2" },
+          },
+        }),
+      );
+      const runner = new OpenCodeRunner(runnerOptions(root, "", "opencode"));
+
+      const env = await runner.environment();
+
+      // OPENCODE_CONFIG_DIR 指向临时目录，OMO 经它定位 oh-my-openagent.json。
+      expect(env.OPENCODE_CONFIG_DIR).toBeTruthy();
+      expect(env.OPENCODE_CONFIG_DIR).toBe(path.dirname(String(env.OPENCODE_CONFIG)));
+      const omo = JSON.parse(
+        await fs.readFile(path.join(String(env.OPENCODE_CONFIG_DIR), "oh-my-openagent.json"), "utf8"),
+      );
+      expect(omo.agents.sisyphus).toEqual({ model: "agent-compose/m1", fallback_models: ["agent-compose/m2"] });
+      expect(omo.agents.explore).toEqual({ model: "agent-compose/m2" });
+      expect(omo.categories.quick).toEqual({ model: "agent-compose/m2" });
+    });
+  });
+
+  it("skips the OMO config file when no agent slots are provided", async () => {
+    await withTempSession(async (root) => {
+      const fs = await import("node:fs/promises");
+      const path = await import("node:path");
+      vi.stubEnv("OPENCODE_AGENT_CONFIG", "");
+      const runner = new OpenCodeRunner({ ...runnerOptions(root, "", "opencode"), skills: ["pdf"] });
+
+      const env = await runner.environment();
+
+      // skills 仍写临时 config，但没有 OMO 槽表就不写 oh-my-openagent.json，
+      // 也不设 OPENCODE_CONFIG_DIR（让 OMO 用操作者自己的配置）。
+      expect(env.OPENCODE_CONFIG).toBeTruthy();
+      expect(env.OPENCODE_CONFIG_DIR).toBeUndefined();
+      await expect(
+        fs.stat(path.join(path.dirname(String(env.OPENCODE_CONFIG)), "oh-my-openagent.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     });
   });
 

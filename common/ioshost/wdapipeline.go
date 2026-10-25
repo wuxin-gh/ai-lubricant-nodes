@@ -32,6 +32,7 @@ import (
 	"github.com/aluedeke/go-codesign/pkg/codesign"
 	ios "github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/amfi"
+	"github.com/danielpaulus/go-ios/ios/installationproxy"
 	"github.com/danielpaulus/go-ios/ios/signing"
 	"github.com/danielpaulus/go-ios/ios/zipconduit"
 
@@ -53,6 +54,10 @@ const (
 type DownloadResolver interface {
 	ResolveDownloadURL(string) string
 	DownloadHTTPClient(time.Duration) (*http.Client, error)
+	// DirectHTTPClient returns a plain direct-egress client, used as the
+	// fallback when the proxy mangles the download. Optional in practice:
+	// callers that only need the proxy path may omit it (duck-typed).
+	DirectHTTPClient(time.Duration) (*http.Client, error)
 }
 
 // GoiosWdaSteps is the production WdaSteps.
@@ -65,6 +70,11 @@ type GoiosWdaSteps struct {
 	// proxy transport) — the same download path self-upgrade takes for release
 	// assets. Read per fetch, so a runtime proxy-config update applies.
 	dl DownloadResolver
+	// cacheDir, when set, persists downloaded+verified artifacts keyed by
+	// sha256, so repeated prepare/renew/reinstall on one host never re-download
+	// (and never re-expose themselves to a flaky egress proxy). Owned by the
+	// host: the node passes its ios state dir.
+	cacheDir string
 }
 
 // NewGoiosWdaSteps builds the production pipeline. dl may be nil (direct).
@@ -73,6 +83,69 @@ func NewGoiosWdaSteps(log Logger, dl DownloadResolver) *GoiosWdaSteps {
 		Logger:     log,
 		httpClient: &http.Client{Timeout: 15 * time.Minute},
 		dl:         dl,
+	}
+}
+
+// WithArtifactCache enables the verified-artifact cache under dir. Chainable.
+func (s *GoiosWdaSteps) WithArtifactCache(dir string) *GoiosWdaSteps {
+	s.cacheDir = dir
+	return s
+}
+
+// directHTTPClient is the no-proxy fallback client used when the egress route
+// mangles the download (observed: a local MITM proxy answering HTTP/2 frames
+// Go's HTTP/1 transport rejects). Direct egress is the safety net.
+func directHTTPClient(timeout time.Duration) (*http.Client, error) {
+	return &http.Client{Timeout: timeout}, nil
+}
+
+// cachedArtifact returns the cached copy for the digest, if one exists AND its
+// on-disk sha256 still matches (a truncated/interrupted write must never be
+// served). The copy is linked into workDir under its real name, because the
+// signing stage reads the artifact from there.
+func (s *GoiosWdaSteps) cachedArtifact(sha string) (string, bool) {
+	if s.cacheDir == "" {
+		return "", false
+	}
+	cached := filepath.Join(s.cacheDir, "artifacts", sha+".ipa")
+	f, err := os.Open(cached)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", false
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != sha {
+		// Corrupt cache entry: drop it so the next attempt re-downloads.
+		_ = os.Remove(cached)
+		return "", false
+	}
+	return cached, true
+}
+
+// storeCachedArtifact persists a verified download into the cache dir. The
+// file is already sha256-verified by the fetcher; a best-effort rename keeps
+// partial writes out.
+func (s *GoiosWdaSteps) storeCachedArtifact(sha, src string) {
+	if s.cacheDir == "" || src == "" {
+		return
+	}
+	dir := filepath.Join(s.cacheDir, "artifacts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	dst := filepath.Join(dir, sha+".ipa")
+	if src == dst {
+		return
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		return
 	}
 }
 
@@ -96,6 +169,40 @@ func (s *GoiosWdaSteps) Fetch(ctx context.Context, art *agentcomposev2.NodeIosWd
 		return "", errors.New("artifact sha256 is required")
 	}
 
+	// Cache hit: the same artifact (identical sha256) downloaded once before is
+	// returned without touching the network. The runner IPA is identical for
+	// every device, so repeated prepares/renews/reinstalls on one host never
+	// re-download it — and never re-expose themselves to a flaky egress proxy.
+	if cached, ok := s.cachedArtifact(want); ok {
+		if progress != nil {
+			progress(100)
+		}
+		return cached, nil
+	}
+
+	dest, err := s.fetchThroughProxy(ctx, art, fetchURL, want, workDir, progress)
+	if err != nil {
+		// The egress proxy can garble the stream (observed: a local Clash
+		// answering with raw HTTP/2 frames that Go's HTTP/1 transport rejects —
+		// "malformed HTTP response \x00\x00\x12\x04..."). The artifact is also
+		// fetchable directly, so fall back once: the proxy stays first-choice
+		// (some hosts have no direct egress), the direct path is the safety net.
+		if direct, derr := directHTTPClient(15 * time.Minute); derr == nil {
+			if dest2, ferr := s.fetchWithClient(ctx, direct, strings.TrimSpace(art.GetUrl()), want, workDir, progress); ferr == nil {
+				dest, err = dest2, nil
+			}
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	s.storeCachedArtifact(want, dest)
+	return dest, nil
+}
+
+// fetchThroughProxy downloads via the egress-proxy client (or directly when no
+// resolver is wired), verifying the sha256.
+func (s *GoiosWdaSteps) fetchThroughProxy(ctx context.Context, art *agentcomposev2.NodeIosWdaArtifact, fetchURL, want, workDir string, progress func(int)) (string, error) {
 	client := s.httpClient
 	if s.dl != nil {
 		// Route through the node's egress proxy (URL rewrite + transport), the
@@ -107,7 +214,12 @@ func (s *GoiosWdaSteps) Fetch(ctx context.Context, art *agentcomposev2.NodeIosWd
 		}
 		client = proxyClient
 	}
+	return s.fetchWithClient(ctx, client, fetchURL, want, workDir, progress)
+}
 
+// fetchWithClient streams the artifact through the given client, verifying the
+// digest before the file counts as downloaded.
+func (s *GoiosWdaSteps) fetchWithClient(ctx context.Context, client *http.Client, fetchURL, want, workDir string, progress func(int)) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
 		return "", err
@@ -338,6 +450,37 @@ func (s *GoiosWdaSteps) Install(ctx context.Context, udid, signedPath string) er
 	return nil
 }
 
+// IsInstalled reports whether the runner bundle is already installed on the
+// device, by browsing user apps over the installation proxy. Used to skip the
+// download→sign→install half on a re-prepare of an already-provisioned device.
+//
+// A browse failure is returned as an error (not a bare false): the caller must
+// fall back to the full pipeline rather than skip an install it cannot confirm.
+func (s *GoiosWdaSteps) IsInstalled(ctx context.Context, udid, bundleID string) (bool, error) {
+	if bundleID == "" {
+		return false, errors.New("is-installed: bundle id is empty")
+	}
+	entry, err := deviceByUDID(udid)
+	if err != nil {
+		return false, err
+	}
+	conn, err := installationproxy.New(entry)
+	if err != nil {
+		return false, fmt.Errorf("is-installed: connect installation proxy: %w", err)
+	}
+	defer conn.Close()
+	apps, err := conn.BrowseUserApps()
+	if err != nil {
+		return false, fmt.Errorf("is-installed: browse user apps: %w", err)
+	}
+	for _, app := range apps {
+		if app.CFBundleIdentifier() == bundleID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Launch starts the runner through the device-control link (which owns the
 // testmanagerd + port-forward lifecycle), waits for WDA to answer, and runs a
 // control smoke test. Only if all of that passes does the caller mark the
@@ -351,34 +494,100 @@ func (s *GoiosWdaSteps) Launch(ctx context.Context, udid, bundleID, xctestConfig
 	}
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_STARTING_RUNNER)
 
-	link := devicecontrol.NewLink(devicecontrol.Options{
-		UDID:         udid,
-		WDABundleID:  bundleID,
-		XCTestConfig: xctestConfig,
-	})
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_FORWARDING_PORT)
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_WAITING_READY)
-	if err := link.Start(ctx); err != nil {
+	// Retry on transient usbmuxd/AMDS failures: on Windows the Apple Mobile
+	// Device Service intermittently drops a connection under concurrent load
+	// (reproduced ~1-in-8 even from a bare probe). One such blip during launch
+	// was the whole reason a freshly-installed runner reported "wda_unreachable".
+	// A FRESH Link per attempt: Start tears down everything it opened before
+	// returning an error, but is only guaranteed retryable on a new Link. The
+	// successful link is kept alive for the smoke test and closed on return.
+	// Developer-mode / non-transient errors stay terminal.
+	var launchErr error
+	success := false
+	var liveLink *devicecontrol.Link
+	for attempt := 1; attempt <= 3 && !success; attempt++ {
+		link := devicecontrol.NewLink(devicecontrol.Options{
+			UDID:         udid,
+			WDABundleID:  bundleID,
+			XCTestConfig: xctestConfig,
+		})
+		err := link.Start(ctx)
+		if err == nil {
+			success = true
+			liveLink = link
+			// Keep the successful link alive for the smoke test; Close runs after
+			// Launch returns (captured so the loop variable doesn't alias).
+			defer func(l *devicecontrol.Link) {
+				_ = l.Close()
+			}(link)
+			break
+		}
+		_ = link.Close() // no-op when Start already tore down, safe to repeat
 		if isDeveloperModeError(err) {
 			return 0, fmt.Errorf("%w: %v", errDeveloperModeRequired, err)
 		}
-		return 0, err
+		if !isTransientUsbmuxdError(err) {
+			return 0, err
+		}
+		launchErr = err
+		// Back off 2s, then 4s — a retry must not add to the AMDS contention
+		// that caused the failure in the first place.
+		backoff := time.Duration(1<<attempt) * time.Second // 2s, 4s
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(backoff):
+		}
 	}
-	defer link.Close()
+	if !success {
+		return 0, launchErr
+	}
 
 	// Smoke test: a real screen read proves the whole chain (runner → forward →
 	// control RPC → accessibility tree), not just that a port is open.
 	stage(agentcomposev2.IosJobStage_IOS_JOB_STAGE_VERIFYING_CONTROL)
-	if _, err := link.Source(ctx); err != nil {
+	if _, err := liveLink.Source(ctx); err != nil {
 		return 0, fmt.Errorf("runner control check: %w", err)
 	}
 	return 0, nil
+}
+
+// isTransientUsbmuxdError reports whether a launch error looks like a transient
+// usbmuxd/AMDS failure worth retrying rather than a terminal setup problem.
+// Kept conservative: any connectex timeout, "did not properly respond", i/o
+// timeout, EOF on a dial, or a closed/reset connection. A real app crash or
+// signature rejection surfaces a different error shape and is NOT retried.
+func isTransientUsbmuxdError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connectex") ||
+		strings.Contains(msg, "did not properly respond") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "no connection could be made") ||
+		strings.Contains(msg, "eof") {
+		return true
+	}
+	return false
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
 // deviceByUDID resolves a UDID to a go-ios device entry, distinguishing "not
 // attached" so the job engine can mark the failure retryable.
+//
+// USB first (zero behaviour change for a plugged phone). When usbmuxd does not
+// know the device, fall back to the LAN entry: an unplugged phone the node's
+// LAN tunnel agent has an RSD tunnel for is reachable through the tunnel —
+// zipconduit (install) and installationproxy (list) both have shim paths for a
+// DeviceID==0 + RSD entry. No tunnel → the original not-present error, so the
+// job still parks in waitForDevice rather than failing deep in install.
 func deviceByUDID(udid string) (ios.DeviceEntry, error) {
 	list, err := ios.ListDevices()
 	if err != nil {
@@ -388,6 +597,12 @@ func deviceByUDID(udid string) (ios.DeviceEntry, error) {
 		if d.Properties.SerialNumber == udid {
 			return d, nil
 		}
+	}
+	// LAN fallback: an unplugged phone with a live tunnel is reachable here.
+	// No tunnel → the original not-present error, so the job parks in
+	// waitForDevice instead of failing deep in install.
+	if entry, err := devicecontrol.LanDeviceEntry(udid); err == nil {
+		return entry, nil
 	}
 	return ios.DeviceEntry{}, fmt.Errorf("%w: udid %s", errDeviceNotPresent, udid)
 }

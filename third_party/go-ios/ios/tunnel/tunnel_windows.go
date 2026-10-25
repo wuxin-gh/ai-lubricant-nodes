@@ -1,0 +1,118 @@
+//go:build windows
+
+package tunnel
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"syscall"
+
+	"github.com/danielpaulus/go-ios/ios/golog"
+)
+
+// createSysProcAttr returns attributes for spawning the go-ios agent as a
+// new process group so it survives as a standalone daemon.
+func createSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+}
+
+// CheckPermissions verifies the process has sufficient privileges to create
+// a TUN interface for `ios tunnel start` (without `--userspace`).
+//
+// Windows: probe for administrator privileges by attempting to open
+// \\.\PHYSICALDRIVE0 — an operation that requires elevation.
+func CheckPermissions() error {
+	if _, err := os.Open("\\\\.\\PHYSICALDRIVE0"); err != nil {
+		return fmt.Errorf("this program needs elevated privileges. Run as administrator.")
+	}
+	return nil
+}
+
+type tunWrapper struct {
+	device Device
+
+	buffer [][]byte
+}
+
+func initTUNwrapper(device Device) *tunWrapper {
+	t := &tunWrapper{}
+
+	t.device = device
+	if device.BatchSize() != 1 {
+		panic("batch size not 1")
+	}
+
+	mtu, _ := t.device.MTU()
+	golog.Info("tun wrapper initialized", "module", logModule, "batchSize", device.BatchSize(), "mtu", mtu)
+
+	t.buffer = make([][]byte, 1)
+	t.buffer[0] = make([]byte, mtu)
+	go func() {
+		// Ranging over the channel exits when device.Events() is closed on
+		// disconnect; the old `for { <-device.Events() }` busy-looped on the
+		// closed channel forever, leaking this goroutine.
+		for e := range device.Events() {
+			golog.Info("tun device event", "module", logModule, "event", e)
+		}
+		golog.Info("tun device events channel closed", "module", logModule)
+	}()
+	return t
+}
+
+func (t *tunWrapper) Close() error {
+	return t.device.Close()
+}
+
+func (t *tunWrapper) Write(p []byte) (int, error) {
+
+	bufs := [][]byte{p}                     // Create a slice of one byte slice
+	written, err := t.device.Write(bufs, 0) // Use offset 0
+	if written > 0 {
+		return len(p), err // Assume the entire slice was written
+	}
+	return 0, err
+}
+
+func (t *tunWrapper) Read(p []byte) (int, error) {
+
+	sizes := make([]int, 1)
+	_, err := t.device.Read(t.buffer, sizes, 0)
+
+	if err != nil {
+		return 0, err
+	}
+
+	buf := t.buffer[0]
+	size := sizes[0]
+	copy(p, buf[:size])
+	return size, err
+
+}
+
+func setupTunnelInterface(tunnelInfo tunnelParameters) (io.ReadWriteCloser, error) {
+	name := "tun0"
+
+	tunDevice, err := CreateTUN(name, int(tunnelInfo.ClientParameters.Mtu))
+	if err != nil {
+		fmt.Println("Error creating TUN device:", err)
+		return &tunWrapper{}, err
+	}
+	tunname, err := tunDevice.Name()
+
+	if err != nil {
+		return nil, fmt.Errorf("setupTunnelInterface: failed to get interface name: %w", err)
+	}
+	const prefixLength = 64
+	setIpAddr := exec.Command("netsh", "interface", "ipv6", "set", "address", tunname, fmt.Sprintf("%s/%d", tunnelInfo.ClientParameters.Address, prefixLength))
+	err = runCmd(setIpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("setupTunnelInterface: failed to set IP address for interface: %w. "+
+			"Common causes: the process is not elevated (wintun and netsh require administrator rights) "+
+			"or the wintun adapter was not created properly. "+
+			"Run from an administrator shell, or use 'ios tunnel start --userspace' which does not need admin rights", err)
+	}
+
+	return initTUNwrapper(tunDevice), nil
+}

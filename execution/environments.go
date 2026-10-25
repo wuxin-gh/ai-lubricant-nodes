@@ -173,6 +173,22 @@ func (m *sessionManager) manageEnvironment(ctx context.Context, frame *agentcomp
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create environment %s: %w", envID, err)
 		}
+		// 新建/fresh + worktree 两种模式都在建环境时把仓库 clone 好，让第一个任务
+		// 只需 `git worktree add`（秒级），不再等 ensureEnvRepo 那个 clone（分钟级）。
+		// 导入（external）不带 git spec——目录是操作者自己的，节点一个字节都不能动。
+		//
+		// clone 落点由 target_path 区分：
+		//   空       = 环境共享检出（worktree 模式，envRepoDir），任务从它切 worktree
+		//   非空     = fresh 模式，clone 进用户选定的 external_path（绝对路径）
+		if git := frame.GetGit(); git != nil && strings.TrimSpace(git.GetUrl()) != "" {
+			target := strings.TrimSpace(frame.GetTargetPath())
+			if target == "" {
+				target = m.envRepoDir(envID)
+			}
+			if err := m.ensureEnvRepo(ctx, target, git); err != nil {
+				return fmt.Errorf("create environment %s: clone shared checkout: %w", envID, err)
+			}
+		}
 		m.logger.Info("environment ensured", "env_id", envID, "dir", dir)
 		return nil
 	case agentcomposev2.EnvironmentAction_ENVIRONMENT_ACTION_REMOVE:

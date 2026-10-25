@@ -1,0 +1,27 @@
+#!/bin/sh
+# Pre-commit hook for go-ios
+# Runs gofmt and go vet before allowing commits
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check formatting
+echo "Checking code formatting..."
+UNFORMATTED=$(gofmt -l .)
+if [ -n "$UNFORMATTED" ]; then
+    echo "Error: The following files are not formatted:"
+    echo "$UNFORMATTED"
+    echo ""
+    echo "Run 'gofmt -w .' to fix formatting."
+    exit 1
+fi
+
+# Run go vet
+echo "Running go vet..."
+if ! go vet ./...; then
+    echo "Error: go vet found issues. Please fix them before committing."
+    exit 1
+fi
+
+echo "All checks passed!"

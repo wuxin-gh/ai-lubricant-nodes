@@ -74,18 +74,26 @@ export class OpenCodeRunner {
     const hasSkills = Boolean(this.options.skills && this.options.skills.length > 0);
     const localPlugins = await discoverOpenCodePlugins(this.options.home, this.options.plugins);
     const hasMcp = Boolean(this.options.mcpConfig && Object.keys(this.options.mcpConfig).length > 0);
+    const hasOmoConfig = Boolean(process.env.OPENCODE_AGENT_CONFIG && String(process.env.OPENCODE_AGENT_CONFIG).trim());
     // Only rewrite config when there is something to add — skills.paths, a
-    // local plugin package, or (system-env only) task MCP that must NOT land in
-    // the operator's own opencode.json. Sessions with neither stay on the
-    // untouched base config, exactly as before.
-    if (hasSkills || localPlugins.length > 0 || (this.options.systemEnv && hasMcp)) {
-      const configPath = await this.writeRuntimeConfig(
+    // local plugin package, the OMO agent/category model slots, or (system-env
+    // only) task MCP that must NOT land in the operator's own opencode.json.
+    // Sessions with neither stay on the untouched base config, exactly as before.
+    if (hasSkills || localPlugins.length > 0 || hasOmoConfig || (this.options.systemEnv && hasMcp)) {
+      const { configPath, omoWritten } = await this.writeRuntimeConfig(
         this.baseConfigPath(process.env.OPENCODE_CONFIG),
         hasSkills,
         localPlugins,
+        hasOmoConfig,
       );
       env.OPENCODE_CONFIG = configPath;
       env.AGENT_COMPOSE_OPENCODE_CONFIG = configPath;
+      // OMO（oh-my-openagent）读的是 opencode 配置目录下独立的 oh-my-openagent.json，
+      // 经 OPENCODE_CONFIG_DIR 定位。只有真正写了 OMO 文件才指向临时目录——否则
+      // OMO 会在空目录里找不到配置，回落内置默认；操作者 HOME 的配置不受影响。
+      if (omoWritten) {
+        env.OPENCODE_CONFIG_DIR = path.dirname(configPath);
+      }
     }
     return env;
   }
@@ -95,7 +103,12 @@ export class OpenCodeRunner {
     return trimmed || path.join(this.options.home, ".config", "opencode", "opencode.json");
   }
 
-  async writeRuntimeConfig(baseConfigPath: string, includeSkills: boolean, localPlugins: string[]): Promise<string> {
+  async writeRuntimeConfig(
+    baseConfigPath: string,
+    includeSkills: boolean,
+    localPlugins: string[],
+    includeOmo = false,
+  ): Promise<{ configPath: string; omoWritten: boolean }> {
     await this.cleanupSkillsConfig();
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-compose-opencode-"));
     this.skillsConfigDir = dir;
@@ -134,8 +147,46 @@ export class OpenCodeRunner {
         config.mcp = this.toOpenCodeMcp(mcps);
       }
     }
+    // 模型映射（任务侧 model_mapping → llm.extra["OPENCODE_MODELS"] → 进程 env）：
+    // {平台模型id: {name, limit:{context}}}。合并而非覆盖——base 配置里可能已有
+    // 操作者自己的 models 段。opencode 的 /model 菜单按这份表展示，缺了它就只能
+    // 用 CLI 自带的模型列表（往往不含网关的自定义模型名）。
+    const rawModels = String(process.env.OPENCODE_MODELS || "").trim();
+    if (rawModels) {
+      try {
+        const parsed = JSON.parse(rawModels) as Record<string, unknown>;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          config.models = { ...(isRecord(config.models) ? config.models : {}), ...parsed };
+        }
+      } catch {
+        // 非法 JSON 不阻断会话：opencode 用自带模型列表继续跑。
+      }
+    }
     await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
-    return configPath;
+    // OMO（oh-my-openagent）按它自己的两张表（agents / categories）选模型：切换
+    // 模式/任务类型时 OMO 按 agents.<名>.model / categories.<名>.model 落点。后端
+    // 经 OPENCODE_AGENT_CONFIG 传整包 JSON {agents:{...}, categories:{...}}，每槽
+    // {model:"agent-compose/<平台模型>", fallback_models:[...]}。直接写进临时配置
+    // 目录的 oh-my-openagent.json（与 opencode.json 并存），OMO 经
+    // OPENCODE_CONFIG_DIR 定位到它。system-env 档写的是临时目录而非操作者 HOME，
+    // 操作者自己的 OMO 配置不受影响。
+    let omoWritten = false;
+    if (includeOmo) {
+      const rawOmo = String(process.env.OPENCODE_AGENT_CONFIG || "").trim();
+      if (rawOmo) {
+        try {
+          const parsed = JSON.parse(rawOmo) as unknown;
+          if (isRecord(parsed) && (isRecord(parsed.agents) || isRecord(parsed.categories))) {
+            const omoPath = path.join(dir, "oh-my-openagent.json");
+            await fs.writeFile(omoPath, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+            omoWritten = true;
+          }
+        } catch {
+          // 非法 JSON 不阻断会话：OMO 按内置默认槽表跑。
+        }
+      }
+    }
+    return { configPath, omoWritten };
   }
 
   toOpenCodeMcp(mcps: Record<string, Record<string, unknown>>): Record<string, unknown> {

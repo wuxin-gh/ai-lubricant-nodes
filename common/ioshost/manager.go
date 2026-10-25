@@ -142,6 +142,11 @@ type managedDevice struct {
 	productVersion string
 	connectionType agentcomposev2.IosConnectionType
 	present        bool
+	// lanOn: the LAN tunnel agent currently holds a RemotePairing tunnel for
+	// this UDID (phone unplugged but reachable over Wi-Fi). The console's
+	// online axis is present || lanOn; present stays USB-only so the USB
+	// reconcile keeps its exact meaning.
+	lanOn bool
 
 	claimed          bool
 	claiming         bool
@@ -167,6 +172,11 @@ type managedDevice struct {
 	// 一致。autoPrepare 仍不启用节点自主派发——续签 job 一律由服务端扫描器派发。
 	renewBeforeDays  int
 	lastError        string
+
+	// userStopped 记录「操作者主动退出 Automation 模式」。探测（probeControl）
+	// 见到它就不拉起——否则用户手动 STOP 后 30s 内又被自动拉回来，跟意图打架。
+	// START（无论来自操作者还是探测）与设备重插（applyEvent attach）都会清它。
+	userStopped bool
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -392,8 +402,10 @@ func (m *DeviceManager) ControlRunner(ctx context.Context, req *agentcomposev2.N
 
 	switch action {
 	case agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START:
-		// Idempotent: already running is a success.
+		// Idempotent: already running is a success. An explicit START also clears
+		// the userStopped pin — whoever pressed START wants the loop up.
 		if dev.cancel == nil && !m.stopped.Load() {
+			dev.userStopped = false
 			m.startDeviceLocked(ctx, dev)
 			m.markDirtyLocked()
 			m.reportLocked()
@@ -412,7 +424,14 @@ func (m *DeviceManager) ControlRunner(ctx context.Context, req *agentcomposev2.N
 		// For STOP, reflect "intentionally off" by clearing the device_control
 		// flag immediately; the goroutine will also clear it on exit, but the
 		// flag flip lets the next report surface "stopped" without waiting for
-		// the goroutine to wind down.
+		// the goroutine to wind down. userStopped pins that intent so the
+		// periodic prober does not resurrect an operator-stopped loop (RESTART
+		// clears it — the loop comes right back).
+		if action == agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP {
+			dev.userStopped = true
+		} else {
+			dev.userStopped = false
+		}
 		dev.deviceControlOn = false
 		m.markDirtyLocked()
 		m.reportLocked()
@@ -567,6 +586,24 @@ func (m *DeviceManager) ConfigureDevice(ctx context.Context, req *agentcomposev2
 	return applied, nil
 }
 
+// IsPresent reports whether the device is reachable: usbmuxd-attached OR
+// holding a live LAN (RemotePairing) tunnel. This is the ONLINE axis the
+// console gates on, and it is deliberately not "the device-control runner is
+// connected": the runner only comes up after a successful WDA install, so
+// gating on it would deadlock the very first initialization.
+//
+// An unknown UDID is not present.
+func (m *DeviceManager) IsPresent(udid string) bool {
+	udid = strings.TrimSpace(udid)
+	if udid == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d := m.devices[udid]
+	return d != nil && (d.present || d.lanOn)
+}
+
 // Snapshot returns the full inventory. Always a complete snapshot so a
 // reconnecting server converges in one frame.
 func (m *DeviceManager) Snapshot(requestID string) *agentcomposev2.NodeIosDevicesReport {
@@ -702,20 +739,80 @@ func (m *DeviceManager) applySnapshot(list []EnumeratedDevice) {
 		m.reportLocked()
 	}
 	m.mu.Unlock()
+	m.probeControl()
 }
 
-// refreshWdaExpiryLocked walks every device and advances wdaState purely by
-// time: READY → RENEWAL_DUE inside the renewal window (renewBeforeDays before
-// profile expiry), READY → EXPIRED past expiry. No IO — profileExpiresAt was
-// recorded when the last WDA job verified the profile, so this is a clock
-// comparison on every periodic Rescan (30s tick). Returns whether anything
-// changed so the caller reports a new snapshot. RENEWAL_DUE/EXPIRED are not
-// demoted here: only a WDA job completion (OnState) promotes back to READY.
+// probeControl nudges the device-control loops for devices that are
+// INITIALIZED but not control-ready, so a freshly installed runner (or a runner
+// that came back after a crash / phone unlock / profile renewal) is promoted to
+// READY without waiting for the operator to press anything.
+//
+// This is the periodic batch prober the console's "control ready" axis relies
+// on. It runs on every Rescan tick (30s). ControlRunner(START) is idempotent:
+// a device whose loop is already running (dev.cancel != nil) is a no-op, so
+// repeated ticks do not spawn duplicate goroutines — the real probe cost is
+// only paid by devices whose loop has died (e.g. a 4003 fatal close, ErrNotPaired
+// after a re-pair, or the loop crashed after a node restart race).
+//
+// Devices whose wdaState is RENEWAL_DUE / EXPIRED are deliberately excluded:
+// a runner with a dead profile will not launch, so probing only spams
+// testmanagerd; the auto-renew scanner owns those.
+//
+// Never touches the INITIALIZATION axis: probing a MISSING/PREPARING device
+// would clobber a running job's PREPARING state. Caller must NOT hold m.mu
+// (ControlRunner takes it).
+func (m *DeviceManager) probeControl() {
+	var udid []string
+	m.mu.Lock()
+	for id, d := range m.devices {
+		if d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED {
+			continue
+		}
+		// An operator-stopped loop stays down: userStopped pins that intent, so a
+		// manual "退出 Automation 模式" is not undone by this prober 30s later.
+		if d.userStopped {
+			continue
+		}
+		if !d.present || !d.claimed || d.credentialPath == "" || d.deviceControlOn {
+			continue
+		}
+		udid = append(udid, id)
+	}
+	m.mu.Unlock()
+	if len(udid) == 0 {
+		return
+	}
+	for _, id := range udid {
+		err := m.ControlRunner(context.Background(), &agentcomposev2.NodeIosRunnerControl{
+			Udid: id,
+			Action: agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START,
+		})
+		if err != nil && m.cfg.Logger != nil {
+			m.cfg.Logger.Info("control probe", "udid", id, "error", err)
+		}
+	}
+}
+
+// refreshWdaExpiryLocked walks every device and advances the control axis by
+// time only: READY/RENEWAL_DUE → RENEWAL_DUE inside the renewal window
+// (renewBeforeDays before profile expiry), → EXPIRED past expiry. No IO —
+// profileExpiresAt was recorded when the last WDA job verified the profile, so
+// this is a clock comparison on every periodic Rescan (30s tick). Returns
+// whether anything changed so the caller reports a new snapshot. RENEWAL_DUE /
+// EXPIRED are not demoted here: only a WDA job completion (OnState) or
+// onDeviceState promoting the link promotes back to READY.
 // Caller holds m.mu.
 func (m *DeviceManager) refreshWdaExpiryLocked(now time.Time) bool {
 	changed := false
 	for _, d := range m.devices {
-		if d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY {
+		// The badge tracks the CONTROL axis, not the initialization one: an
+		// INSTALLED device whose profile expired must still show EXPIRED (its
+		// runner will not launch), and a READY device in the renewal window
+		// shows RENEWAL_DUE. MISSING / PREPARING / INSTALLED-with-no-expiry are
+		// left alone — no profile was ever recorded for them.
+		if d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY &&
+			d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED &&
+			d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_RENEWAL_DUE {
 			continue
 		}
 		exp, err := time.Parse(time.RFC3339, strings.TrimSpace(d.profileExpiresAt))
@@ -752,6 +849,13 @@ func (m *DeviceManager) applyEvent(ctx context.Context, ev DeviceEvent) {
 		m.mu.Unlock()
 		return
 	}
+	// A re-attach clears the operator's STOP pin: plugging the phone back in is
+	// an explicit "I want this device available again".
+	m.mu.Lock()
+	if dev, ok := m.devices[ev.UDID]; ok {
+		dev.userStopped = false
+	}
+	m.mu.Unlock()
 	// An attach event carries only the basics; re-enumerate so the new device
 	// arrives with its connection type and lockdown detail filled in.
 	m.Rescan(ctx)
@@ -872,12 +976,33 @@ func (m *DeviceManager) startDeviceLocked(ctx context.Context, d *managedDevice)
 
 // onDeviceState returns the OnState callback for one device. Split out so the
 // closure does not capture the loop variable of a caller.
+//
+// This is ALSO the control-ready derivation point: deviceControlOn turning true
+// means the whole control chain is live (RunDevice only reaches ConnectLoop —
+// and thus StateConnected — after link.Start succeeded: runner launched,
+// port forwarded, health answering). READY ⇄ INSTALLED follows it, so the
+// wda_state can never again claim FAILED while the link is demonstrably up.
+// Rolling back goes to INSTALLED only — the initialization axis never loses its
+// "runner installed" fact to a control-link blip.
 func (m *DeviceManager) onDeviceState(d *managedDevice) func(devicecontrol.State) {
 	return func(s devicecontrol.State) {
 		m.mu.Lock()
 		online := s == devicecontrol.StateConnected
 		if online != d.deviceControlOn {
 			d.deviceControlOn = online
+			switch {
+			case online && d.wdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_PREPARING:
+				// Control chain is up: promote to READY. A job may still be
+				// preparing (its own result will refine), never clobber that.
+				d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
+				d.lastError = ""
+			case !online && d.wdaState == agentcomposev2.IosWdaState_IOS_WDA_STATE_READY:
+				// Runner died (device detached / killed / profile expired):
+				// demote to INSTALLED — initialization stays done, only control
+				// is unavailable. refreshWdaExpiryLocked re-applies RENEWAL_DUE /
+				// EXPIRED badges on its next pass.
+				d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED
+			}
 			m.markDirtyLocked()
 			m.reportLocked()
 		}
@@ -947,12 +1072,21 @@ func (m *DeviceManager) NoteWdaJobProgress(udid string, percent int, stage strin
 
 // NoteWdaJobResult records a job's terminal outcome onto the device.
 //
-//   - ok            → READY, with the signed profile's expiry so the clock can
-//     later demote it to RENEWAL_DUE / EXPIRED.
-//   - cancelled     → no state change. A user-initiated cancel is not a failure;
+//   - ok=true with installed=true → INSTALLED when the control link is down
+//     (waiting for the device-control loop / prober to promote it), READY when
+//     the link is already up (a renew on a working device). Control readiness
+//     is a SEPARATE axis — READY is derived from deviceControlOn in
+//     onDeviceState, never from the job result alone, so a launch flake cannot
+//     both fail the job and claim the device is broken while the control link
+//     is demonstrably up. The signed profile's expiry is recorded so the clock
+//     can later demote to RENEWAL_DUE / EXPIRED.
+//   - ok=true with installed=false → cannot happen (a successful job implies
+//     an installed runner); treated as INSTALLED for safety.
+//   - cancelled → no state change. A user-initiated cancel is not a failure;
 //     leaving the previous state (typically MISSING) lets them retry.
-//   - anything else → FAILED, keeping the error for the console.
-func (m *DeviceManager) NoteWdaJobResult(udid string, ok bool, cancelled bool, errorCode string, profileExpiresAt string) {
+//   - ok=false with installed=false → FAILED, keeping the error for the
+//     console: without an installed runner there is nothing to promote.
+func (m *DeviceManager) NoteWdaJobResult(udid string, ok bool, cancelled bool, installed bool, errorCode string, message string, profileExpiresAt string) {
 	m.noteWdaState(udid, func(d *managedDevice) {
 		d.wdaProgress = 0
 		d.wdaStage = ""
@@ -964,16 +1098,40 @@ func (m *DeviceManager) NoteWdaJobResult(udid string, ok bool, cancelled bool, e
 			}
 			return
 		}
-		if ok {
-			d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
+		if ok || installed {
+			// Initialization done (runner on device). READY only when the
+			// device-control link is already up; otherwise INSTALLED — the
+			// prober (Rescan → ControlRunner START) promotes it shortly. A
+			// launch-verification failure still lands here (installed=true),
+			// keeping the reason in lastError for the console.
+			if d.deviceControlOn {
+				d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
+			} else {
+				d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED
+			}
 			if exp := strings.TrimSpace(profileExpiresAt); exp != "" {
 				d.profileExpiresAt = exp
 			}
-			d.lastError = ""
+			if !ok {
+				// installed but control not verified: keep the reason visible
+				// without claiming the device is broken.
+				if msg := strings.TrimSpace(message); msg != "" {
+					d.lastError = msg
+				} else if code := strings.TrimSpace(errorCode); code != "" {
+					d.lastError = code
+				}
+			} else {
+				d.lastError = ""
+			}
 			return
 		}
 		d.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_FAILED
-		if code := strings.TrimSpace(errorCode); code != "" {
+		// Prefer the human-readable failure text; fall back to the code so a node
+		// that only classified the error still surfaces something. Both are
+		// already redacted upstream (redactErr) — never a raw path or PEM here.
+		if msg := strings.TrimSpace(message); msg != "" {
+			d.lastError = msg
+		} else if code := strings.TrimSpace(errorCode); code != "" {
 			d.lastError = code
 		}
 	})
@@ -1008,6 +1166,84 @@ func (m *DeviceManager) noteWdaState(udid string, fn func(*managedDevice)) {
 // fn actually changed anything (avoiding a report storm on no-op progress).
 func wdaStateKey(d *managedDevice) string {
 	return fmt.Sprintf("%d|%d|%s|%s|%s", d.wdaState, d.wdaProgress, d.wdaStage, d.profileExpiresAt, d.lastError)
+}
+
+// ── LAN (no-USB) tunnel write-back ───────────────────────────────────────
+//
+// The LAN agent (lan.go) is the only writer here. It runs for devices this
+// host has claimed, so it never invents a device the server does not know.
+// Everything below only touches the online/connection axes: no claim, no
+// credential, no WDA state — those belong to the job engine.
+
+// NoteLanReachable flips the LAN half of the online axis and reports the new
+// snapshot, so the console converges without waiting for the next Rescan.
+func (m *DeviceManager) NoteLanReachable(udid string, on bool) {
+	udid = strings.TrimSpace(udid)
+	if udid == "" {
+		return
+	}
+	m.mu.Lock()
+	d := m.devices[udid]
+	if d == nil {
+		m.mu.Unlock()
+		return
+	}
+	if d.lanOn == on {
+		m.mu.Unlock()
+		return
+	}
+	d.lanOn = on
+	if !on && d.present {
+		// USB still attached: nothing else changes, the cable just won.
+		m.mu.Unlock()
+		return
+	}
+	if on {
+		// A tunnel just came up: clear a leftover pairing hint.
+		d.lastError = ""
+	}
+	m.markDirtyLocked()
+	m.reportLocked()
+	m.mu.Unlock()
+}
+
+// NoteLanPairingPending surfaces "tap Trust on the iPhone" as the device's
+// last_error. RemotePairing's first pairing is a human step; leaving it
+// invisible makes a working setup look broken.
+func (m *DeviceManager) NoteLanPairingPending(udid string) {
+	udid = strings.TrimSpace(udid)
+	if udid == "" {
+		return
+	}
+	m.mu.Lock()
+	d := m.devices[udid]
+	if d == nil || d.lanOn {
+		m.mu.Unlock()
+		return
+	}
+	d.lastError = lanPairingHint
+	m.markDirtyLocked()
+	m.reportLocked()
+	m.mu.Unlock()
+}
+
+// lanPairingHint is the operator-facing instruction for the one step only the
+// phone's owner can do.
+const lanPairingHint = "局域网配对：请在 iPhone 上点按「信任」，允许此电脑控制设备（仅首次）"
+
+// ClaimedUDIDs returns the UDIDs this host has claimed and holds a credential
+// for — the only devices the LAN agent may try to reach. Used to scope its
+// discovery so it never dials a phone we do not own.
+func (m *DeviceManager) ClaimedUDIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.devices))
+	for udid, d := range m.devices {
+		if d.claimed && strings.TrimSpace(d.credentialPath) != "" {
+			out = append(out, udid)
+		}
+	}
+	return out
 }
 
 // findLocked resolves a device by server device_id or UDID. Caller holds m.mu.
@@ -1078,13 +1314,22 @@ func (m *DeviceManager) removeFromConfigLocked(udid string) {
 // ── conversions ──────────────────────────────────────────────────────────
 
 func (d *managedDevice) toProto() *agentcomposev2.NodeIosDevice {
+	// Online axis = USB-attached OR a live LAN tunnel. ConnectionType reports
+	// how: while only the LAN tunnel holds the device it is "Network", which is
+	// exactly what it is — usbmuxd keeps reporting "USB"/absent separately via
+	// applySnapshot, so nothing else in the pipeline changes meaning.
+	present := d.present || d.lanOn
+	ct := d.connectionType
+	if d.lanOn && !d.present {
+		ct = agentcomposev2.IosConnectionType_IOS_CONNECTION_TYPE_NETWORK
+	}
 	return &agentcomposev2.NodeIosDevice{
 		Udid:                  d.udid,
 		Name:                  d.name,
 		Model:                 d.model,
 		ProductVersion:        d.productVersion,
-		ConnectionType:        d.connectionType,
-		Present:               d.present,
+		ConnectionType:        ct,
+		Present:               present,
 		Claimed:               d.claimed,
 		DeviceId:              d.deviceID,
 		DeviceControlOnline:   d.deviceControlOn,

@@ -11,3 +11,6 @@ runtime/javascript/node_modules/
 *.exe
 # runtime 平台二进制包（pack-release.sh 可重建；发行走 GitHub Releases，仓库只留元数据）
 runtime/javascript/release/
+# go-ios fork vendored tree: runtime pairing-pool dbs (go run cmd/agent debris), not source
+third_party/go-ios/pool-data/
+third_party/go-ios/cmd/agent/

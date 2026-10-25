@@ -125,37 +125,61 @@ func TestNoteWdaJobProgressIgnoredAfterTerminal(t *testing.T) {
 	// A late progress event must not resurrect a finished job's PREPARING state.
 	m, rep := newTestManager(t, "UDID-1")
 	m.NoteWdaJobStarted("UDID-1")
-	m.NoteWdaJobResult("UDID-1", true, false, "", "2099-01-01T00:00:00Z")
+	m.NoteWdaJobResult("UDID-1", true, false, true, "", "", "2099-01-01T00:00:00Z")
 	rep.count()
 
 	m.NoteWdaJobProgress("UDID-1", 50, "downloading")
 	d := rep.snapshot()
-	if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY {
-		t.Fatalf("late progress changed READY back; got %v", d.WdaState)
+	// No control link in this test → the terminal landed INSTALLED (link-down
+	// flavor of the success path). Either way the late progress must not move it.
+	if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED {
+		t.Fatalf("late progress changed the terminal state; got %v", d.WdaState)
 	}
 	if d.WdaProgress != 0 {
-		t.Fatalf("late progress wrote percent onto a READY device; got %d", d.WdaProgress)
+		t.Fatalf("late progress wrote percent onto a terminal device; got %d", d.WdaProgress)
 	}
 }
 
 // ── NoteWdaJobResult ───────────────────────────────────────────────────────
 
 func TestNoteWdaJobResultSuccessSetsReady(t *testing.T) {
-	m, rep := newTestManager(t, "UDID-1")
-	m.NoteWdaJobStarted("UDID-1")
-	rep.count()
+	// Two flavors, per the control-axis split:
+	//   control link UP   → READY (renew on a working device)
+	//   control link DOWN → INSTALLED (waiting for the prober to promote)
+	t.Run("link up", func(t *testing.T) {
+		m, rep := newTestManager(t, "UDID-1")
+		m.mu.Lock()
+		m.devices["UDID-1"].deviceControlOn = true
+		m.mu.Unlock()
+		m.NoteWdaJobStarted("UDID-1")
+		rep.count()
 
-	m.NoteWdaJobResult("UDID-1", true, false, "", "2099-01-01T00:00:00Z")
-	d := rep.snapshot()
-	if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY {
-		t.Fatalf("wda_state = %v, want READY", d.WdaState)
-	}
-	if d.ProfileExpiresAt != "2099-01-01T00:00:00Z" {
-		t.Fatalf("profile_expires_at = %q, want recorded", d.ProfileExpiresAt)
-	}
-	if d.WdaProgress != 0 || d.WdaStage != "" {
-		t.Fatalf("progress/stage not cleared on terminal: %d/%q", d.WdaProgress, d.WdaStage)
-	}
+		m.NoteWdaJobResult("UDID-1", true, false, true, "", "", "2099-01-01T00:00:00Z")
+		d := rep.snapshot()
+		if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY {
+			t.Fatalf("wda_state = %v, want READY when the control link is up", d.WdaState)
+		}
+		if d.ProfileExpiresAt != "2099-01-01T00:00:00Z" {
+			t.Fatalf("profile_expires_at = %q, want recorded", d.ProfileExpiresAt)
+		}
+		if d.WdaProgress != 0 || d.WdaStage != "" {
+			t.Fatalf("progress/stage not cleared on terminal: %d/%q", d.WdaProgress, d.WdaStage)
+		}
+	})
+	t.Run("link down", func(t *testing.T) {
+		m, rep := newTestManager(t, "UDID-1")
+		m.NoteWdaJobStarted("UDID-1")
+		rep.count()
+
+		m.NoteWdaJobResult("UDID-1", true, false, true, "", "", "2099-01-01T00:00:00Z")
+		d := rep.snapshot()
+		if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED {
+			t.Fatalf("wda_state = %v, want INSTALLED when the control link is down", d.WdaState)
+		}
+		if d.ProfileExpiresAt != "2099-01-01T00:00:00Z" {
+			t.Fatalf("profile_expires_at = %q, want recorded", d.ProfileExpiresAt)
+		}
+	})
 }
 
 func TestNoteWdaJobResultFailureSetsFailed(t *testing.T) {
@@ -163,7 +187,7 @@ func TestNoteWdaJobResultFailureSetsFailed(t *testing.T) {
 	m.NoteWdaJobStarted("UDID-1")
 	rep.count()
 
-	m.NoteWdaJobResult("UDID-1", false, false, "signing_failed", "")
+	m.NoteWdaJobResult("UDID-1", false, false, false, "signing_failed", "", "")
 	d := rep.snapshot()
 	if d.WdaState != agentcomposev2.IosWdaState_IOS_WDA_STATE_FAILED {
 		t.Fatalf("wda_state = %v, want FAILED", d.WdaState)
@@ -180,7 +204,7 @@ func TestNoteWdaJobResultCancelledDoesNotFail(t *testing.T) {
 	m.NoteWdaJobStarted("UDID-1")
 	rep.count()
 
-	m.NoteWdaJobResult("UDID-1", false, true, "cancelled", "")
+	m.NoteWdaJobResult("UDID-1", false, true, false, "cancelled", "", "")
 	d := rep.snapshot()
 	if d.WdaState == agentcomposev2.IosWdaState_IOS_WDA_STATE_FAILED {
 		t.Fatal("cancel must not set FAILED")
@@ -199,12 +223,39 @@ func TestNoteWdaJobResultCancelledPreservesReady(t *testing.T) {
 	m.devices["UDID-1"].wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
 	m.mu.Unlock()
 
-	m.NoteWdaJobResult("UDID-1", false, true, "cancelled", "")
+	m.NoteWdaJobResult("UDID-1", false, true, false, "cancelled", "", "")
 	m.mu.Lock()
 	got := m.devices["UDID-1"].wdaState
 	m.mu.Unlock()
 	if got != agentcomposev2.IosWdaState_IOS_WDA_STATE_READY {
 		t.Fatalf("cancel of a READY-renew dropped state; got %v", got)
+	}
+}
+
+func TestNoteWdaJobResultPrefersMessageOverCode(t *testing.T) {
+	// 失败原因：真因（message，redactErr 后的文本）优先落 last_error；
+	// message 为空时回退 code（保持旧形状兼容）。
+	m, rep := newTestManager(t, "UDID-1")
+	m.NoteWdaJobStarted("UDID-1")
+	rep.count()
+
+	m.NoteWdaJobResult("UDID-1", false, false, true, "wda_unreachable",
+		"runner control check: dial tcp 127.0.0.1:27015: connectex: timeout", "")
+	d := rep.snapshot()
+	if d.LastError != "runner control check: dial tcp 127.0.0.1:27015: connectex: timeout" {
+		t.Fatalf("last_error = %q, want the human-readable reason", d.LastError)
+	}
+}
+
+func TestNoteWdaJobResultFallsBackToCodeWhenMessageEmpty(t *testing.T) {
+	m, rep := newTestManager(t, "UDID-1")
+	m.NoteWdaJobStarted("UDID-1")
+	rep.count()
+
+	m.NoteWdaJobResult("UDID-1", false, false, false, "signing_failed", "", "")
+	d := rep.snapshot()
+	if d.LastError != "signing_failed" {
+		t.Fatalf("last_error = %q, want the code fallback", d.LastError)
 	}
 }
 

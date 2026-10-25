@@ -79,11 +79,18 @@ export class GeminiRunner {
 
     await this.writeSettingsFile();
 
-    const child = spawn("gemini", [
+    const args = [
       "-p", userPrompt,
       "--output-format", "stream-json",
       "--approval-mode", resolveGeminiMode(this.options.mode),
-    ], {
+    ];
+    // 模型映射（单模型）：任务侧 model_mapping.model / 快照头 → options.model。
+    // 之前 gemini runner 从不传模型，CLI 只会用它自己的默认值（往往不是网关
+    // 可路由模型），首轮就报「无此模型」。
+    const geminiModel = String(this.options.model || process.env.LLM_MODEL || "").trim();
+    if (geminiModel) args.push("--model", geminiModel);
+
+    const child = spawn("gemini", args, {
       cwd: this.options.workspace,
       env: { ...process.env },
       stdio: ["ignore", "pipe", "pipe"],

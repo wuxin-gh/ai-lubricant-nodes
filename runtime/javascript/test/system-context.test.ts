@@ -24,11 +24,20 @@ describe("system-context", () => {
 
   it("buildSystemContext returns mpi-only context when agent prompt is empty", () => {
     const mpiFormatted = formatMpiContext("# Email tools\n", "/data/runtime/mpi/resources");
-    expect(buildSystemContext("", mpiFormatted)).toBe(mpiFormatted);
+    const combined = buildSystemContext("", mpiFormatted);
+    // mpi catalog comes first; the always-on workspace git rules are appended.
+    expect(combined.startsWith(mpiFormatted)).toBe(true);
+    expect(combined).toContain("## Workspace git rules");
+    expect(combined).not.toContain("## Agent Identity");
   });
 
-  it("buildSystemContext returns empty string when both layers are empty", () => {
-    expect(buildSystemContext("   ", "\n")).toBe("");
+  it("buildSystemContext always appends the workspace git rules", () => {
+    // Even with no agent prompt and no mpi, the stash-safety rules must be
+    // present: the workspace is a shared-checkout worktree in every session.
+    const combined = buildSystemContext("   ", "\n");
+    expect(combined).toContain("## Workspace git rules");
+    expect(combined).toContain("git stash");
+    expect(combined).toContain("WIP");
   });
 
   it("agentSystemPromptPath resolves under state root", () => {

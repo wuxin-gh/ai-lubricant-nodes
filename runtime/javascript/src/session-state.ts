@@ -57,3 +57,38 @@ function sanitizeScope(scope?: string): string {
   }
   return Buffer.from(value, "utf8").toString("base64url");
 }
+
+/**
+ * Seed the provider thread from an adopt-resume hint, without ever overruling
+ * a thread the runner already recorded.
+ *
+ * Why this exists: adopting an external editor session into a platform task
+ * gives the session a NEW runtime session id, so the state file under that scope
+ * is absent and the runner's `resume` would start a blank conversation. The hint
+ * (tags["resume_thread_id"] from the data service) is written here so the
+ * existing resume chain works unchanged, for every provider, with no per-runner
+ * change.
+ *
+ * The "never overrule" half is the part that matters on re-dispatch: a resume
+ * can fork a new provider thread, and the runner records that forked id after the
+ * turn. If a later dispatch re-sent the ORIGINAL hint and we clobbered the file,
+ * the task would silently fall back to the pre-adoption history and lose every
+ * turn taken since. Returns whether a seed actually happened.
+ */
+export async function seedResumeThread(
+  stateRoot: string,
+  provider: Provider,
+  hint: string,
+  sessionScope?: string,
+): Promise<boolean> {
+  const threadId = String(hint || "").trim();
+  if (!threadId) {
+    return false;
+  }
+  const stored = await readStoredThread(stateRoot, provider, sessionScope);
+  if (stored?.threadId) {
+    return false;
+  }
+  await writeStoredThread(stateRoot, provider, threadId, new Date(), sessionScope);
+  return true;
+}

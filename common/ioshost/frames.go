@@ -116,12 +116,24 @@ func (h *FrameHandler) HandleIosFrame(ctx context.Context, c *agent.Client, fram
 		}
 		// Mark the device PREPARING before the job registers, so the console sees
 		// "initializing" from the device inventory the moment work starts — not
-		// only from the job snapshot (which a server restart would drop).
-		h.manager.NoteWdaJobStarted(payload.IosWdaJob.GetUdid())
+		// only from the job snapshot (which a server restart would drop). Only
+		// when the phone is actually reachable: a job parked waiting for an
+		// offline device must not read as "initializing" (the console shows the
+		// offline axis instead), and the wait stage flips it once it comes back.
+		if h.manager.IsPresent(payload.IosWdaJob.GetUdid()) {
+			h.manager.NoteWdaJobStarted(payload.IosWdaJob.GetUdid())
+		}
 		// Start is non-blocking: it registers the job and returns. Progress and
 		// the terminal result stream back as their own upstream frames, so the
 		// ack means "accepted", never "finished".
-		err := h.jobs.Start(ctx, payload.IosWdaJob)
+		//
+		// DetachStreamContext: a WDA job is a multi-minute pipeline (download →
+		// sign → install → launch). The ctx here is the dispatch loop's
+		// stream-scoped context, so a control-stream blip would cancel the job
+		// mid-download (the observed `download_failed` at the VERIFYING stage) —
+		// even though the job's real work has nothing to do with the stream.
+		// Same pattern as ManageEditor / InstallHostTool / ManageEnvironment.
+		err := h.jobs.Start(agent.DetachStreamContext(ctx), payload.IosWdaJob)
 		c.SendAck(frameID, err, nil)
 
 	case *agentcomposev2.NodeDownstreamFrame_IosJobCancel:

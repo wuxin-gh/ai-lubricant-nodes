@@ -1398,6 +1398,14 @@ const (
 	IosWdaState_IOS_WDA_STATE_EXPIRED IosWdaState = 5
 	// The last WDA job or launch attempt failed; last_error carries why.
 	IosWdaState_IOS_WDA_STATE_FAILED IosWdaState = 6
+	// Initialization complete: a signed runner is installed and lockdown-level
+	// operations (list/install/uninstall) work, but the control link is not up
+	// yet. This is the terminal state of the initialization axis — it never rolls
+	// back to MISSING/UNSPECIFIED unless the runner is removed. Control readiness
+	// is a separate axis: INSTALLED ⇄ READY follows `device_control_online`
+	// (the runner link being connected means testmanagerd + forward + health are
+	// all live), so a runner crash demotes READY→INSTALLED, never →uninitialized.
+	IosWdaState_IOS_WDA_STATE_INSTALLED IosWdaState = 7
 )
 
 // Enum value maps for IosWdaState.
@@ -1410,6 +1418,7 @@ var (
 		4: "IOS_WDA_STATE_RENEWAL_DUE",
 		5: "IOS_WDA_STATE_EXPIRED",
 		6: "IOS_WDA_STATE_FAILED",
+		7: "IOS_WDA_STATE_INSTALLED",
 	}
 	IosWdaState_value = map[string]int32{
 		"IOS_WDA_STATE_UNSPECIFIED": 0,
@@ -1419,6 +1428,7 @@ var (
 		"IOS_WDA_STATE_RENEWAL_DUE": 4,
 		"IOS_WDA_STATE_EXPIRED":     5,
 		"IOS_WDA_STATE_FAILED":      6,
+		"IOS_WDA_STATE_INSTALLED":   7,
 	}
 )
 
@@ -11170,6 +11180,7 @@ type NodeUpstreamFrame struct {
 	//	*NodeUpstreamFrame_NodeBuildResult
 	//	*NodeUpstreamFrame_HostToolJobEvent
 	//	*NodeUpstreamFrame_HostToolJobResult
+	//	*NodeUpstreamFrame_NodeUpgradeEvent
 	Frame         isNodeUpstreamFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -11417,6 +11428,15 @@ func (x *NodeUpstreamFrame) GetHostToolJobResult() *NodeHostToolJobResult {
 	return nil
 }
 
+func (x *NodeUpstreamFrame) GetNodeUpgradeEvent() *NodeUpgradeEvent {
+	if x != nil {
+		if x, ok := x.Frame.(*NodeUpstreamFrame_NodeUpgradeEvent); ok {
+			return x.NodeUpgradeEvent
+		}
+	}
+	return nil
+}
+
 type isNodeUpstreamFrame_Frame interface {
 	isNodeUpstreamFrame_Frame()
 }
@@ -11555,6 +11575,15 @@ type NodeUpstreamFrame_HostToolJobResult struct {
 	HostToolJobResult *NodeHostToolJobResult `protobuf:"bytes,23,opt,name=host_tool_job_result,json=hostToolJobResult,proto3,oneof"`
 }
 
+type NodeUpstreamFrame_NodeUpgradeEvent struct {
+	// ─── Node upgrade progress (runtime hot-swap + binary self-upgrade) ──────
+	// Streamed progress of one upgrade step, correlated by the driving
+	// downstream frame's server_frame_id (the node echoes it in every event).
+	// kind distinguishes the two sequential steps of a unified upgrade
+	// ("runtime" then "node"). seq is monotonic per step.
+	NodeUpgradeEvent *NodeUpgradeEvent `protobuf:"bytes,24,opt,name=node_upgrade_event,json=nodeUpgradeEvent,proto3,oneof"`
+}
+
 func (*NodeUpstreamFrame_Register) isNodeUpstreamFrame_Frame() {}
 
 func (*NodeUpstreamFrame_Heartbeat) isNodeUpstreamFrame_Frame() {}
@@ -11598,6 +11627,8 @@ func (*NodeUpstreamFrame_NodeBuildResult) isNodeUpstreamFrame_Frame() {}
 func (*NodeUpstreamFrame_HostToolJobEvent) isNodeUpstreamFrame_Frame() {}
 
 func (*NodeUpstreamFrame_HostToolJobResult) isNodeUpstreamFrame_Frame() {}
+
+func (*NodeUpstreamFrame_NodeUpgradeEvent) isNodeUpstreamFrame_Frame() {}
 
 // NodeDownstreamFrame: server → node. Session lifecycle commands pushed over
 // the node's already-established outbound stream.
@@ -12812,9 +12843,17 @@ func (*NodeRefreshLabelsRequest) Descriptor() ([]byte, []int) {
 // acked ok, so a retried dispatch cannot wipe a live environment. REMOVE
 // deletes the directory tree and everything installed in it.
 type NodeManageEnvironment struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	EnvId         string                 `protobuf:"bytes,1,opt,name=env_id,json=envId,proto3" json:"env_id,omitempty"`
-	Action        EnvironmentAction      `protobuf:"varint,2,opt,name=action,proto3,enum=agentcompose.v2.EnvironmentAction" json:"action,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	EnvId  string                 `protobuf:"bytes,1,opt,name=env_id,json=envId,proto3" json:"env_id,omitempty"`
+	Action EnvironmentAction      `protobuf:"varint,2,opt,name=action,proto3,enum=agentcompose.v2.EnvironmentAction" json:"action,omitempty"`
+	// Git identity used to clone at CREATE time (fresh / worktree modes). Empty
+	// for external mode (operator's own checkout; no clone).
+	Git *NodeGitSpec `protobuf:"bytes,3,opt,name=git,proto3" json:"git,omitempty"`
+	// Clone target, absolute path on the node. Empty = clone into the environment's
+	// shared checkout (worktree mode, envRepoDir) so tasks cut per-task worktrees
+	// from it; non-empty = clone into this directory (fresh mode, the operator's
+	// chosen external_path). Ignored when git is unset.
+	TargetPath    string `protobuf:"bytes,4,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -12861,6 +12900,20 @@ func (x *NodeManageEnvironment) GetAction() EnvironmentAction {
 		return x.Action
 	}
 	return EnvironmentAction_ENVIRONMENT_ACTION_UNSPECIFIED
+}
+
+func (x *NodeManageEnvironment) GetGit() *NodeGitSpec {
+	if x != nil {
+		return x.Git
+	}
+	return nil
+}
+
+func (x *NodeManageEnvironment) GetTargetPath() string {
+	if x != nil {
+		return x.TargetPath
+	}
+	return ""
 }
 
 // Server -> node: make a shared environment's installed skill/plugin set match
@@ -13600,6 +13653,141 @@ func (x *NodeRuntimeUpgrade) GetProxyUrlPrefix() string {
 	return ""
 }
 
+// Node -> server: one progress step of a runtime/node upgrade, correlated by
+// the server_frame_id of the driving NodeRuntimeUpgrade/NodeSelfUpgrade frame
+// (the node echoes it so a reconnecting server can attribute late events).
+// kind ∈ {"runtime", "node"}. seq is monotonic per step. current/total_bytes are
+// set during the downloading stage so the UI can show "69 MB / 188 MB"; 0/0 when
+// the stage has no denominator.
+//
+// Stage vocabulary (Go emits these verbatim; Python treats only done|failed as
+// terminal; the frontend maps the rest to display labels):
+//
+//	kind=runtime                       kind=node
+//	----------------------------------------------------------------
+//	dispatched   server-side init      dispatched   server-side init
+//	downloading  fetching archive      downloading  fetching binary
+//	verifying    sha256 check          verifying    sha256 check
+//	extracting   untar to staging      (—)
+//	activating   atomic swap+marker    (—)
+//	done         ack (terminal)        (—)          (node would die before sending)
+//	swapping                            swapping     rename new binary into place
+//	restarting                          restarting  emitted before re-exec/restart
+//	failed       error path (terminal)  failed       error path (terminal)
+//
+// The runtime step's terminal truth is its ack (sent after activation); the
+// node step's terminal truth is the reconnect reporting the new client_version
+// — a "done" event for the node step is never sent because the process is
+// replaced. server_frame_id lets the server reject events from a stale step.
+type NodeUpgradeEvent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ServerFrameId string                 `protobuf:"bytes,1,opt,name=server_frame_id,json=serverFrameId,proto3" json:"server_frame_id,omitempty"` // echoes the driving downstream frame's id
+	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`                                          // "runtime" | "node"
+	Seq           int64                  `protobuf:"varint,3,opt,name=seq,proto3" json:"seq,omitempty"`                                           // monotonic per step
+	Stage         string                 `protobuf:"bytes,4,opt,name=stage,proto3" json:"stage,omitempty"`                                        // dispatched|downloading|verifying|extracting|
+	// activating|swapping|restarting|done|failed
+	Message       string `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"`
+	Percent       int32  `protobuf:"varint,6,opt,name=percent,proto3" json:"percent,omitempty"`                               // 0-100 where estimable, else 0
+	CurrentBytes  int64  `protobuf:"varint,7,opt,name=current_bytes,json=currentBytes,proto3" json:"current_bytes,omitempty"` // download progress numerator
+	TotalBytes    int64  `protobuf:"varint,8,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`       // download progress denominator
+	ReportedAt    string `protobuf:"bytes,9,opt,name=reported_at,json=reportedAt,proto3" json:"reported_at,omitempty"`        // RFC3339
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeUpgradeEvent) Reset() {
+	*x = NodeUpgradeEvent{}
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[141]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeUpgradeEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeUpgradeEvent) ProtoMessage() {}
+
+func (x *NodeUpgradeEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[141]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeUpgradeEvent.ProtoReflect.Descriptor instead.
+func (*NodeUpgradeEvent) Descriptor() ([]byte, []int) {
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{141}
+}
+
+func (x *NodeUpgradeEvent) GetServerFrameId() string {
+	if x != nil {
+		return x.ServerFrameId
+	}
+	return ""
+}
+
+func (x *NodeUpgradeEvent) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *NodeUpgradeEvent) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *NodeUpgradeEvent) GetStage() string {
+	if x != nil {
+		return x.Stage
+	}
+	return ""
+}
+
+func (x *NodeUpgradeEvent) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *NodeUpgradeEvent) GetPercent() int32 {
+	if x != nil {
+		return x.Percent
+	}
+	return 0
+}
+
+func (x *NodeUpgradeEvent) GetCurrentBytes() int64 {
+	if x != nil {
+		return x.CurrentBytes
+	}
+	return 0
+}
+
+func (x *NodeUpgradeEvent) GetTotalBytes() int64 {
+	if x != nil {
+		return x.TotalBytes
+	}
+	return 0
+}
+
+func (x *NodeUpgradeEvent) GetReportedAt() string {
+	if x != nil {
+		return x.ReportedAt
+	}
+	return ""
+}
+
 // Server -> node: install a host-level runtime dependency (currently Node.js).
 //
 // The node resolves its own os/arch at runtime and the server picks the matching
@@ -13627,7 +13815,7 @@ type NodeInstallHostTool struct {
 
 func (x *NodeInstallHostTool) Reset() {
 	*x = NodeInstallHostTool{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[141]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13639,7 +13827,7 @@ func (x *NodeInstallHostTool) String() string {
 func (*NodeInstallHostTool) ProtoMessage() {}
 
 func (x *NodeInstallHostTool) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[141]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13652,7 +13840,7 @@ func (x *NodeInstallHostTool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInstallHostTool.ProtoReflect.Descriptor instead.
 func (*NodeInstallHostTool) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{141}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *NodeInstallHostTool) GetTool() string {
@@ -13735,7 +13923,7 @@ type NodeTerminalOpen struct {
 
 func (x *NodeTerminalOpen) Reset() {
 	*x = NodeTerminalOpen{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[142]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13747,7 +13935,7 @@ func (x *NodeTerminalOpen) String() string {
 func (*NodeTerminalOpen) ProtoMessage() {}
 
 func (x *NodeTerminalOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[142]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13760,7 +13948,7 @@ func (x *NodeTerminalOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalOpen.ProtoReflect.Descriptor instead.
 func (*NodeTerminalOpen) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{142}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *NodeTerminalOpen) GetTerminalId() string {
@@ -13816,7 +14004,7 @@ type NodeTerminalInput struct {
 
 func (x *NodeTerminalInput) Reset() {
 	*x = NodeTerminalInput{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[143]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13828,7 +14016,7 @@ func (x *NodeTerminalInput) String() string {
 func (*NodeTerminalInput) ProtoMessage() {}
 
 func (x *NodeTerminalInput) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[143]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13841,7 +14029,7 @@ func (x *NodeTerminalInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalInput.ProtoReflect.Descriptor instead.
 func (*NodeTerminalInput) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{143}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *NodeTerminalInput) GetTerminalId() string {
@@ -13869,7 +14057,7 @@ type NodeTerminalResize struct {
 
 func (x *NodeTerminalResize) Reset() {
 	*x = NodeTerminalResize{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[144]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13881,7 +14069,7 @@ func (x *NodeTerminalResize) String() string {
 func (*NodeTerminalResize) ProtoMessage() {}
 
 func (x *NodeTerminalResize) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[144]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13894,7 +14082,7 @@ func (x *NodeTerminalResize) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalResize.ProtoReflect.Descriptor instead.
 func (*NodeTerminalResize) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{144}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *NodeTerminalResize) GetTerminalId() string {
@@ -13921,7 +14109,7 @@ type NodeTerminalClose struct {
 
 func (x *NodeTerminalClose) Reset() {
 	*x = NodeTerminalClose{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[145]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13933,7 +14121,7 @@ func (x *NodeTerminalClose) String() string {
 func (*NodeTerminalClose) ProtoMessage() {}
 
 func (x *NodeTerminalClose) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[145]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13946,7 +14134,7 @@ func (x *NodeTerminalClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalClose.ProtoReflect.Descriptor instead.
 func (*NodeTerminalClose) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{145}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *NodeTerminalClose) GetTerminalId() string {
@@ -13977,7 +14165,7 @@ type NodeTerminalAttach struct {
 
 func (x *NodeTerminalAttach) Reset() {
 	*x = NodeTerminalAttach{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[146]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13989,7 +14177,7 @@ func (x *NodeTerminalAttach) String() string {
 func (*NodeTerminalAttach) ProtoMessage() {}
 
 func (x *NodeTerminalAttach) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[146]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14002,7 +14190,7 @@ func (x *NodeTerminalAttach) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalAttach.ProtoReflect.Descriptor instead.
 func (*NodeTerminalAttach) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{146}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *NodeTerminalAttach) GetTerminalId() string {
@@ -14030,7 +14218,7 @@ type NodeTerminalListRequest struct {
 
 func (x *NodeTerminalListRequest) Reset() {
 	*x = NodeTerminalListRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[147]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14042,7 +14230,7 @@ func (x *NodeTerminalListRequest) String() string {
 func (*NodeTerminalListRequest) ProtoMessage() {}
 
 func (x *NodeTerminalListRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[147]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14055,7 +14243,7 @@ func (x *NodeTerminalListRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalListRequest.ProtoReflect.Descriptor instead.
 func (*NodeTerminalListRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{147}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{148}
 }
 
 func (x *NodeTerminalListRequest) GetRequestId() string {
@@ -14097,7 +14285,7 @@ type NodeTerminalStatus struct {
 
 func (x *NodeTerminalStatus) Reset() {
 	*x = NodeTerminalStatus{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[148]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14109,7 +14297,7 @@ func (x *NodeTerminalStatus) String() string {
 func (*NodeTerminalStatus) ProtoMessage() {}
 
 func (x *NodeTerminalStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[148]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14122,7 +14310,7 @@ func (x *NodeTerminalStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalStatus.ProtoReflect.Descriptor instead.
 func (*NodeTerminalStatus) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{148}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{149}
 }
 
 func (x *NodeTerminalStatus) GetTerminalId() string {
@@ -14184,7 +14372,7 @@ type NodeTerminalListResult struct {
 
 func (x *NodeTerminalListResult) Reset() {
 	*x = NodeTerminalListResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[149]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14196,7 +14384,7 @@ func (x *NodeTerminalListResult) String() string {
 func (*NodeTerminalListResult) ProtoMessage() {}
 
 func (x *NodeTerminalListResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[149]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14209,7 +14397,7 @@ func (x *NodeTerminalListResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalListResult.ProtoReflect.Descriptor instead.
 func (*NodeTerminalListResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{149}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{150}
 }
 
 func (x *NodeTerminalListResult) GetRequestId() string {
@@ -14238,7 +14426,7 @@ type NodeTerminalInterrupt struct {
 
 func (x *NodeTerminalInterrupt) Reset() {
 	*x = NodeTerminalInterrupt{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[150]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14250,7 +14438,7 @@ func (x *NodeTerminalInterrupt) String() string {
 func (*NodeTerminalInterrupt) ProtoMessage() {}
 
 func (x *NodeTerminalInterrupt) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[150]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14263,7 +14451,7 @@ func (x *NodeTerminalInterrupt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalInterrupt.ProtoReflect.Descriptor instead.
 func (*NodeTerminalInterrupt) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{150}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{151}
 }
 
 func (x *NodeTerminalInterrupt) GetTerminalId() string {
@@ -14294,7 +14482,7 @@ type NodeTerminalOutput struct {
 
 func (x *NodeTerminalOutput) Reset() {
 	*x = NodeTerminalOutput{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[151]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14306,7 +14494,7 @@ func (x *NodeTerminalOutput) String() string {
 func (*NodeTerminalOutput) ProtoMessage() {}
 
 func (x *NodeTerminalOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[151]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14319,7 +14507,7 @@ func (x *NodeTerminalOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalOutput.ProtoReflect.Descriptor instead.
 func (*NodeTerminalOutput) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{151}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{152}
 }
 
 func (x *NodeTerminalOutput) GetTerminalId() string {
@@ -14364,7 +14552,7 @@ type NodeTerminalExit struct {
 
 func (x *NodeTerminalExit) Reset() {
 	*x = NodeTerminalExit{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[152]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14376,7 +14564,7 @@ func (x *NodeTerminalExit) String() string {
 func (*NodeTerminalExit) ProtoMessage() {}
 
 func (x *NodeTerminalExit) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[152]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14389,7 +14577,7 @@ func (x *NodeTerminalExit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTerminalExit.ProtoReflect.Descriptor instead.
 func (*NodeTerminalExit) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{152}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{153}
 }
 
 func (x *NodeTerminalExit) GetTerminalId() string {
@@ -14440,7 +14628,7 @@ type NodeHostExecRequest struct {
 
 func (x *NodeHostExecRequest) Reset() {
 	*x = NodeHostExecRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[153]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14452,7 +14640,7 @@ func (x *NodeHostExecRequest) String() string {
 func (*NodeHostExecRequest) ProtoMessage() {}
 
 func (x *NodeHostExecRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[153]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14465,7 +14653,7 @@ func (x *NodeHostExecRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostExecRequest.ProtoReflect.Descriptor instead.
 func (*NodeHostExecRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{153}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{154}
 }
 
 func (x *NodeHostExecRequest) GetRequestId() string {
@@ -14531,7 +14719,7 @@ type NodeHostExecResult struct {
 
 func (x *NodeHostExecResult) Reset() {
 	*x = NodeHostExecResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[154]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14543,7 +14731,7 @@ func (x *NodeHostExecResult) String() string {
 func (*NodeHostExecResult) ProtoMessage() {}
 
 func (x *NodeHostExecResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[154]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14556,7 +14744,7 @@ func (x *NodeHostExecResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostExecResult.ProtoReflect.Descriptor instead.
 func (*NodeHostExecResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{154}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{155}
 }
 
 func (x *NodeHostExecResult) GetRequestId() string {
@@ -14642,7 +14830,7 @@ type NodeToolRunRequest struct {
 
 func (x *NodeToolRunRequest) Reset() {
 	*x = NodeToolRunRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[155]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[156]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14654,7 +14842,7 @@ func (x *NodeToolRunRequest) String() string {
 func (*NodeToolRunRequest) ProtoMessage() {}
 
 func (x *NodeToolRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[155]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[156]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14667,7 +14855,7 @@ func (x *NodeToolRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeToolRunRequest.ProtoReflect.Descriptor instead.
 func (*NodeToolRunRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{155}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{156}
 }
 
 func (x *NodeToolRunRequest) GetRunId() string {
@@ -14739,7 +14927,7 @@ type NodeToolRunStop struct {
 
 func (x *NodeToolRunStop) Reset() {
 	*x = NodeToolRunStop{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[156]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[157]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14751,7 +14939,7 @@ func (x *NodeToolRunStop) String() string {
 func (*NodeToolRunStop) ProtoMessage() {}
 
 func (x *NodeToolRunStop) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[156]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[157]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14764,7 +14952,7 @@ func (x *NodeToolRunStop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeToolRunStop.ProtoReflect.Descriptor instead.
 func (*NodeToolRunStop) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{156}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{157}
 }
 
 func (x *NodeToolRunStop) GetRunId() string {
@@ -14805,7 +14993,7 @@ type NodeToolRunEvent struct {
 
 func (x *NodeToolRunEvent) Reset() {
 	*x = NodeToolRunEvent{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[157]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[158]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14817,7 +15005,7 @@ func (x *NodeToolRunEvent) String() string {
 func (*NodeToolRunEvent) ProtoMessage() {}
 
 func (x *NodeToolRunEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[157]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[158]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14830,7 +15018,7 @@ func (x *NodeToolRunEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeToolRunEvent.ProtoReflect.Descriptor instead.
 func (*NodeToolRunEvent) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{157}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{158}
 }
 
 func (x *NodeToolRunEvent) GetRunId() string {
@@ -14895,7 +15083,7 @@ type NodeActiveToolRun struct {
 
 func (x *NodeActiveToolRun) Reset() {
 	*x = NodeActiveToolRun{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[158]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[159]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14907,7 +15095,7 @@ func (x *NodeActiveToolRun) String() string {
 func (*NodeActiveToolRun) ProtoMessage() {}
 
 func (x *NodeActiveToolRun) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[158]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[159]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14920,7 +15108,7 @@ func (x *NodeActiveToolRun) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeActiveToolRun.ProtoReflect.Descriptor instead.
 func (*NodeActiveToolRun) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{158}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{159}
 }
 
 func (x *NodeActiveToolRun) GetRunId() string {
@@ -14958,7 +15146,7 @@ type FollowToolRunRequest struct {
 
 func (x *FollowToolRunRequest) Reset() {
 	*x = FollowToolRunRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[159]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[160]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14970,7 +15158,7 @@ func (x *FollowToolRunRequest) String() string {
 func (*FollowToolRunRequest) ProtoMessage() {}
 
 func (x *FollowToolRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[159]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[160]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14983,7 +15171,7 @@ func (x *FollowToolRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FollowToolRunRequest.ProtoReflect.Descriptor instead.
 func (*FollowToolRunRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{159}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{160}
 }
 
 func (x *FollowToolRunRequest) GetNodeId() string {
@@ -15022,7 +15210,7 @@ type NodeFileUploadRequest struct {
 
 func (x *NodeFileUploadRequest) Reset() {
 	*x = NodeFileUploadRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[160]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[161]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15034,7 +15222,7 @@ func (x *NodeFileUploadRequest) String() string {
 func (*NodeFileUploadRequest) ProtoMessage() {}
 
 func (x *NodeFileUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[160]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[161]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15047,7 +15235,7 @@ func (x *NodeFileUploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeFileUploadRequest.ProtoReflect.Descriptor instead.
 func (*NodeFileUploadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{160}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{161}
 }
 
 func (x *NodeFileUploadRequest) GetUploadId() string {
@@ -15124,7 +15312,7 @@ type NodeFileUploadResult struct {
 
 func (x *NodeFileUploadResult) Reset() {
 	*x = NodeFileUploadResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[161]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[162]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15136,7 +15324,7 @@ func (x *NodeFileUploadResult) String() string {
 func (*NodeFileUploadResult) ProtoMessage() {}
 
 func (x *NodeFileUploadResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[161]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[162]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15149,7 +15337,7 @@ func (x *NodeFileUploadResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeFileUploadResult.ProtoReflect.Descriptor instead.
 func (*NodeFileUploadResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{161}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{162}
 }
 
 func (x *NodeFileUploadResult) GetUploadId() string {
@@ -15208,7 +15396,7 @@ type NodeRegister struct {
 
 func (x *NodeRegister) Reset() {
 	*x = NodeRegister{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[162]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[163]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15220,7 +15408,7 @@ func (x *NodeRegister) String() string {
 func (*NodeRegister) ProtoMessage() {}
 
 func (x *NodeRegister) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[162]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[163]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15233,7 +15421,7 @@ func (x *NodeRegister) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeRegister.ProtoReflect.Descriptor instead.
 func (*NodeRegister) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{162}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{163}
 }
 
 func (x *NodeRegister) GetNodeId() string {
@@ -15294,7 +15482,7 @@ type NodeServerHello struct {
 
 func (x *NodeServerHello) Reset() {
 	*x = NodeServerHello{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[163]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[164]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15306,7 +15494,7 @@ func (x *NodeServerHello) String() string {
 func (*NodeServerHello) ProtoMessage() {}
 
 func (x *NodeServerHello) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[163]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[164]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15319,7 +15507,7 @@ func (x *NodeServerHello) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeServerHello.ProtoReflect.Descriptor instead.
 func (*NodeServerHello) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{163}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{164}
 }
 
 func (x *NodeServerHello) GetServerTime() string {
@@ -15349,7 +15537,7 @@ type EditorModeSemantics struct {
 
 func (x *EditorModeSemantics) Reset() {
 	*x = EditorModeSemantics{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[164]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[165]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15361,7 +15549,7 @@ func (x *EditorModeSemantics) String() string {
 func (*EditorModeSemantics) ProtoMessage() {}
 
 func (x *EditorModeSemantics) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[164]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[165]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15374,7 +15562,7 @@ func (x *EditorModeSemantics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EditorModeSemantics.ProtoReflect.Descriptor instead.
 func (*EditorModeSemantics) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{164}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{165}
 }
 
 func (x *EditorModeSemantics) GetCanRead() bool {
@@ -15425,7 +15613,7 @@ type EditorModeSpec struct {
 
 func (x *EditorModeSpec) Reset() {
 	*x = EditorModeSpec{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[165]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[166]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15437,7 +15625,7 @@ func (x *EditorModeSpec) String() string {
 func (*EditorModeSpec) ProtoMessage() {}
 
 func (x *EditorModeSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[165]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[166]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15450,7 +15638,7 @@ func (x *EditorModeSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EditorModeSpec.ProtoReflect.Descriptor instead.
 func (*EditorModeSpec) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{165}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{166}
 }
 
 func (x *EditorModeSpec) GetId() string {
@@ -15504,7 +15692,7 @@ type EditorCapability struct {
 
 func (x *EditorCapability) Reset() {
 	*x = EditorCapability{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[166]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[167]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15516,7 +15704,7 @@ func (x *EditorCapability) String() string {
 func (*EditorCapability) ProtoMessage() {}
 
 func (x *EditorCapability) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[166]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[167]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15529,7 +15717,7 @@ func (x *EditorCapability) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EditorCapability.ProtoReflect.Descriptor instead.
 func (*EditorCapability) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{166}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{167}
 }
 
 func (x *EditorCapability) GetProvider() string {
@@ -15602,7 +15790,7 @@ type NodeCapabilities struct {
 
 func (x *NodeCapabilities) Reset() {
 	*x = NodeCapabilities{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[167]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[168]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15614,7 +15802,7 @@ func (x *NodeCapabilities) String() string {
 func (*NodeCapabilities) ProtoMessage() {}
 
 func (x *NodeCapabilities) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[167]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[168]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15627,7 +15815,7 @@ func (x *NodeCapabilities) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeCapabilities.ProtoReflect.Descriptor instead.
 func (*NodeCapabilities) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{167}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{168}
 }
 
 func (x *NodeCapabilities) GetOs() string {
@@ -15687,7 +15875,7 @@ type NodePublicIPReport struct {
 
 func (x *NodePublicIPReport) Reset() {
 	*x = NodePublicIPReport{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[168]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[169]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15699,7 +15887,7 @@ func (x *NodePublicIPReport) String() string {
 func (*NodePublicIPReport) ProtoMessage() {}
 
 func (x *NodePublicIPReport) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[168]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[169]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15712,7 +15900,7 @@ func (x *NodePublicIPReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePublicIPReport.ProtoReflect.Descriptor instead.
 func (*NodePublicIPReport) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{168}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{169}
 }
 
 func (x *NodePublicIPReport) GetConfigRevision() uint64 {
@@ -15781,7 +15969,7 @@ type NodeHeartbeat struct {
 
 func (x *NodeHeartbeat) Reset() {
 	*x = NodeHeartbeat{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[169]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[170]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15793,7 +15981,7 @@ func (x *NodeHeartbeat) String() string {
 func (*NodeHeartbeat) ProtoMessage() {}
 
 func (x *NodeHeartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[169]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[170]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15806,7 +15994,7 @@ func (x *NodeHeartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHeartbeat.ProtoReflect.Descriptor instead.
 func (*NodeHeartbeat) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{169}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{170}
 }
 
 func (x *NodeHeartbeat) GetNodeId() string {
@@ -15855,7 +16043,7 @@ type NodePublicIPLookupConfig struct {
 
 func (x *NodePublicIPLookupConfig) Reset() {
 	*x = NodePublicIPLookupConfig{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[170]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[171]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15867,7 +16055,7 @@ func (x *NodePublicIPLookupConfig) String() string {
 func (*NodePublicIPLookupConfig) ProtoMessage() {}
 
 func (x *NodePublicIPLookupConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[170]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[171]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15880,7 +16068,7 @@ func (x *NodePublicIPLookupConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePublicIPLookupConfig.ProtoReflect.Descriptor instead.
 func (*NodePublicIPLookupConfig) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{170}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{171}
 }
 
 func (x *NodePublicIPLookupConfig) GetRevision() uint64 {
@@ -15924,7 +16112,7 @@ type NodeProxyConfig struct {
 
 func (x *NodeProxyConfig) Reset() {
 	*x = NodeProxyConfig{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[171]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[172]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15936,7 +16124,7 @@ func (x *NodeProxyConfig) String() string {
 func (*NodeProxyConfig) ProtoMessage() {}
 
 func (x *NodeProxyConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[171]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[172]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15949,7 +16137,7 @@ func (x *NodeProxyConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeProxyConfig.ProtoReflect.Descriptor instead.
 func (*NodeProxyConfig) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{171}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{172}
 }
 
 func (x *NodeProxyConfig) GetRevision() uint64 {
@@ -15995,7 +16183,7 @@ type GetPublicIPLookupConfigRequest struct {
 
 func (x *GetPublicIPLookupConfigRequest) Reset() {
 	*x = GetPublicIPLookupConfigRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[172]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[173]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16007,7 +16195,7 @@ func (x *GetPublicIPLookupConfigRequest) String() string {
 func (*GetPublicIPLookupConfigRequest) ProtoMessage() {}
 
 func (x *GetPublicIPLookupConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[172]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[173]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16020,7 +16208,7 @@ func (x *GetPublicIPLookupConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPublicIPLookupConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetPublicIPLookupConfigRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{172}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{173}
 }
 
 type UpdatePublicIPLookupConfigRequest struct {
@@ -16033,7 +16221,7 @@ type UpdatePublicIPLookupConfigRequest struct {
 
 func (x *UpdatePublicIPLookupConfigRequest) Reset() {
 	*x = UpdatePublicIPLookupConfigRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[173]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[174]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16045,7 +16233,7 @@ func (x *UpdatePublicIPLookupConfigRequest) String() string {
 func (*UpdatePublicIPLookupConfigRequest) ProtoMessage() {}
 
 func (x *UpdatePublicIPLookupConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[173]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[174]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16058,7 +16246,7 @@ func (x *UpdatePublicIPLookupConfigRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use UpdatePublicIPLookupConfigRequest.ProtoReflect.Descriptor instead.
 func (*UpdatePublicIPLookupConfigRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{173}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{174}
 }
 
 func (x *UpdatePublicIPLookupConfigRequest) GetIpv4Urls() []string {
@@ -16084,7 +16272,7 @@ type GetNodeProxyConfigRequest struct {
 
 func (x *GetNodeProxyConfigRequest) Reset() {
 	*x = GetNodeProxyConfigRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[174]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[175]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16096,7 +16284,7 @@ func (x *GetNodeProxyConfigRequest) String() string {
 func (*GetNodeProxyConfigRequest) ProtoMessage() {}
 
 func (x *GetNodeProxyConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[174]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[175]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16109,7 +16297,7 @@ func (x *GetNodeProxyConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeProxyConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetNodeProxyConfigRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{174}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{175}
 }
 
 func (x *GetNodeProxyConfigRequest) GetNodeId() string {
@@ -16129,7 +16317,7 @@ type UpdateNodeProxyConfigRequest struct {
 
 func (x *UpdateNodeProxyConfigRequest) Reset() {
 	*x = UpdateNodeProxyConfigRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[175]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[176]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16141,7 +16329,7 @@ func (x *UpdateNodeProxyConfigRequest) String() string {
 func (*UpdateNodeProxyConfigRequest) ProtoMessage() {}
 
 func (x *UpdateNodeProxyConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[175]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[176]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16154,7 +16342,7 @@ func (x *UpdateNodeProxyConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateNodeProxyConfigRequest.ProtoReflect.Descriptor instead.
 func (*UpdateNodeProxyConfigRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{175}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{176}
 }
 
 func (x *UpdateNodeProxyConfigRequest) GetProxyConfigId() string {
@@ -16184,7 +16372,7 @@ type SetNodeLastProxyRequest struct {
 
 func (x *SetNodeLastProxyRequest) Reset() {
 	*x = SetNodeLastProxyRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[176]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[177]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16196,7 +16384,7 @@ func (x *SetNodeLastProxyRequest) String() string {
 func (*SetNodeLastProxyRequest) ProtoMessage() {}
 
 func (x *SetNodeLastProxyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[176]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[177]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16209,7 +16397,7 @@ func (x *SetNodeLastProxyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNodeLastProxyRequest.ProtoReflect.Descriptor instead.
 func (*SetNodeLastProxyRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{176}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{177}
 }
 
 func (x *SetNodeLastProxyRequest) GetNodeId() string {
@@ -16236,7 +16424,7 @@ type SetNodeLastProxyResponse struct {
 
 func (x *SetNodeLastProxyResponse) Reset() {
 	*x = SetNodeLastProxyResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[177]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[178]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16248,7 +16436,7 @@ func (x *SetNodeLastProxyResponse) String() string {
 func (*SetNodeLastProxyResponse) ProtoMessage() {}
 
 func (x *SetNodeLastProxyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[177]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[178]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16261,7 +16449,7 @@ func (x *SetNodeLastProxyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNodeLastProxyResponse.ProtoReflect.Descriptor instead.
 func (*SetNodeLastProxyResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{177}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{178}
 }
 
 func (x *SetNodeLastProxyResponse) GetNodeId() string {
@@ -16295,7 +16483,7 @@ type NodeRegistered struct {
 
 func (x *NodeRegistered) Reset() {
 	*x = NodeRegistered{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[178]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[179]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16307,7 +16495,7 @@ func (x *NodeRegistered) String() string {
 func (*NodeRegistered) ProtoMessage() {}
 
 func (x *NodeRegistered) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[178]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[179]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16320,7 +16508,7 @@ func (x *NodeRegistered) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeRegistered.ProtoReflect.Descriptor instead.
 func (*NodeRegistered) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{178}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{179}
 }
 
 func (x *NodeRegistered) GetNodeId() string {
@@ -16429,7 +16617,7 @@ type NodeCreateSession struct {
 
 func (x *NodeCreateSession) Reset() {
 	*x = NodeCreateSession{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[179]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[180]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16441,7 +16629,7 @@ func (x *NodeCreateSession) String() string {
 func (*NodeCreateSession) ProtoMessage() {}
 
 func (x *NodeCreateSession) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[179]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[180]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16454,7 +16642,7 @@ func (x *NodeCreateSession) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeCreateSession.ProtoReflect.Descriptor instead.
 func (*NodeCreateSession) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{179}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{180}
 }
 
 func (x *NodeCreateSession) GetSessionId() string {
@@ -16650,7 +16838,7 @@ type NodeGitSpec struct {
 
 func (x *NodeGitSpec) Reset() {
 	*x = NodeGitSpec{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[180]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[181]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16662,7 +16850,7 @@ func (x *NodeGitSpec) String() string {
 func (*NodeGitSpec) ProtoMessage() {}
 
 func (x *NodeGitSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[180]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[181]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16675,7 +16863,7 @@ func (x *NodeGitSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeGitSpec.ProtoReflect.Descriptor instead.
 func (*NodeGitSpec) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{180}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{181}
 }
 
 func (x *NodeGitSpec) GetUrl() string {
@@ -16751,7 +16939,7 @@ type NodeLLMConfig struct {
 
 func (x *NodeLLMConfig) Reset() {
 	*x = NodeLLMConfig{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[181]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[182]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16763,7 +16951,7 @@ func (x *NodeLLMConfig) String() string {
 func (*NodeLLMConfig) ProtoMessage() {}
 
 func (x *NodeLLMConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[181]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[182]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16776,7 +16964,7 @@ func (x *NodeLLMConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeLLMConfig.ProtoReflect.Descriptor instead.
 func (*NodeLLMConfig) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{181}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{182}
 }
 
 func (x *NodeLLMConfig) GetEndpoint() string {
@@ -16832,7 +17020,7 @@ type NodePluginSpec struct {
 
 func (x *NodePluginSpec) Reset() {
 	*x = NodePluginSpec{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[182]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[183]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16844,7 +17032,7 @@ func (x *NodePluginSpec) String() string {
 func (*NodePluginSpec) ProtoMessage() {}
 
 func (x *NodePluginSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[182]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[183]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16857,7 +17045,7 @@ func (x *NodePluginSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePluginSpec.ProtoReflect.Descriptor instead.
 func (*NodePluginSpec) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{182}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{183}
 }
 
 func (x *NodePluginSpec) GetName() string {
@@ -16896,7 +17084,7 @@ type ConfigureSessionLLM struct {
 
 func (x *ConfigureSessionLLM) Reset() {
 	*x = ConfigureSessionLLM{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[183]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[184]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16908,7 +17096,7 @@ func (x *ConfigureSessionLLM) String() string {
 func (*ConfigureSessionLLM) ProtoMessage() {}
 
 func (x *ConfigureSessionLLM) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[183]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[184]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16921,7 +17109,7 @@ func (x *ConfigureSessionLLM) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureSessionLLM.ProtoReflect.Descriptor instead.
 func (*ConfigureSessionLLM) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{183}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{184}
 }
 
 func (x *ConfigureSessionLLM) GetSessionId() string {
@@ -16959,7 +17147,7 @@ type ApplySessionMCPs struct {
 
 func (x *ApplySessionMCPs) Reset() {
 	*x = ApplySessionMCPs{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[184]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[185]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16971,7 +17159,7 @@ func (x *ApplySessionMCPs) String() string {
 func (*ApplySessionMCPs) ProtoMessage() {}
 
 func (x *ApplySessionMCPs) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[184]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[185]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16984,7 +17172,7 @@ func (x *ApplySessionMCPs) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplySessionMCPs.ProtoReflect.Descriptor instead.
 func (*ApplySessionMCPs) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{184}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{185}
 }
 
 func (x *ApplySessionMCPs) GetSessionId() string {
@@ -17021,7 +17209,7 @@ type ApplySessionSkills struct {
 
 func (x *ApplySessionSkills) Reset() {
 	*x = ApplySessionSkills{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[185]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[186]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17033,7 +17221,7 @@ func (x *ApplySessionSkills) String() string {
 func (*ApplySessionSkills) ProtoMessage() {}
 
 func (x *ApplySessionSkills) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[185]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[186]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17046,7 +17234,7 @@ func (x *ApplySessionSkills) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplySessionSkills.ProtoReflect.Descriptor instead.
 func (*ApplySessionSkills) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{185}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{186}
 }
 
 func (x *ApplySessionSkills) GetSessionId() string {
@@ -17083,7 +17271,7 @@ type ApplySessionPlugins struct {
 
 func (x *ApplySessionPlugins) Reset() {
 	*x = ApplySessionPlugins{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[186]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[187]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17095,7 +17283,7 @@ func (x *ApplySessionPlugins) String() string {
 func (*ApplySessionPlugins) ProtoMessage() {}
 
 func (x *ApplySessionPlugins) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[186]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[187]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17108,7 +17296,7 @@ func (x *ApplySessionPlugins) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplySessionPlugins.ProtoReflect.Descriptor instead.
 func (*ApplySessionPlugins) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{186}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{187}
 }
 
 func (x *ApplySessionPlugins) GetSessionId() string {
@@ -17146,7 +17334,7 @@ type ConfigureSessionMode struct {
 
 func (x *ConfigureSessionMode) Reset() {
 	*x = ConfigureSessionMode{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[187]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[188]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17158,7 +17346,7 @@ func (x *ConfigureSessionMode) String() string {
 func (*ConfigureSessionMode) ProtoMessage() {}
 
 func (x *ConfigureSessionMode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[187]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[188]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17171,7 +17359,7 @@ func (x *ConfigureSessionMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureSessionMode.ProtoReflect.Descriptor instead.
 func (*ConfigureSessionMode) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{187}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{188}
 }
 
 func (x *ConfigureSessionMode) GetSessionId() string {
@@ -17206,7 +17394,7 @@ type StartSessionRuntime struct {
 
 func (x *StartSessionRuntime) Reset() {
 	*x = StartSessionRuntime{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[188]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[189]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17218,7 +17406,7 @@ func (x *StartSessionRuntime) String() string {
 func (*StartSessionRuntime) ProtoMessage() {}
 
 func (x *StartSessionRuntime) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[188]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[189]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17231,7 +17419,7 @@ func (x *StartSessionRuntime) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartSessionRuntime.ProtoReflect.Descriptor instead.
 func (*StartSessionRuntime) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{188}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{189}
 }
 
 func (x *StartSessionRuntime) GetSessionId() string {
@@ -17255,7 +17443,7 @@ type RestartSessionRuntime struct {
 
 func (x *RestartSessionRuntime) Reset() {
 	*x = RestartSessionRuntime{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[189]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[190]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17267,7 +17455,7 @@ func (x *RestartSessionRuntime) String() string {
 func (*RestartSessionRuntime) ProtoMessage() {}
 
 func (x *RestartSessionRuntime) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[189]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[190]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17280,7 +17468,7 @@ func (x *RestartSessionRuntime) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartSessionRuntime.ProtoReflect.Descriptor instead.
 func (*RestartSessionRuntime) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{189}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{190}
 }
 
 func (x *RestartSessionRuntime) GetSessionId() string {
@@ -17310,7 +17498,7 @@ type CollectSessionArtifacts struct {
 
 func (x *CollectSessionArtifacts) Reset() {
 	*x = CollectSessionArtifacts{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[190]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[191]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17322,7 +17510,7 @@ func (x *CollectSessionArtifacts) String() string {
 func (*CollectSessionArtifacts) ProtoMessage() {}
 
 func (x *CollectSessionArtifacts) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[190]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[191]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17335,7 +17523,7 @@ func (x *CollectSessionArtifacts) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectSessionArtifacts.ProtoReflect.Descriptor instead.
 func (*CollectSessionArtifacts) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{190}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{191}
 }
 
 func (x *CollectSessionArtifacts) GetSessionId() string {
@@ -17361,7 +17549,7 @@ type NodeDeleteSession struct {
 
 func (x *NodeDeleteSession) Reset() {
 	*x = NodeDeleteSession{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[191]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[192]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17373,7 +17561,7 @@ func (x *NodeDeleteSession) String() string {
 func (*NodeDeleteSession) ProtoMessage() {}
 
 func (x *NodeDeleteSession) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[191]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[192]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17386,7 +17574,7 @@ func (x *NodeDeleteSession) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeDeleteSession.ProtoReflect.Descriptor instead.
 func (*NodeDeleteSession) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{191}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{192}
 }
 
 func (x *NodeDeleteSession) GetSessionId() string {
@@ -17405,7 +17593,7 @@ type NodeListSessions struct {
 
 func (x *NodeListSessions) Reset() {
 	*x = NodeListSessions{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[192]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[193]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17417,7 +17605,7 @@ func (x *NodeListSessions) String() string {
 func (*NodeListSessions) ProtoMessage() {}
 
 func (x *NodeListSessions) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[192]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[193]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17430,7 +17618,7 @@ func (x *NodeListSessions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeListSessions.ProtoReflect.Descriptor instead.
 func (*NodeListSessions) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{192}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{193}
 }
 
 func (x *NodeListSessions) GetRequestId() string {
@@ -17474,7 +17662,7 @@ type NodeSessionInput struct {
 
 func (x *NodeSessionInput) Reset() {
 	*x = NodeSessionInput{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[193]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[194]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17486,7 +17674,7 @@ func (x *NodeSessionInput) String() string {
 func (*NodeSessionInput) ProtoMessage() {}
 
 func (x *NodeSessionInput) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[193]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[194]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17499,7 +17687,7 @@ func (x *NodeSessionInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionInput.ProtoReflect.Descriptor instead.
 func (*NodeSessionInput) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{193}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{194}
 }
 
 func (x *NodeSessionInput) GetSessionId() string {
@@ -17581,7 +17769,7 @@ type NodeCreateExecutionNode struct {
 
 func (x *NodeCreateExecutionNode) Reset() {
 	*x = NodeCreateExecutionNode{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[194]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[195]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17593,7 +17781,7 @@ func (x *NodeCreateExecutionNode) String() string {
 func (*NodeCreateExecutionNode) ProtoMessage() {}
 
 func (x *NodeCreateExecutionNode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[194]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[195]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17606,7 +17794,7 @@ func (x *NodeCreateExecutionNode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeCreateExecutionNode.ProtoReflect.Descriptor instead.
 func (*NodeCreateExecutionNode) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{194}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{195}
 }
 
 func (x *NodeCreateExecutionNode) GetLaunchId() string {
@@ -17681,7 +17869,7 @@ type NodeDeleteExecutionNode struct {
 
 func (x *NodeDeleteExecutionNode) Reset() {
 	*x = NodeDeleteExecutionNode{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[195]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[196]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17693,7 +17881,7 @@ func (x *NodeDeleteExecutionNode) String() string {
 func (*NodeDeleteExecutionNode) ProtoMessage() {}
 
 func (x *NodeDeleteExecutionNode) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[195]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[196]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17706,7 +17894,7 @@ func (x *NodeDeleteExecutionNode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeDeleteExecutionNode.ProtoReflect.Descriptor instead.
 func (*NodeDeleteExecutionNode) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{195}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{196}
 }
 
 func (x *NodeDeleteExecutionNode) GetLaunchId() string {
@@ -17737,7 +17925,7 @@ type SendSessionInputRequest struct {
 
 func (x *SendSessionInputRequest) Reset() {
 	*x = SendSessionInputRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[196]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[197]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17749,7 +17937,7 @@ func (x *SendSessionInputRequest) String() string {
 func (*SendSessionInputRequest) ProtoMessage() {}
 
 func (x *SendSessionInputRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[196]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[197]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17762,7 +17950,7 @@ func (x *SendSessionInputRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendSessionInputRequest.ProtoReflect.Descriptor instead.
 func (*SendSessionInputRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{196}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{197}
 }
 
 func (x *SendSessionInputRequest) GetSessionId() string {
@@ -17831,7 +18019,7 @@ type SendSessionInputResponse struct {
 
 func (x *SendSessionInputResponse) Reset() {
 	*x = SendSessionInputResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[197]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[198]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17843,7 +18031,7 @@ func (x *SendSessionInputResponse) String() string {
 func (*SendSessionInputResponse) ProtoMessage() {}
 
 func (x *SendSessionInputResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[197]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[198]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17856,7 +18044,7 @@ func (x *SendSessionInputResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendSessionInputResponse.ProtoReflect.Descriptor instead.
 func (*SendSessionInputResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{197}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{198}
 }
 
 func (x *SendSessionInputResponse) GetAccepted() bool {
@@ -17891,7 +18079,7 @@ type NodeTunnelRequest struct {
 
 func (x *NodeTunnelRequest) Reset() {
 	*x = NodeTunnelRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[198]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[199]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17903,7 +18091,7 @@ func (x *NodeTunnelRequest) String() string {
 func (*NodeTunnelRequest) ProtoMessage() {}
 
 func (x *NodeTunnelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[198]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[199]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17916,7 +18104,7 @@ func (x *NodeTunnelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTunnelRequest.ProtoReflect.Descriptor instead.
 func (*NodeTunnelRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{198}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{199}
 }
 
 func (x *NodeTunnelRequest) GetTunnelId() string {
@@ -17991,7 +18179,7 @@ type NodeTunnelResponse struct {
 
 func (x *NodeTunnelResponse) Reset() {
 	*x = NodeTunnelResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[199]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[200]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18003,7 +18191,7 @@ func (x *NodeTunnelResponse) String() string {
 func (*NodeTunnelResponse) ProtoMessage() {}
 
 func (x *NodeTunnelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[199]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[200]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18016,7 +18204,7 @@ func (x *NodeTunnelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeTunnelResponse.ProtoReflect.Descriptor instead.
 func (*NodeTunnelResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{199}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{200}
 }
 
 func (x *NodeTunnelResponse) GetTunnelId() string {
@@ -18077,7 +18265,7 @@ type NodeSessionOutput struct {
 
 func (x *NodeSessionOutput) Reset() {
 	*x = NodeSessionOutput{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[200]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[201]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18089,7 +18277,7 @@ func (x *NodeSessionOutput) String() string {
 func (*NodeSessionOutput) ProtoMessage() {}
 
 func (x *NodeSessionOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[200]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[201]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18102,7 +18290,7 @@ func (x *NodeSessionOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionOutput.ProtoReflect.Descriptor instead.
 func (*NodeSessionOutput) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{200}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{201}
 }
 
 func (x *NodeSessionOutput) GetSessionId() string {
@@ -18153,7 +18341,7 @@ type NodeSessionResult struct {
 
 func (x *NodeSessionResult) Reset() {
 	*x = NodeSessionResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[201]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[202]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18165,7 +18353,7 @@ func (x *NodeSessionResult) String() string {
 func (*NodeSessionResult) ProtoMessage() {}
 
 func (x *NodeSessionResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[201]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[202]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18178,7 +18366,7 @@ func (x *NodeSessionResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionResult.ProtoReflect.Descriptor instead.
 func (*NodeSessionResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{201}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{202}
 }
 
 func (x *NodeSessionResult) GetSessionId() string {
@@ -18250,7 +18438,7 @@ type NodeSessionStage struct {
 
 func (x *NodeSessionStage) Reset() {
 	*x = NodeSessionStage{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[202]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[203]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18262,7 +18450,7 @@ func (x *NodeSessionStage) String() string {
 func (*NodeSessionStage) ProtoMessage() {}
 
 func (x *NodeSessionStage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[202]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[203]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18275,7 +18463,7 @@ func (x *NodeSessionStage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionStage.ProtoReflect.Descriptor instead.
 func (*NodeSessionStage) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{202}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{203}
 }
 
 func (x *NodeSessionStage) GetSessionId() string {
@@ -18381,7 +18569,7 @@ type NodeCommandAck struct {
 
 func (x *NodeCommandAck) Reset() {
 	*x = NodeCommandAck{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[203]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[204]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18393,7 +18581,7 @@ func (x *NodeCommandAck) String() string {
 func (*NodeCommandAck) ProtoMessage() {}
 
 func (x *NodeCommandAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[203]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[204]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18406,7 +18594,7 @@ func (x *NodeCommandAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeCommandAck.ProtoReflect.Descriptor instead.
 func (*NodeCommandAck) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{203}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{204}
 }
 
 func (x *NodeCommandAck) GetServerFrameId() string {
@@ -18518,7 +18706,7 @@ type NodeSessionSummary struct {
 
 func (x *NodeSessionSummary) Reset() {
 	*x = NodeSessionSummary{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[204]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[205]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18530,7 +18718,7 @@ func (x *NodeSessionSummary) String() string {
 func (*NodeSessionSummary) ProtoMessage() {}
 
 func (x *NodeSessionSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[204]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[205]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18543,7 +18731,7 @@ func (x *NodeSessionSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionSummary.ProtoReflect.Descriptor instead.
 func (*NodeSessionSummary) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{204}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{205}
 }
 
 func (x *NodeSessionSummary) GetSessionId() string {
@@ -18578,7 +18766,7 @@ type NodeError struct {
 
 func (x *NodeError) Reset() {
 	*x = NodeError{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[205]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[206]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18590,7 +18778,7 @@ func (x *NodeError) String() string {
 func (*NodeError) ProtoMessage() {}
 
 func (x *NodeError) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[205]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[206]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18603,7 +18791,7 @@ func (x *NodeError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeError.ProtoReflect.Descriptor instead.
 func (*NodeError) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{205}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{206}
 }
 
 func (x *NodeError) GetCode() string {
@@ -18636,7 +18824,7 @@ type ListNodesRequest struct {
 
 func (x *ListNodesRequest) Reset() {
 	*x = ListNodesRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[206]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[207]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18648,7 +18836,7 @@ func (x *ListNodesRequest) String() string {
 func (*ListNodesRequest) ProtoMessage() {}
 
 func (x *ListNodesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[206]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[207]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18661,7 +18849,7 @@ func (x *ListNodesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNodesRequest.ProtoReflect.Descriptor instead.
 func (*ListNodesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{206}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{207}
 }
 
 func (x *ListNodesRequest) GetStatus() NodeStatus {
@@ -18680,7 +18868,7 @@ type ListNodesResponse struct {
 
 func (x *ListNodesResponse) Reset() {
 	*x = ListNodesResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[207]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[208]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18692,7 +18880,7 @@ func (x *ListNodesResponse) String() string {
 func (*ListNodesResponse) ProtoMessage() {}
 
 func (x *ListNodesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[207]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[208]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18705,7 +18893,7 @@ func (x *ListNodesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNodesResponse.ProtoReflect.Descriptor instead.
 func (*ListNodesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{207}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{208}
 }
 
 func (x *ListNodesResponse) GetNodes() []*NodeInfo {
@@ -18747,7 +18935,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[208]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[209]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18759,7 +18947,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[208]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[209]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18772,7 +18960,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{208}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{209}
 }
 
 func (x *NodeInfo) GetNodeId() string {
@@ -18891,7 +19079,7 @@ type NodeCapacity struct {
 
 func (x *NodeCapacity) Reset() {
 	*x = NodeCapacity{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[209]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[210]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18903,7 +19091,7 @@ func (x *NodeCapacity) String() string {
 func (*NodeCapacity) ProtoMessage() {}
 
 func (x *NodeCapacity) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[209]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[210]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18916,7 +19104,7 @@ func (x *NodeCapacity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeCapacity.ProtoReflect.Descriptor instead.
 func (*NodeCapacity) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{209}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{210}
 }
 
 func (x *NodeCapacity) GetMaxSessions() int32 {
@@ -18950,7 +19138,7 @@ type SetNodeCapacityRequest struct {
 
 func (x *SetNodeCapacityRequest) Reset() {
 	*x = SetNodeCapacityRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[210]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[211]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18962,7 +19150,7 @@ func (x *SetNodeCapacityRequest) String() string {
 func (*SetNodeCapacityRequest) ProtoMessage() {}
 
 func (x *SetNodeCapacityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[210]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[211]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18975,7 +19163,7 @@ func (x *SetNodeCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNodeCapacityRequest.ProtoReflect.Descriptor instead.
 func (*SetNodeCapacityRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{210}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{211}
 }
 
 func (x *SetNodeCapacityRequest) GetNodeId() string {
@@ -19002,7 +19190,7 @@ type SetNodeCapacityResponse struct {
 
 func (x *SetNodeCapacityResponse) Reset() {
 	*x = SetNodeCapacityResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[211]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[212]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19014,7 +19202,7 @@ func (x *SetNodeCapacityResponse) String() string {
 func (*SetNodeCapacityResponse) ProtoMessage() {}
 
 func (x *SetNodeCapacityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[211]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[212]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19027,7 +19215,7 @@ func (x *SetNodeCapacityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNodeCapacityResponse.ProtoReflect.Descriptor instead.
 func (*SetNodeCapacityResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{211}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{212}
 }
 
 func (x *SetNodeCapacityResponse) GetNodeId() string {
@@ -19054,7 +19242,7 @@ type MoveNodeRequest struct {
 
 func (x *MoveNodeRequest) Reset() {
 	*x = MoveNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[212]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[213]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19066,7 +19254,7 @@ func (x *MoveNodeRequest) String() string {
 func (*MoveNodeRequest) ProtoMessage() {}
 
 func (x *MoveNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[212]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[213]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19079,7 +19267,7 @@ func (x *MoveNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveNodeRequest.ProtoReflect.Descriptor instead.
 func (*MoveNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{212}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{213}
 }
 
 func (x *MoveNodeRequest) GetNodeId() string {
@@ -19105,7 +19293,7 @@ type MoveNodeResponse struct {
 
 func (x *MoveNodeResponse) Reset() {
 	*x = MoveNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[213]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[214]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19117,7 +19305,7 @@ func (x *MoveNodeResponse) String() string {
 func (*MoveNodeResponse) ProtoMessage() {}
 
 func (x *MoveNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[213]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[214]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19130,7 +19318,7 @@ func (x *MoveNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveNodeResponse.ProtoReflect.Descriptor instead.
 func (*MoveNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{213}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{214}
 }
 
 func (x *MoveNodeResponse) GetNode() *NodeInfo {
@@ -19151,7 +19339,7 @@ type ManageEditorRequest struct {
 
 func (x *ManageEditorRequest) Reset() {
 	*x = ManageEditorRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[214]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[215]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19163,7 +19351,7 @@ func (x *ManageEditorRequest) String() string {
 func (*ManageEditorRequest) ProtoMessage() {}
 
 func (x *ManageEditorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[214]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[215]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19176,7 +19364,7 @@ func (x *ManageEditorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManageEditorRequest.ProtoReflect.Descriptor instead.
 func (*ManageEditorRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{214}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{215}
 }
 
 func (x *ManageEditorRequest) GetNodeId() string {
@@ -19212,7 +19400,7 @@ type ManageEditorResponse struct {
 
 func (x *ManageEditorResponse) Reset() {
 	*x = ManageEditorResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[215]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[216]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19224,7 +19412,7 @@ func (x *ManageEditorResponse) String() string {
 func (*ManageEditorResponse) ProtoMessage() {}
 
 func (x *ManageEditorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[215]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[216]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19237,7 +19425,7 @@ func (x *ManageEditorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManageEditorResponse.ProtoReflect.Descriptor instead.
 func (*ManageEditorResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{215}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{216}
 }
 
 func (x *ManageEditorResponse) GetNodeId() string {
@@ -19279,7 +19467,7 @@ type ManageNodeEnvironmentRequest struct {
 
 func (x *ManageNodeEnvironmentRequest) Reset() {
 	*x = ManageNodeEnvironmentRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[216]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[217]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19291,7 +19479,7 @@ func (x *ManageNodeEnvironmentRequest) String() string {
 func (*ManageNodeEnvironmentRequest) ProtoMessage() {}
 
 func (x *ManageNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[216]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[217]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19304,7 +19492,7 @@ func (x *ManageNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManageNodeEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*ManageNodeEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{216}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{217}
 }
 
 func (x *ManageNodeEnvironmentRequest) GetNodeId() string {
@@ -19342,7 +19530,7 @@ type ManageNodeEnvironmentResponse struct {
 
 func (x *ManageNodeEnvironmentResponse) Reset() {
 	*x = ManageNodeEnvironmentResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[217]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[218]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19354,7 +19542,7 @@ func (x *ManageNodeEnvironmentResponse) String() string {
 func (*ManageNodeEnvironmentResponse) ProtoMessage() {}
 
 func (x *ManageNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[217]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[218]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19367,7 +19555,7 @@ func (x *ManageNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManageNodeEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*ManageNodeEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{217}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{218}
 }
 
 func (x *ManageNodeEnvironmentResponse) GetNodeId() string {
@@ -19410,7 +19598,7 @@ type SyncNodeEnvironmentRequest struct {
 
 func (x *SyncNodeEnvironmentRequest) Reset() {
 	*x = SyncNodeEnvironmentRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[218]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[219]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19422,7 +19610,7 @@ func (x *SyncNodeEnvironmentRequest) String() string {
 func (*SyncNodeEnvironmentRequest) ProtoMessage() {}
 
 func (x *SyncNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[218]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[219]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19435,7 +19623,7 @@ func (x *SyncNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncNodeEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*SyncNodeEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{218}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{219}
 }
 
 func (x *SyncNodeEnvironmentRequest) GetNodeId() string {
@@ -19477,7 +19665,7 @@ type SyncNodeEnvironmentResponse struct {
 
 func (x *SyncNodeEnvironmentResponse) Reset() {
 	*x = SyncNodeEnvironmentResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[219]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[220]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19489,7 +19677,7 @@ func (x *SyncNodeEnvironmentResponse) String() string {
 func (*SyncNodeEnvironmentResponse) ProtoMessage() {}
 
 func (x *SyncNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[219]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[220]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19502,7 +19690,7 @@ func (x *SyncNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncNodeEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*SyncNodeEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{219}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{220}
 }
 
 func (x *SyncNodeEnvironmentResponse) GetNodeId() string {
@@ -19536,7 +19724,7 @@ type InspectNodeEnvironmentRequest struct {
 
 func (x *InspectNodeEnvironmentRequest) Reset() {
 	*x = InspectNodeEnvironmentRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[220]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[221]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19548,7 +19736,7 @@ func (x *InspectNodeEnvironmentRequest) String() string {
 func (*InspectNodeEnvironmentRequest) ProtoMessage() {}
 
 func (x *InspectNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[220]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[221]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19561,7 +19749,7 @@ func (x *InspectNodeEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectNodeEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*InspectNodeEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{220}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{221}
 }
 
 func (x *InspectNodeEnvironmentRequest) GetNodeId() string {
@@ -19589,7 +19777,7 @@ type InspectNodeEnvironmentResponse struct {
 
 func (x *InspectNodeEnvironmentResponse) Reset() {
 	*x = InspectNodeEnvironmentResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[221]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[222]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19601,7 +19789,7 @@ func (x *InspectNodeEnvironmentResponse) String() string {
 func (*InspectNodeEnvironmentResponse) ProtoMessage() {}
 
 func (x *InspectNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[221]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[222]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19614,7 +19802,7 @@ func (x *InspectNodeEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectNodeEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*InspectNodeEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{221}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{222}
 }
 
 func (x *InspectNodeEnvironmentResponse) GetNodeId() string {
@@ -19648,7 +19836,7 @@ type InspectNodeSystemEnvRequest struct {
 
 func (x *InspectNodeSystemEnvRequest) Reset() {
 	*x = InspectNodeSystemEnvRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[222]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[223]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19660,7 +19848,7 @@ func (x *InspectNodeSystemEnvRequest) String() string {
 func (*InspectNodeSystemEnvRequest) ProtoMessage() {}
 
 func (x *InspectNodeSystemEnvRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[222]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[223]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19673,7 +19861,7 @@ func (x *InspectNodeSystemEnvRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectNodeSystemEnvRequest.ProtoReflect.Descriptor instead.
 func (*InspectNodeSystemEnvRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{222}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{223}
 }
 
 func (x *InspectNodeSystemEnvRequest) GetNodeId() string {
@@ -19700,7 +19888,7 @@ type InspectNodeSystemEnvResponse struct {
 
 func (x *InspectNodeSystemEnvResponse) Reset() {
 	*x = InspectNodeSystemEnvResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[223]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[224]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19712,7 +19900,7 @@ func (x *InspectNodeSystemEnvResponse) String() string {
 func (*InspectNodeSystemEnvResponse) ProtoMessage() {}
 
 func (x *InspectNodeSystemEnvResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[223]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[224]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19725,7 +19913,7 @@ func (x *InspectNodeSystemEnvResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectNodeSystemEnvResponse.ProtoReflect.Descriptor instead.
 func (*InspectNodeSystemEnvResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{223}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{224}
 }
 
 func (x *InspectNodeSystemEnvResponse) GetNodeId() string {
@@ -19755,7 +19943,7 @@ type SyncNodeSystemEnvRequest struct {
 
 func (x *SyncNodeSystemEnvRequest) Reset() {
 	*x = SyncNodeSystemEnvRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[224]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[225]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19767,7 +19955,7 @@ func (x *SyncNodeSystemEnvRequest) String() string {
 func (*SyncNodeSystemEnvRequest) ProtoMessage() {}
 
 func (x *SyncNodeSystemEnvRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[224]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[225]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19780,7 +19968,7 @@ func (x *SyncNodeSystemEnvRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncNodeSystemEnvRequest.ProtoReflect.Descriptor instead.
 func (*SyncNodeSystemEnvRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{224}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{225}
 }
 
 func (x *SyncNodeSystemEnvRequest) GetNodeId() string {
@@ -19831,7 +20019,7 @@ type SyncNodeSystemEnvResponse struct {
 
 func (x *SyncNodeSystemEnvResponse) Reset() {
 	*x = SyncNodeSystemEnvResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[225]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[226]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19843,7 +20031,7 @@ func (x *SyncNodeSystemEnvResponse) String() string {
 func (*SyncNodeSystemEnvResponse) ProtoMessage() {}
 
 func (x *SyncNodeSystemEnvResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[225]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[226]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19856,7 +20044,7 @@ func (x *SyncNodeSystemEnvResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncNodeSystemEnvResponse.ProtoReflect.Descriptor instead.
 func (*SyncNodeSystemEnvResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{225}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{226}
 }
 
 func (x *SyncNodeSystemEnvResponse) GetNodeId() string {
@@ -19891,7 +20079,7 @@ type ArchiveNodeSystemEnvResourceRequest struct {
 
 func (x *ArchiveNodeSystemEnvResourceRequest) Reset() {
 	*x = ArchiveNodeSystemEnvResourceRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[226]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[227]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19903,7 +20091,7 @@ func (x *ArchiveNodeSystemEnvResourceRequest) String() string {
 func (*ArchiveNodeSystemEnvResourceRequest) ProtoMessage() {}
 
 func (x *ArchiveNodeSystemEnvResourceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[226]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[227]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19916,7 +20104,7 @@ func (x *ArchiveNodeSystemEnvResourceRequest) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use ArchiveNodeSystemEnvResourceRequest.ProtoReflect.Descriptor instead.
 func (*ArchiveNodeSystemEnvResourceRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{226}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{227}
 }
 
 func (x *ArchiveNodeSystemEnvResourceRequest) GetNodeId() string {
@@ -19952,7 +20140,7 @@ type ArchiveNodeSystemEnvResourceResponse struct {
 
 func (x *ArchiveNodeSystemEnvResourceResponse) Reset() {
 	*x = ArchiveNodeSystemEnvResourceResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[227]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[228]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19964,7 +20152,7 @@ func (x *ArchiveNodeSystemEnvResourceResponse) String() string {
 func (*ArchiveNodeSystemEnvResourceResponse) ProtoMessage() {}
 
 func (x *ArchiveNodeSystemEnvResourceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[227]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[228]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19977,7 +20165,7 @@ func (x *ArchiveNodeSystemEnvResourceResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use ArchiveNodeSystemEnvResourceResponse.ProtoReflect.Descriptor instead.
 func (*ArchiveNodeSystemEnvResourceResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{227}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{228}
 }
 
 func (x *ArchiveNodeSystemEnvResourceResponse) GetNodeId() string {
@@ -20017,7 +20205,7 @@ type SelfUpgradeNodeRequest struct {
 
 func (x *SelfUpgradeNodeRequest) Reset() {
 	*x = SelfUpgradeNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[228]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[229]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20029,7 +20217,7 @@ func (x *SelfUpgradeNodeRequest) String() string {
 func (*SelfUpgradeNodeRequest) ProtoMessage() {}
 
 func (x *SelfUpgradeNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[228]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[229]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20042,7 +20230,7 @@ func (x *SelfUpgradeNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SelfUpgradeNodeRequest.ProtoReflect.Descriptor instead.
 func (*SelfUpgradeNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{228}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{229}
 }
 
 func (x *SelfUpgradeNodeRequest) GetNodeId() string {
@@ -20064,7 +20252,7 @@ type SelfUpgradeNodeResponse struct {
 
 func (x *SelfUpgradeNodeResponse) Reset() {
 	*x = SelfUpgradeNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[229]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[230]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20076,7 +20264,7 @@ func (x *SelfUpgradeNodeResponse) String() string {
 func (*SelfUpgradeNodeResponse) ProtoMessage() {}
 
 func (x *SelfUpgradeNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[229]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[230]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20089,7 +20277,7 @@ func (x *SelfUpgradeNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SelfUpgradeNodeResponse.ProtoReflect.Descriptor instead.
 func (*SelfUpgradeNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{229}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{230}
 }
 
 func (x *SelfUpgradeNodeResponse) GetNodeId() string {
@@ -20129,7 +20317,7 @@ type RuntimeUpgradeNodeRequest struct {
 
 func (x *RuntimeUpgradeNodeRequest) Reset() {
 	*x = RuntimeUpgradeNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[230]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[231]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20141,7 +20329,7 @@ func (x *RuntimeUpgradeNodeRequest) String() string {
 func (*RuntimeUpgradeNodeRequest) ProtoMessage() {}
 
 func (x *RuntimeUpgradeNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[230]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[231]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20154,7 +20342,7 @@ func (x *RuntimeUpgradeNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeUpgradeNodeRequest.ProtoReflect.Descriptor instead.
 func (*RuntimeUpgradeNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{230}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{231}
 }
 
 func (x *RuntimeUpgradeNodeRequest) GetNodeId() string {
@@ -20176,7 +20364,7 @@ type RuntimeUpgradeNodeResponse struct {
 
 func (x *RuntimeUpgradeNodeResponse) Reset() {
 	*x = RuntimeUpgradeNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[231]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[232]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20188,7 +20376,7 @@ func (x *RuntimeUpgradeNodeResponse) String() string {
 func (*RuntimeUpgradeNodeResponse) ProtoMessage() {}
 
 func (x *RuntimeUpgradeNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[231]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[232]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20201,7 +20389,7 @@ func (x *RuntimeUpgradeNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeUpgradeNodeResponse.ProtoReflect.Descriptor instead.
 func (*RuntimeUpgradeNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{231}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{232}
 }
 
 func (x *RuntimeUpgradeNodeResponse) GetNodeId() string {
@@ -20245,7 +20433,7 @@ type HostExecRequest struct {
 
 func (x *HostExecRequest) Reset() {
 	*x = HostExecRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[232]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[233]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20257,7 +20445,7 @@ func (x *HostExecRequest) String() string {
 func (*HostExecRequest) ProtoMessage() {}
 
 func (x *HostExecRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[232]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[233]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20270,7 +20458,7 @@ func (x *HostExecRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostExecRequest.ProtoReflect.Descriptor instead.
 func (*HostExecRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{232}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{233}
 }
 
 func (x *HostExecRequest) GetNodeId() string {
@@ -20324,7 +20512,7 @@ type HostExecResponse struct {
 
 func (x *HostExecResponse) Reset() {
 	*x = HostExecResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[233]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[234]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20336,7 +20524,7 @@ func (x *HostExecResponse) String() string {
 func (*HostExecResponse) ProtoMessage() {}
 
 func (x *HostExecResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[233]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[234]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20349,7 +20537,7 @@ func (x *HostExecResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostExecResponse.ProtoReflect.Descriptor instead.
 func (*HostExecResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{233}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{234}
 }
 
 func (x *HostExecResponse) GetRequestId() string {
@@ -20428,7 +20616,7 @@ type HostFileUploadRequest struct {
 
 func (x *HostFileUploadRequest) Reset() {
 	*x = HostFileUploadRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[234]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[235]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20440,7 +20628,7 @@ func (x *HostFileUploadRequest) String() string {
 func (*HostFileUploadRequest) ProtoMessage() {}
 
 func (x *HostFileUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[234]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[235]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20453,7 +20641,7 @@ func (x *HostFileUploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostFileUploadRequest.ProtoReflect.Descriptor instead.
 func (*HostFileUploadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{234}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{235}
 }
 
 func (x *HostFileUploadRequest) GetNodeId() string {
@@ -20533,7 +20721,7 @@ type HostFileUploadResponse struct {
 
 func (x *HostFileUploadResponse) Reset() {
 	*x = HostFileUploadResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[235]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[236]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20545,7 +20733,7 @@ func (x *HostFileUploadResponse) String() string {
 func (*HostFileUploadResponse) ProtoMessage() {}
 
 func (x *HostFileUploadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[235]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[236]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20558,7 +20746,7 @@ func (x *HostFileUploadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostFileUploadResponse.ProtoReflect.Descriptor instead.
 func (*HostFileUploadResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{235}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{236}
 }
 
 func (x *HostFileUploadResponse) GetUploadId() string {
@@ -20605,7 +20793,7 @@ type ApproveNodeRequest struct {
 
 func (x *ApproveNodeRequest) Reset() {
 	*x = ApproveNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[236]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[237]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20617,7 +20805,7 @@ func (x *ApproveNodeRequest) String() string {
 func (*ApproveNodeRequest) ProtoMessage() {}
 
 func (x *ApproveNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[236]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[237]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20630,7 +20818,7 @@ func (x *ApproveNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApproveNodeRequest.ProtoReflect.Descriptor instead.
 func (*ApproveNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{236}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{237}
 }
 
 func (x *ApproveNodeRequest) GetNodeId() string {
@@ -20649,7 +20837,7 @@ type ApproveNodeResponse struct {
 
 func (x *ApproveNodeResponse) Reset() {
 	*x = ApproveNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[237]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[238]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20661,7 +20849,7 @@ func (x *ApproveNodeResponse) String() string {
 func (*ApproveNodeResponse) ProtoMessage() {}
 
 func (x *ApproveNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[237]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[238]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20674,7 +20862,7 @@ func (x *ApproveNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApproveNodeResponse.ProtoReflect.Descriptor instead.
 func (*ApproveNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{237}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{238}
 }
 
 func (x *ApproveNodeResponse) GetNode() *NodeInfo {
@@ -20693,7 +20881,7 @@ type RevokeNodeRequest struct {
 
 func (x *RevokeNodeRequest) Reset() {
 	*x = RevokeNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[238]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[239]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20705,7 +20893,7 @@ func (x *RevokeNodeRequest) String() string {
 func (*RevokeNodeRequest) ProtoMessage() {}
 
 func (x *RevokeNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[238]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[239]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20718,7 +20906,7 @@ func (x *RevokeNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeNodeRequest.ProtoReflect.Descriptor instead.
 func (*RevokeNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{238}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{239}
 }
 
 func (x *RevokeNodeRequest) GetNodeId() string {
@@ -20737,7 +20925,7 @@ type RevokeNodeResponse struct {
 
 func (x *RevokeNodeResponse) Reset() {
 	*x = RevokeNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[239]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[240]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20749,7 +20937,7 @@ func (x *RevokeNodeResponse) String() string {
 func (*RevokeNodeResponse) ProtoMessage() {}
 
 func (x *RevokeNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[239]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[240]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20762,7 +20950,7 @@ func (x *RevokeNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeNodeResponse.ProtoReflect.Descriptor instead.
 func (*RevokeNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{239}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{240}
 }
 
 func (x *RevokeNodeResponse) GetNode() *NodeInfo {
@@ -20786,7 +20974,7 @@ type DeleteNodeRequest struct {
 
 func (x *DeleteNodeRequest) Reset() {
 	*x = DeleteNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[240]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[241]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20798,7 +20986,7 @@ func (x *DeleteNodeRequest) String() string {
 func (*DeleteNodeRequest) ProtoMessage() {}
 
 func (x *DeleteNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[240]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[241]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20811,7 +20999,7 @@ func (x *DeleteNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNodeRequest.ProtoReflect.Descriptor instead.
 func (*DeleteNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{240}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{241}
 }
 
 func (x *DeleteNodeRequest) GetNodeId() string {
@@ -20837,7 +21025,7 @@ type DeleteNodeResponse struct {
 
 func (x *DeleteNodeResponse) Reset() {
 	*x = DeleteNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[241]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[242]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20849,7 +21037,7 @@ func (x *DeleteNodeResponse) String() string {
 func (*DeleteNodeResponse) ProtoMessage() {}
 
 func (x *DeleteNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[241]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[242]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20862,7 +21050,7 @@ func (x *DeleteNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNodeResponse.ProtoReflect.Descriptor instead.
 func (*DeleteNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{241}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{242}
 }
 
 func (x *DeleteNodeResponse) GetDeleted() bool {
@@ -20897,7 +21085,7 @@ type OnboardNodeRequest struct {
 
 func (x *OnboardNodeRequest) Reset() {
 	*x = OnboardNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[242]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[243]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20909,7 +21097,7 @@ func (x *OnboardNodeRequest) String() string {
 func (*OnboardNodeRequest) ProtoMessage() {}
 
 func (x *OnboardNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[242]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[243]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20922,7 +21110,7 @@ func (x *OnboardNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OnboardNodeRequest.ProtoReflect.Descriptor instead.
 func (*OnboardNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{242}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{243}
 }
 
 func (x *OnboardNodeRequest) GetRole() NodeRole {
@@ -20994,7 +21182,7 @@ type OnboardNodeResponse struct {
 
 func (x *OnboardNodeResponse) Reset() {
 	*x = OnboardNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[243]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[244]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21006,7 +21194,7 @@ func (x *OnboardNodeResponse) String() string {
 func (*OnboardNodeResponse) ProtoMessage() {}
 
 func (x *OnboardNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[243]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[244]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21019,7 +21207,7 @@ func (x *OnboardNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OnboardNodeResponse.ProtoReflect.Descriptor instead.
 func (*OnboardNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{243}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{244}
 }
 
 func (x *OnboardNodeResponse) GetNodeId() string {
@@ -21080,7 +21268,7 @@ type RevokeOnboardNodeRequest struct {
 
 func (x *RevokeOnboardNodeRequest) Reset() {
 	*x = RevokeOnboardNodeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[244]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[245]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21092,7 +21280,7 @@ func (x *RevokeOnboardNodeRequest) String() string {
 func (*RevokeOnboardNodeRequest) ProtoMessage() {}
 
 func (x *RevokeOnboardNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[244]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[245]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21105,7 +21293,7 @@ func (x *RevokeOnboardNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeOnboardNodeRequest.ProtoReflect.Descriptor instead.
 func (*RevokeOnboardNodeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{244}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{245}
 }
 
 func (x *RevokeOnboardNodeRequest) GetNodeId() string {
@@ -21126,7 +21314,7 @@ type RevokeOnboardNodeResponse struct {
 
 func (x *RevokeOnboardNodeResponse) Reset() {
 	*x = RevokeOnboardNodeResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[245]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[246]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21138,7 +21326,7 @@ func (x *RevokeOnboardNodeResponse) String() string {
 func (*RevokeOnboardNodeResponse) ProtoMessage() {}
 
 func (x *RevokeOnboardNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[245]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[246]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21151,7 +21339,7 @@ func (x *RevokeOnboardNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeOnboardNodeResponse.ProtoReflect.Descriptor instead.
 func (*RevokeOnboardNodeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{245}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{246}
 }
 
 func (x *RevokeOnboardNodeResponse) GetDeleted() bool {
@@ -21189,7 +21377,7 @@ type DispatchSessionRequest struct {
 
 func (x *DispatchSessionRequest) Reset() {
 	*x = DispatchSessionRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[246]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[247]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21201,7 +21389,7 @@ func (x *DispatchSessionRequest) String() string {
 func (*DispatchSessionRequest) ProtoMessage() {}
 
 func (x *DispatchSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[246]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[247]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21214,7 +21402,7 @@ func (x *DispatchSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DispatchSessionRequest.ProtoReflect.Descriptor instead.
 func (*DispatchSessionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{246}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{247}
 }
 
 func (x *DispatchSessionRequest) GetNodeId() string {
@@ -21243,7 +21431,7 @@ type DispatchSessionResponse struct {
 
 func (x *DispatchSessionResponse) Reset() {
 	*x = DispatchSessionResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[247]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[248]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21255,7 +21443,7 @@ func (x *DispatchSessionResponse) String() string {
 func (*DispatchSessionResponse) ProtoMessage() {}
 
 func (x *DispatchSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[247]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[248]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21268,7 +21456,7 @@ func (x *DispatchSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DispatchSessionResponse.ProtoReflect.Descriptor instead.
 func (*DispatchSessionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{247}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{248}
 }
 
 func (x *DispatchSessionResponse) GetSessionId() string {
@@ -21309,7 +21497,7 @@ type ConfigureNodeSessionLLMRequest struct {
 
 func (x *ConfigureNodeSessionLLMRequest) Reset() {
 	*x = ConfigureNodeSessionLLMRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[248]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[249]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21321,7 +21509,7 @@ func (x *ConfigureNodeSessionLLMRequest) String() string {
 func (*ConfigureNodeSessionLLMRequest) ProtoMessage() {}
 
 func (x *ConfigureNodeSessionLLMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[248]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[249]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21334,7 +21522,7 @@ func (x *ConfigureNodeSessionLLMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureNodeSessionLLMRequest.ProtoReflect.Descriptor instead.
 func (*ConfigureNodeSessionLLMRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{248}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{249}
 }
 
 func (x *ConfigureNodeSessionLLMRequest) GetSessionId() string {
@@ -21361,7 +21549,7 @@ type ApplyNodeSessionMCPsRequest struct {
 
 func (x *ApplyNodeSessionMCPsRequest) Reset() {
 	*x = ApplyNodeSessionMCPsRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[249]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[250]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21373,7 +21561,7 @@ func (x *ApplyNodeSessionMCPsRequest) String() string {
 func (*ApplyNodeSessionMCPsRequest) ProtoMessage() {}
 
 func (x *ApplyNodeSessionMCPsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[249]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[250]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21386,7 +21574,7 @@ func (x *ApplyNodeSessionMCPsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyNodeSessionMCPsRequest.ProtoReflect.Descriptor instead.
 func (*ApplyNodeSessionMCPsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{249}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{250}
 }
 
 func (x *ApplyNodeSessionMCPsRequest) GetSessionId() string {
@@ -21413,7 +21601,7 @@ type ApplyNodeSessionSkillsRequest struct {
 
 func (x *ApplyNodeSessionSkillsRequest) Reset() {
 	*x = ApplyNodeSessionSkillsRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[250]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[251]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21425,7 +21613,7 @@ func (x *ApplyNodeSessionSkillsRequest) String() string {
 func (*ApplyNodeSessionSkillsRequest) ProtoMessage() {}
 
 func (x *ApplyNodeSessionSkillsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[250]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[251]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21438,7 +21626,7 @@ func (x *ApplyNodeSessionSkillsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyNodeSessionSkillsRequest.ProtoReflect.Descriptor instead.
 func (*ApplyNodeSessionSkillsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{250}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{251}
 }
 
 func (x *ApplyNodeSessionSkillsRequest) GetSessionId() string {
@@ -21465,7 +21653,7 @@ type ApplyNodeSessionPluginsRequest struct {
 
 func (x *ApplyNodeSessionPluginsRequest) Reset() {
 	*x = ApplyNodeSessionPluginsRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[251]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[252]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21477,7 +21665,7 @@ func (x *ApplyNodeSessionPluginsRequest) String() string {
 func (*ApplyNodeSessionPluginsRequest) ProtoMessage() {}
 
 func (x *ApplyNodeSessionPluginsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[251]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[252]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21490,7 +21678,7 @@ func (x *ApplyNodeSessionPluginsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyNodeSessionPluginsRequest.ProtoReflect.Descriptor instead.
 func (*ApplyNodeSessionPluginsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{251}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{252}
 }
 
 func (x *ApplyNodeSessionPluginsRequest) GetSessionId() string {
@@ -21517,7 +21705,7 @@ type ConfigureNodeSessionModeRequest struct {
 
 func (x *ConfigureNodeSessionModeRequest) Reset() {
 	*x = ConfigureNodeSessionModeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[252]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[253]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21529,7 +21717,7 @@ func (x *ConfigureNodeSessionModeRequest) String() string {
 func (*ConfigureNodeSessionModeRequest) ProtoMessage() {}
 
 func (x *ConfigureNodeSessionModeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[252]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[253]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21542,7 +21730,7 @@ func (x *ConfigureNodeSessionModeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureNodeSessionModeRequest.ProtoReflect.Descriptor instead.
 func (*ConfigureNodeSessionModeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{252}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{253}
 }
 
 func (x *ConfigureNodeSessionModeRequest) GetSessionId() string {
@@ -21568,7 +21756,7 @@ type StartNodeSessionRuntimeRequest struct {
 
 func (x *StartNodeSessionRuntimeRequest) Reset() {
 	*x = StartNodeSessionRuntimeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[253]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[254]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21580,7 +21768,7 @@ func (x *StartNodeSessionRuntimeRequest) String() string {
 func (*StartNodeSessionRuntimeRequest) ProtoMessage() {}
 
 func (x *StartNodeSessionRuntimeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[253]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[254]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21593,7 +21781,7 @@ func (x *StartNodeSessionRuntimeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartNodeSessionRuntimeRequest.ProtoReflect.Descriptor instead.
 func (*StartNodeSessionRuntimeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{253}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{254}
 }
 
 func (x *StartNodeSessionRuntimeRequest) GetSessionId() string {
@@ -21613,7 +21801,7 @@ type RestartNodeSessionRuntimeRequest struct {
 
 func (x *RestartNodeSessionRuntimeRequest) Reset() {
 	*x = RestartNodeSessionRuntimeRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[254]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[255]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21625,7 +21813,7 @@ func (x *RestartNodeSessionRuntimeRequest) String() string {
 func (*RestartNodeSessionRuntimeRequest) ProtoMessage() {}
 
 func (x *RestartNodeSessionRuntimeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[254]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[255]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21638,7 +21826,7 @@ func (x *RestartNodeSessionRuntimeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartNodeSessionRuntimeRequest.ProtoReflect.Descriptor instead.
 func (*RestartNodeSessionRuntimeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{254}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{255}
 }
 
 func (x *RestartNodeSessionRuntimeRequest) GetSessionId() string {
@@ -21665,7 +21853,7 @@ type CollectNodeSessionArtifactsRequest struct {
 
 func (x *CollectNodeSessionArtifactsRequest) Reset() {
 	*x = CollectNodeSessionArtifactsRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[255]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[256]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21677,7 +21865,7 @@ func (x *CollectNodeSessionArtifactsRequest) String() string {
 func (*CollectNodeSessionArtifactsRequest) ProtoMessage() {}
 
 func (x *CollectNodeSessionArtifactsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[255]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[256]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21690,7 +21878,7 @@ func (x *CollectNodeSessionArtifactsRequest) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use CollectNodeSessionArtifactsRequest.ProtoReflect.Descriptor instead.
 func (*CollectNodeSessionArtifactsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{255}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{256}
 }
 
 func (x *CollectNodeSessionArtifactsRequest) GetSessionId() string {
@@ -21724,7 +21912,7 @@ type NodeSessionConfigAck struct {
 
 func (x *NodeSessionConfigAck) Reset() {
 	*x = NodeSessionConfigAck{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[256]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[257]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21736,7 +21924,7 @@ func (x *NodeSessionConfigAck) String() string {
 func (*NodeSessionConfigAck) ProtoMessage() {}
 
 func (x *NodeSessionConfigAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[256]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[257]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21749,7 +21937,7 @@ func (x *NodeSessionConfigAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionConfigAck.ProtoReflect.Descriptor instead.
 func (*NodeSessionConfigAck) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{256}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{257}
 }
 
 func (x *NodeSessionConfigAck) GetOk() bool {
@@ -21796,7 +21984,7 @@ type DeleteNodeSessionRequest struct {
 
 func (x *DeleteNodeSessionRequest) Reset() {
 	*x = DeleteNodeSessionRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[257]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[258]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21808,7 +21996,7 @@ func (x *DeleteNodeSessionRequest) String() string {
 func (*DeleteNodeSessionRequest) ProtoMessage() {}
 
 func (x *DeleteNodeSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[257]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[258]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21821,7 +22009,7 @@ func (x *DeleteNodeSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNodeSessionRequest.ProtoReflect.Descriptor instead.
 func (*DeleteNodeSessionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{257}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{258}
 }
 
 func (x *DeleteNodeSessionRequest) GetSessionId() string {
@@ -21841,7 +22029,7 @@ type DeleteNodeSessionResponse struct {
 
 func (x *DeleteNodeSessionResponse) Reset() {
 	*x = DeleteNodeSessionResponse{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[258]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[259]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21853,7 +22041,7 @@ func (x *DeleteNodeSessionResponse) String() string {
 func (*DeleteNodeSessionResponse) ProtoMessage() {}
 
 func (x *DeleteNodeSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[258]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[259]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21866,7 +22054,7 @@ func (x *DeleteNodeSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNodeSessionResponse.ProtoReflect.Descriptor instead.
 func (*DeleteNodeSessionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{258}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{259}
 }
 
 func (x *DeleteNodeSessionResponse) GetDeleted() bool {
@@ -21892,7 +22080,7 @@ type FollowNodeSessionRequest struct {
 
 func (x *FollowNodeSessionRequest) Reset() {
 	*x = FollowNodeSessionRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[259]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[260]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21904,7 +22092,7 @@ func (x *FollowNodeSessionRequest) String() string {
 func (*FollowNodeSessionRequest) ProtoMessage() {}
 
 func (x *FollowNodeSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[259]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[260]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21917,7 +22105,7 @@ func (x *FollowNodeSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FollowNodeSessionRequest.ProtoReflect.Descriptor instead.
 func (*FollowNodeSessionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{259}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{260}
 }
 
 func (x *FollowNodeSessionRequest) GetSessionId() string {
@@ -21944,7 +22132,7 @@ type NodeSessionEvent struct {
 
 func (x *NodeSessionEvent) Reset() {
 	*x = NodeSessionEvent{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[260]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[261]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21956,7 +22144,7 @@ func (x *NodeSessionEvent) String() string {
 func (*NodeSessionEvent) ProtoMessage() {}
 
 func (x *NodeSessionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[260]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[261]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21969,7 +22157,7 @@ func (x *NodeSessionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionEvent.ProtoReflect.Descriptor instead.
 func (*NodeSessionEvent) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{260}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{261}
 }
 
 func (x *NodeSessionEvent) GetEvent() isNodeSessionEvent_Event {
@@ -22063,7 +22251,7 @@ type NodeSessionEventStructured struct {
 
 func (x *NodeSessionEventStructured) Reset() {
 	*x = NodeSessionEventStructured{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[261]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[262]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22075,7 +22263,7 @@ func (x *NodeSessionEventStructured) String() string {
 func (*NodeSessionEventStructured) ProtoMessage() {}
 
 func (x *NodeSessionEventStructured) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[261]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[262]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22088,7 +22276,7 @@ func (x *NodeSessionEventStructured) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeSessionEventStructured.ProtoReflect.Descriptor instead.
 func (*NodeSessionEventStructured) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{261}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{262}
 }
 
 func (x *NodeSessionEventStructured) GetSessionId() string {
@@ -22204,7 +22392,7 @@ type NodeProxyRequest struct {
 
 func (x *NodeProxyRequest) Reset() {
 	*x = NodeProxyRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[262]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[263]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22216,7 +22404,7 @@ func (x *NodeProxyRequest) String() string {
 func (*NodeProxyRequest) ProtoMessage() {}
 
 func (x *NodeProxyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[262]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[263]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22229,7 +22417,7 @@ func (x *NodeProxyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeProxyRequest.ProtoReflect.Descriptor instead.
 func (*NodeProxyRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{262}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{263}
 }
 
 func (x *NodeProxyRequest) GetTunnelId() string {
@@ -22285,7 +22473,7 @@ type NodeIosDiscover struct {
 
 func (x *NodeIosDiscover) Reset() {
 	*x = NodeIosDiscover{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[263]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[264]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22297,7 +22485,7 @@ func (x *NodeIosDiscover) String() string {
 func (*NodeIosDiscover) ProtoMessage() {}
 
 func (x *NodeIosDiscover) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[263]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[264]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22310,7 +22498,7 @@ func (x *NodeIosDiscover) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosDiscover.ProtoReflect.Descriptor instead.
 func (*NodeIosDiscover) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{263}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{264}
 }
 
 func (x *NodeIosDiscover) GetRequestId() string {
@@ -22365,7 +22553,7 @@ type NodeIosDevice struct {
 
 func (x *NodeIosDevice) Reset() {
 	*x = NodeIosDevice{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[264]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[265]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22377,7 +22565,7 @@ func (x *NodeIosDevice) String() string {
 func (*NodeIosDevice) ProtoMessage() {}
 
 func (x *NodeIosDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[264]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[265]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22390,7 +22578,7 @@ func (x *NodeIosDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosDevice.ProtoReflect.Descriptor instead.
 func (*NodeIosDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{264}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{265}
 }
 
 func (x *NodeIosDevice) GetUdid() string {
@@ -22531,7 +22719,7 @@ type NodeIosDevicesReport struct {
 
 func (x *NodeIosDevicesReport) Reset() {
 	*x = NodeIosDevicesReport{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[265]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[266]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22543,7 +22731,7 @@ func (x *NodeIosDevicesReport) String() string {
 func (*NodeIosDevicesReport) ProtoMessage() {}
 
 func (x *NodeIosDevicesReport) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[265]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[266]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22556,7 +22744,7 @@ func (x *NodeIosDevicesReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosDevicesReport.ProtoReflect.Descriptor instead.
 func (*NodeIosDevicesReport) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{265}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{266}
 }
 
 func (x *NodeIosDevicesReport) GetRequestId() string {
@@ -22620,7 +22808,7 @@ type NodeIosClaimDevice struct {
 
 func (x *NodeIosClaimDevice) Reset() {
 	*x = NodeIosClaimDevice{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[266]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[267]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22632,7 +22820,7 @@ func (x *NodeIosClaimDevice) String() string {
 func (*NodeIosClaimDevice) ProtoMessage() {}
 
 func (x *NodeIosClaimDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[266]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[267]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22645,7 +22833,7 @@ func (x *NodeIosClaimDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosClaimDevice.ProtoReflect.Descriptor instead.
 func (*NodeIosClaimDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{266}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{267}
 }
 
 func (x *NodeIosClaimDevice) GetRequestId() string {
@@ -22729,7 +22917,7 @@ type NodeIosReleaseDevice struct {
 
 func (x *NodeIosReleaseDevice) Reset() {
 	*x = NodeIosReleaseDevice{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[267]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[268]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22741,7 +22929,7 @@ func (x *NodeIosReleaseDevice) String() string {
 func (*NodeIosReleaseDevice) ProtoMessage() {}
 
 func (x *NodeIosReleaseDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[267]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[268]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22754,7 +22942,7 @@ func (x *NodeIosReleaseDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosReleaseDevice.ProtoReflect.Descriptor instead.
 func (*NodeIosReleaseDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{267}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{268}
 }
 
 func (x *NodeIosReleaseDevice) GetRequestId() string {
@@ -22816,7 +23004,7 @@ type NodeIosConfigureDevice struct {
 
 func (x *NodeIosConfigureDevice) Reset() {
 	*x = NodeIosConfigureDevice{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[268]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[269]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22828,7 +23016,7 @@ func (x *NodeIosConfigureDevice) String() string {
 func (*NodeIosConfigureDevice) ProtoMessage() {}
 
 func (x *NodeIosConfigureDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[268]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[269]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22841,7 +23029,7 @@ func (x *NodeIosConfigureDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosConfigureDevice.ProtoReflect.Descriptor instead.
 func (*NodeIosConfigureDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{268}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{269}
 }
 
 func (x *NodeIosConfigureDevice) GetRequestId() string {
@@ -22943,7 +23131,7 @@ type NodeIosSigningMaterial struct {
 
 func (x *NodeIosSigningMaterial) Reset() {
 	*x = NodeIosSigningMaterial{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[269]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[270]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22955,7 +23143,7 @@ func (x *NodeIosSigningMaterial) String() string {
 func (*NodeIosSigningMaterial) ProtoMessage() {}
 
 func (x *NodeIosSigningMaterial) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[269]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[270]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22968,7 +23156,7 @@ func (x *NodeIosSigningMaterial) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosSigningMaterial.ProtoReflect.Descriptor instead.
 func (*NodeIosSigningMaterial) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{269}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{270}
 }
 
 func (x *NodeIosSigningMaterial) GetMode() IosSigningMode {
@@ -23047,7 +23235,7 @@ type NodeIosWdaArtifact struct {
 
 func (x *NodeIosWdaArtifact) Reset() {
 	*x = NodeIosWdaArtifact{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[270]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[271]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23059,7 +23247,7 @@ func (x *NodeIosWdaArtifact) String() string {
 func (*NodeIosWdaArtifact) ProtoMessage() {}
 
 func (x *NodeIosWdaArtifact) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[270]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[271]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23072,7 +23260,7 @@ func (x *NodeIosWdaArtifact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosWdaArtifact.ProtoReflect.Descriptor instead.
 func (*NodeIosWdaArtifact) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{270}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{271}
 }
 
 func (x *NodeIosWdaArtifact) GetArtifactId() string {
@@ -23146,7 +23334,7 @@ type NodeIosWdaJobRequest struct {
 
 func (x *NodeIosWdaJobRequest) Reset() {
 	*x = NodeIosWdaJobRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[271]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[272]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23158,7 +23346,7 @@ func (x *NodeIosWdaJobRequest) String() string {
 func (*NodeIosWdaJobRequest) ProtoMessage() {}
 
 func (x *NodeIosWdaJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[271]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[272]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23171,7 +23359,7 @@ func (x *NodeIosWdaJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosWdaJobRequest.ProtoReflect.Descriptor instead.
 func (*NodeIosWdaJobRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{271}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{272}
 }
 
 func (x *NodeIosWdaJobRequest) GetJobId() string {
@@ -23255,7 +23443,7 @@ type NodeIosJobCancel struct {
 
 func (x *NodeIosJobCancel) Reset() {
 	*x = NodeIosJobCancel{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[272]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[273]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23267,7 +23455,7 @@ func (x *NodeIosJobCancel) String() string {
 func (*NodeIosJobCancel) ProtoMessage() {}
 
 func (x *NodeIosJobCancel) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[272]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[273]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23280,7 +23468,7 @@ func (x *NodeIosJobCancel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosJobCancel.ProtoReflect.Descriptor instead.
 func (*NodeIosJobCancel) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{272}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{273}
 }
 
 func (x *NodeIosJobCancel) GetRequestId() string {
@@ -23318,7 +23506,7 @@ type NodeIosJobEvent struct {
 
 func (x *NodeIosJobEvent) Reset() {
 	*x = NodeIosJobEvent{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[273]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[274]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23330,7 +23518,7 @@ func (x *NodeIosJobEvent) String() string {
 func (*NodeIosJobEvent) ProtoMessage() {}
 
 func (x *NodeIosJobEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[273]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[274]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23343,7 +23531,7 @@ func (x *NodeIosJobEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosJobEvent.ProtoReflect.Descriptor instead.
 func (*NodeIosJobEvent) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{273}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{274}
 }
 
 func (x *NodeIosJobEvent) GetJobId() string {
@@ -23425,7 +23613,7 @@ type NodeIosJobResult struct {
 
 func (x *NodeIosJobResult) Reset() {
 	*x = NodeIosJobResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[274]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[275]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23437,7 +23625,7 @@ func (x *NodeIosJobResult) String() string {
 func (*NodeIosJobResult) ProtoMessage() {}
 
 func (x *NodeIosJobResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[274]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[275]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23450,7 +23638,7 @@ func (x *NodeIosJobResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIosJobResult.ProtoReflect.Descriptor instead.
 func (*NodeIosJobResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{274}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{275}
 }
 
 func (x *NodeIosJobResult) GetJobId() string {
@@ -23543,8 +23731,8 @@ type NodeBuildRequest struct {
 	BuildId string                 `protobuf:"bytes,1,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
 	// Recipe identity for logging/UI only; the node does not interpret it.
 	RecipeKind string `protobuf:"bytes,2,opt,name=recipe_kind,json=recipeKind,proto3" json:"recipe_kind,omitempty"` // "xcode_wda", "docker_image", …
-	SourceUrl  string `protobuf:"bytes,3,opt,name=source_url,json=sourceUrl,proto3" json:"source_url,omitempty"`    // git URL, pinned by source_ref
-	SourceRef  string `protobuf:"bytes,4,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`    // commit SHA or tag
+	SourceUrl  string `protobuf:"bytes,3,opt,name=source_url,json=sourceUrl,proto3" json:"source_url,omitempty"`    // git URL (git kind) or archive URL (archive kind)
+	SourceRef  string `protobuf:"bytes,4,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`    // commit SHA or tag (git kind only)
 	// Ordered shell commands executed in the workspace root. The node does not
 	// parse them — each runs via the platform shell, output is captured (bounded)
 	// and streamed as NodeBuildEvent.
@@ -23561,13 +23749,30 @@ type NodeBuildRequest struct {
 	TimeoutSeconds  int64  `protobuf:"varint,9,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
 	ArtifactName    string `protobuf:"bytes,10,opt,name=artifact_name,json=artifactName,proto3" json:"artifact_name,omitempty"`
 	ArtifactVersion string `protobuf:"bytes,11,opt,name=artifact_version,json=artifactVersion,proto3" json:"artifact_version,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// How to obtain the source. Empty or "git" = clone source_url at source_ref
+	// (the historic behaviour). "archive" = download source_url as a tar.gz/zip
+	// and extract it — no git, no source_ref. Lets a build point at a plain
+	// tarball (a GitHub codeload archive, a release asset, any http(s) URL),
+	// routed through the node's egress proxy like every other download.
+	SourceKind string `protobuf:"bytes,12,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"`
+	// archive kind only: subdirectory of the extracted tree to use as the
+	// workspace root (for archives whose buildable app lives under a monorepo
+	// subpath). Empty = the extracted root. The single wrapping directory that
+	// tar.gz archives carry is always stripped first, so this is relative to the
+	// project root, not the wrapper.
+	SourceSubdir string `protobuf:"bytes,13,opt,name=source_subdir,json=sourceSubdir,proto3" json:"source_subdir,omitempty"`
+	// Fetch the source WITHOUT the node's egress proxy, even when one is bound.
+	// For internal sources (a LAN gitea/gitlab a github mirror would mangle into
+	// a broken prefixed URL). Default false = honor the proxy (historic
+	// behaviour). The artifact upload is always direct regardless of this flag.
+	SourceNoProxy bool `protobuf:"varint,14,opt,name=source_no_proxy,json=sourceNoProxy,proto3" json:"source_no_proxy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NodeBuildRequest) Reset() {
 	*x = NodeBuildRequest{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[275]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[276]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23579,7 +23784,7 @@ func (x *NodeBuildRequest) String() string {
 func (*NodeBuildRequest) ProtoMessage() {}
 
 func (x *NodeBuildRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[275]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[276]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23592,7 +23797,7 @@ func (x *NodeBuildRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeBuildRequest.ProtoReflect.Descriptor instead.
 func (*NodeBuildRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{275}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{276}
 }
 
 func (x *NodeBuildRequest) GetBuildId() string {
@@ -23672,6 +23877,27 @@ func (x *NodeBuildRequest) GetArtifactVersion() string {
 	return ""
 }
 
+func (x *NodeBuildRequest) GetSourceKind() string {
+	if x != nil {
+		return x.SourceKind
+	}
+	return ""
+}
+
+func (x *NodeBuildRequest) GetSourceSubdir() string {
+	if x != nil {
+		return x.SourceSubdir
+	}
+	return ""
+}
+
+func (x *NodeBuildRequest) GetSourceNoProxy() bool {
+	if x != nil {
+		return x.SourceNoProxy
+	}
+	return false
+}
+
 // Server -> node: cancel a running build at the next stage boundary.
 type NodeBuildCancel struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -23682,7 +23908,7 @@ type NodeBuildCancel struct {
 
 func (x *NodeBuildCancel) Reset() {
 	*x = NodeBuildCancel{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[276]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[277]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23694,7 +23920,7 @@ func (x *NodeBuildCancel) String() string {
 func (*NodeBuildCancel) ProtoMessage() {}
 
 func (x *NodeBuildCancel) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[276]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[277]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23707,7 +23933,7 @@ func (x *NodeBuildCancel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeBuildCancel.ProtoReflect.Descriptor instead.
 func (*NodeBuildCancel) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{276}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{277}
 }
 
 func (x *NodeBuildCancel) GetBuildId() string {
@@ -23735,7 +23961,7 @@ type NodeBuildEvent struct {
 
 func (x *NodeBuildEvent) Reset() {
 	*x = NodeBuildEvent{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[277]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[278]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23747,7 +23973,7 @@ func (x *NodeBuildEvent) String() string {
 func (*NodeBuildEvent) ProtoMessage() {}
 
 func (x *NodeBuildEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[277]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[278]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23760,7 +23986,7 @@ func (x *NodeBuildEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeBuildEvent.ProtoReflect.Descriptor instead.
 func (*NodeBuildEvent) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{277}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{278}
 }
 
 func (x *NodeBuildEvent) GetBuildId() string {
@@ -23833,7 +24059,7 @@ type NodeBuildResult struct {
 
 func (x *NodeBuildResult) Reset() {
 	*x = NodeBuildResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[278]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[279]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23845,7 +24071,7 @@ func (x *NodeBuildResult) String() string {
 func (*NodeBuildResult) ProtoMessage() {}
 
 func (x *NodeBuildResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[278]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[279]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23858,7 +24084,7 @@ func (x *NodeBuildResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeBuildResult.ProtoReflect.Descriptor instead.
 func (*NodeBuildResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{278}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{279}
 }
 
 func (x *NodeBuildResult) GetBuildId() string {
@@ -23943,7 +24169,7 @@ type NodeHostToolJob struct {
 
 func (x *NodeHostToolJob) Reset() {
 	*x = NodeHostToolJob{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[279]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[280]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23955,7 +24181,7 @@ func (x *NodeHostToolJob) String() string {
 func (*NodeHostToolJob) ProtoMessage() {}
 
 func (x *NodeHostToolJob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[279]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[280]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23968,7 +24194,7 @@ func (x *NodeHostToolJob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostToolJob.ProtoReflect.Descriptor instead.
 func (*NodeHostToolJob) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{279}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{280}
 }
 
 func (x *NodeHostToolJob) GetJobId() string {
@@ -24051,7 +24277,7 @@ type NodeHostToolJobCancel struct {
 
 func (x *NodeHostToolJobCancel) Reset() {
 	*x = NodeHostToolJobCancel{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[280]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[281]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24063,7 +24289,7 @@ func (x *NodeHostToolJobCancel) String() string {
 func (*NodeHostToolJobCancel) ProtoMessage() {}
 
 func (x *NodeHostToolJobCancel) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[280]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[281]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24076,7 +24302,7 @@ func (x *NodeHostToolJobCancel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostToolJobCancel.ProtoReflect.Descriptor instead.
 func (*NodeHostToolJobCancel) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{280}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{281}
 }
 
 func (x *NodeHostToolJobCancel) GetJobId() string {
@@ -24108,7 +24334,7 @@ type NodeHostToolJobEvent struct {
 
 func (x *NodeHostToolJobEvent) Reset() {
 	*x = NodeHostToolJobEvent{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[281]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[282]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24120,7 +24346,7 @@ func (x *NodeHostToolJobEvent) String() string {
 func (*NodeHostToolJobEvent) ProtoMessage() {}
 
 func (x *NodeHostToolJobEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[281]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[282]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24133,7 +24359,7 @@ func (x *NodeHostToolJobEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostToolJobEvent.ProtoReflect.Descriptor instead.
 func (*NodeHostToolJobEvent) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{281}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{282}
 }
 
 func (x *NodeHostToolJobEvent) GetJobId() string {
@@ -24224,7 +24450,7 @@ type NodeHostToolJobResult struct {
 
 func (x *NodeHostToolJobResult) Reset() {
 	*x = NodeHostToolJobResult{}
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[282]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[283]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24236,7 +24462,7 @@ func (x *NodeHostToolJobResult) String() string {
 func (*NodeHostToolJobResult) ProtoMessage() {}
 
 func (x *NodeHostToolJobResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[282]
+	mi := &file_proto_agentcompose_v2_agentcompose_proto_msgTypes[283]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24249,7 +24475,7 @@ func (x *NodeHostToolJobResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeHostToolJobResult.ProtoReflect.Descriptor instead.
 func (*NodeHostToolJobResult) Descriptor() ([]byte, []int) {
-	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{282}
+	return file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP(), []int{283}
 }
 
 func (x *NodeHostToolJobResult) GetJobId() string {
@@ -25181,7 +25407,7 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x03ref\x18\x05 \x01(\tR\x03ref\x12\x1a\n" +
 	"\busername\x18\x06 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\a \x01(\tR\bpassword\x12\x14\n" +
-	"\x05token\x18\b \x01(\tR\x05token\"\xe5\r\n" +
+	"\x05token\x18\b \x01(\tR\x05token\"\xb8\x0e\n" +
 	"\x11NodeUpstreamFrame\x12&\n" +
 	"\x0fclient_frame_id\x18\x0f \x01(\tR\rclientFrameId\x12;\n" +
 	"\bregister\x18\x01 \x01(\v2\x1d.agentcompose.v2.NodeRegisterH\x00R\bregister\x12>\n" +
@@ -25207,7 +25433,8 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x10node_build_event\x18\x14 \x01(\v2\x1f.agentcompose.v2.NodeBuildEventH\x00R\x0enodeBuildEvent\x12N\n" +
 	"\x11node_build_result\x18\x15 \x01(\v2 .agentcompose.v2.NodeBuildResultH\x00R\x0fnodeBuildResult\x12V\n" +
 	"\x13host_tool_job_event\x18\x16 \x01(\v2%.agentcompose.v2.NodeHostToolJobEventH\x00R\x10hostToolJobEvent\x12Y\n" +
-	"\x14host_tool_job_result\x18\x17 \x01(\v2&.agentcompose.v2.NodeHostToolJobResultH\x00R\x11hostToolJobResultB\a\n" +
+	"\x14host_tool_job_result\x18\x17 \x01(\v2&.agentcompose.v2.NodeHostToolJobResultH\x00R\x11hostToolJobResult\x12Q\n" +
+	"\x12node_upgrade_event\x18\x18 \x01(\v2!.agentcompose.v2.NodeUpgradeEventH\x00R\x10nodeUpgradeEventB\a\n" +
 	"\x05frame\"\xb0#\n" +
 	"\x13NodeDownstreamFrame\x12&\n" +
 	"\x0fserver_frame_id\x18\x0f \x01(\tR\rserverFrameId\x12\x1d\n" +
@@ -25279,10 +25506,13 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\tdevice_id\x18\x02 \x01(\tR\bdeviceId\x12\x12\n" +
 	"\x04udid\x18\x03 \x01(\tR\x04udid\x12?\n" +
 	"\x06action\x18\x04 \x01(\x0e2'.agentcompose.v2.IosRunnerControlActionR\x06action\"\x1a\n" +
-	"\x18NodeRefreshLabelsRequest\"j\n" +
+	"\x18NodeRefreshLabelsRequest\"\xbb\x01\n" +
 	"\x15NodeManageEnvironment\x12\x15\n" +
 	"\x06env_id\x18\x01 \x01(\tR\x05envId\x12:\n" +
-	"\x06action\x18\x02 \x01(\x0e2\".agentcompose.v2.EnvironmentActionR\x06action\"\x9b\x01\n" +
+	"\x06action\x18\x02 \x01(\x0e2\".agentcompose.v2.EnvironmentActionR\x06action\x12.\n" +
+	"\x03git\x18\x03 \x01(\v2\x1c.agentcompose.v2.NodeGitSpecR\x03git\x12\x1f\n" +
+	"\vtarget_path\x18\x04 \x01(\tR\n" +
+	"targetPath\"\x9b\x01\n" +
 	"\x13NodeSyncEnvironment\x12\x15\n" +
 	"\x06env_id\x18\x01 \x01(\tR\x05envId\x122\n" +
 	"\x06skills\x18\x02 \x03(\v2\x1a.agentcompose.v2.SkillSpecR\x06skills\x129\n" +
@@ -25333,7 +25563,19 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\n" +
 	"proxy_mode\x18\x04 \x01(\tR\tproxyMode\x12\x1b\n" +
 	"\tproxy_url\x18\x05 \x01(\tR\bproxyUrl\x12(\n" +
-	"\x10proxy_url_prefix\x18\x06 \x01(\tR\x0eproxyUrlPrefix\"\xf1\x01\n" +
+	"\x10proxy_url_prefix\x18\x06 \x01(\tR\x0eproxyUrlPrefix\"\x91\x02\n" +
+	"\x10NodeUpgradeEvent\x12&\n" +
+	"\x0fserver_frame_id\x18\x01 \x01(\tR\rserverFrameId\x12\x12\n" +
+	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x10\n" +
+	"\x03seq\x18\x03 \x01(\x03R\x03seq\x12\x14\n" +
+	"\x05stage\x18\x04 \x01(\tR\x05stage\x12\x18\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage\x12\x18\n" +
+	"\apercent\x18\x06 \x01(\x05R\apercent\x12#\n" +
+	"\rcurrent_bytes\x18\a \x01(\x03R\fcurrentBytes\x12\x1f\n" +
+	"\vtotal_bytes\x18\b \x01(\x03R\n" +
+	"totalBytes\x12\x1f\n" +
+	"\vreported_at\x18\t \x01(\tR\n" +
+	"reportedAt\"\xf1\x01\n" +
 	"\x13NodeInstallHostTool\x12\x12\n" +
 	"\x04tool\x18\x01 \x01(\tR\x04tool\x12%\n" +
 	"\x0etarget_version\x18\x02 \x01(\tR\rtargetVersion\x12!\n" +
@@ -26175,7 +26417,7 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x10artifact_version\x18\n" +
 	" \x01(\tR\x0fartifactVersion\x12%\n" +
 	"\x0ecertificate_id\x18\v \x01(\tR\rcertificateId\x12'\n" +
-	"\x0fconfig_revision\x18\f \x01(\x03R\x0econfigRevision\"\x82\x03\n" +
+	"\x0fconfig_revision\x18\f \x01(\x03R\x0econfigRevision\"\xf0\x03\n" +
 	"\x10NodeBuildRequest\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\x12\x1f\n" +
 	"\vrecipe_kind\x18\x02 \x01(\tR\n" +
@@ -26192,7 +26434,11 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x0ftimeout_seconds\x18\t \x01(\x03R\x0etimeoutSeconds\x12#\n" +
 	"\rartifact_name\x18\n" +
 	" \x01(\tR\fartifactName\x12)\n" +
-	"\x10artifact_version\x18\v \x01(\tR\x0fartifactVersion\",\n" +
+	"\x10artifact_version\x18\v \x01(\tR\x0fartifactVersion\x12\x1f\n" +
+	"\vsource_kind\x18\f \x01(\tR\n" +
+	"sourceKind\x12#\n" +
+	"\rsource_subdir\x18\r \x01(\tR\fsourceSubdir\x12&\n" +
+	"\x0fsource_no_proxy\x18\x0e \x01(\bR\rsourceNoProxy\",\n" +
 	"\x0fNodeBuildCancel\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\"\xc3\x01\n" +
 	"\x0eNodeBuildEvent\x12\x19\n" +
@@ -26383,7 +26629,7 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x11IosConnectionType\x12#\n" +
 	"\x1fIOS_CONNECTION_TYPE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17IOS_CONNECTION_TYPE_USB\x10\x01\x12\x1f\n" +
-	"\x1bIOS_CONNECTION_TYPE_NETWORK\x10\x02*\xd1\x01\n" +
+	"\x1bIOS_CONNECTION_TYPE_NETWORK\x10\x02*\xee\x01\n" +
 	"\vIosWdaState\x12\x1d\n" +
 	"\x19IOS_WDA_STATE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15IOS_WDA_STATE_MISSING\x10\x01\x12\x1b\n" +
@@ -26391,7 +26637,8 @@ const file_proto_agentcompose_v2_agentcompose_proto_rawDesc = "" +
 	"\x13IOS_WDA_STATE_READY\x10\x03\x12\x1d\n" +
 	"\x19IOS_WDA_STATE_RENEWAL_DUE\x10\x04\x12\x19\n" +
 	"\x15IOS_WDA_STATE_EXPIRED\x10\x05\x12\x18\n" +
-	"\x14IOS_WDA_STATE_FAILED\x10\x06*\xbc\x01\n" +
+	"\x14IOS_WDA_STATE_FAILED\x10\x06\x12\x1b\n" +
+	"\x17IOS_WDA_STATE_INSTALLED\x10\a*\xbc\x01\n" +
 	"\x0fIosWdaJobAction\x12\"\n" +
 	"\x1eIOS_WDA_JOB_ACTION_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aIOS_WDA_JOB_ACTION_PREPARE\x10\x01\x12\x1c\n" +
@@ -26525,7 +26772,7 @@ func file_proto_agentcompose_v2_agentcompose_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_agentcompose_v2_agentcompose_proto_enumTypes = make([]protoimpl.EnumInfo, 29)
-var file_proto_agentcompose_v2_agentcompose_proto_msgTypes = make([]protoimpl.MessageInfo, 305)
+var file_proto_agentcompose_v2_agentcompose_proto_msgTypes = make([]protoimpl.MessageInfo, 306)
 var file_proto_agentcompose_v2_agentcompose_proto_goTypes = []any{
 	(ProjectValidationSeverity)(0),               // 0: agentcompose.v2.ProjectValidationSeverity
 	(ProjectChangeAction)(0),                     // 1: agentcompose.v2.ProjectChangeAction
@@ -26697,170 +26944,171 @@ var file_proto_agentcompose_v2_agentcompose_proto_goTypes = []any{
 	(*NodeManageEditor)(nil),                     // 167: agentcompose.v2.NodeManageEditor
 	(*NodeSelfUpgrade)(nil),                      // 168: agentcompose.v2.NodeSelfUpgrade
 	(*NodeRuntimeUpgrade)(nil),                   // 169: agentcompose.v2.NodeRuntimeUpgrade
-	(*NodeInstallHostTool)(nil),                  // 170: agentcompose.v2.NodeInstallHostTool
-	(*NodeTerminalOpen)(nil),                     // 171: agentcompose.v2.NodeTerminalOpen
-	(*NodeTerminalInput)(nil),                    // 172: agentcompose.v2.NodeTerminalInput
-	(*NodeTerminalResize)(nil),                   // 173: agentcompose.v2.NodeTerminalResize
-	(*NodeTerminalClose)(nil),                    // 174: agentcompose.v2.NodeTerminalClose
-	(*NodeTerminalAttach)(nil),                   // 175: agentcompose.v2.NodeTerminalAttach
-	(*NodeTerminalListRequest)(nil),              // 176: agentcompose.v2.NodeTerminalListRequest
-	(*NodeTerminalStatus)(nil),                   // 177: agentcompose.v2.NodeTerminalStatus
-	(*NodeTerminalListResult)(nil),               // 178: agentcompose.v2.NodeTerminalListResult
-	(*NodeTerminalInterrupt)(nil),                // 179: agentcompose.v2.NodeTerminalInterrupt
-	(*NodeTerminalOutput)(nil),                   // 180: agentcompose.v2.NodeTerminalOutput
-	(*NodeTerminalExit)(nil),                     // 181: agentcompose.v2.NodeTerminalExit
-	(*NodeHostExecRequest)(nil),                  // 182: agentcompose.v2.NodeHostExecRequest
-	(*NodeHostExecResult)(nil),                   // 183: agentcompose.v2.NodeHostExecResult
-	(*NodeToolRunRequest)(nil),                   // 184: agentcompose.v2.NodeToolRunRequest
-	(*NodeToolRunStop)(nil),                      // 185: agentcompose.v2.NodeToolRunStop
-	(*NodeToolRunEvent)(nil),                     // 186: agentcompose.v2.NodeToolRunEvent
-	(*NodeActiveToolRun)(nil),                    // 187: agentcompose.v2.NodeActiveToolRun
-	(*FollowToolRunRequest)(nil),                 // 188: agentcompose.v2.FollowToolRunRequest
-	(*NodeFileUploadRequest)(nil),                // 189: agentcompose.v2.NodeFileUploadRequest
-	(*NodeFileUploadResult)(nil),                 // 190: agentcompose.v2.NodeFileUploadResult
-	(*NodeRegister)(nil),                         // 191: agentcompose.v2.NodeRegister
-	(*NodeServerHello)(nil),                      // 192: agentcompose.v2.NodeServerHello
-	(*EditorModeSemantics)(nil),                  // 193: agentcompose.v2.EditorModeSemantics
-	(*EditorModeSpec)(nil),                       // 194: agentcompose.v2.EditorModeSpec
-	(*EditorCapability)(nil),                     // 195: agentcompose.v2.EditorCapability
-	(*NodeCapabilities)(nil),                     // 196: agentcompose.v2.NodeCapabilities
-	(*NodePublicIPReport)(nil),                   // 197: agentcompose.v2.NodePublicIPReport
-	(*NodeHeartbeat)(nil),                        // 198: agentcompose.v2.NodeHeartbeat
-	(*NodePublicIPLookupConfig)(nil),             // 199: agentcompose.v2.NodePublicIPLookupConfig
-	(*NodeProxyConfig)(nil),                      // 200: agentcompose.v2.NodeProxyConfig
-	(*GetPublicIPLookupConfigRequest)(nil),       // 201: agentcompose.v2.GetPublicIPLookupConfigRequest
-	(*UpdatePublicIPLookupConfigRequest)(nil),    // 202: agentcompose.v2.UpdatePublicIPLookupConfigRequest
-	(*GetNodeProxyConfigRequest)(nil),            // 203: agentcompose.v2.GetNodeProxyConfigRequest
-	(*UpdateNodeProxyConfigRequest)(nil),         // 204: agentcompose.v2.UpdateNodeProxyConfigRequest
-	(*SetNodeLastProxyRequest)(nil),              // 205: agentcompose.v2.SetNodeLastProxyRequest
-	(*SetNodeLastProxyResponse)(nil),             // 206: agentcompose.v2.SetNodeLastProxyResponse
-	(*NodeRegistered)(nil),                       // 207: agentcompose.v2.NodeRegistered
-	(*NodeCreateSession)(nil),                    // 208: agentcompose.v2.NodeCreateSession
-	(*NodeGitSpec)(nil),                          // 209: agentcompose.v2.NodeGitSpec
-	(*NodeLLMConfig)(nil),                        // 210: agentcompose.v2.NodeLLMConfig
-	(*NodePluginSpec)(nil),                       // 211: agentcompose.v2.NodePluginSpec
-	(*ConfigureSessionLLM)(nil),                  // 212: agentcompose.v2.ConfigureSessionLLM
-	(*ApplySessionMCPs)(nil),                     // 213: agentcompose.v2.ApplySessionMCPs
-	(*ApplySessionSkills)(nil),                   // 214: agentcompose.v2.ApplySessionSkills
-	(*ApplySessionPlugins)(nil),                  // 215: agentcompose.v2.ApplySessionPlugins
-	(*ConfigureSessionMode)(nil),                 // 216: agentcompose.v2.ConfigureSessionMode
-	(*StartSessionRuntime)(nil),                  // 217: agentcompose.v2.StartSessionRuntime
-	(*RestartSessionRuntime)(nil),                // 218: agentcompose.v2.RestartSessionRuntime
-	(*CollectSessionArtifacts)(nil),              // 219: agentcompose.v2.CollectSessionArtifacts
-	(*NodeDeleteSession)(nil),                    // 220: agentcompose.v2.NodeDeleteSession
-	(*NodeListSessions)(nil),                     // 221: agentcompose.v2.NodeListSessions
-	(*NodeSessionInput)(nil),                     // 222: agentcompose.v2.NodeSessionInput
-	(*NodeCreateExecutionNode)(nil),              // 223: agentcompose.v2.NodeCreateExecutionNode
-	(*NodeDeleteExecutionNode)(nil),              // 224: agentcompose.v2.NodeDeleteExecutionNode
-	(*SendSessionInputRequest)(nil),              // 225: agentcompose.v2.SendSessionInputRequest
-	(*SendSessionInputResponse)(nil),             // 226: agentcompose.v2.SendSessionInputResponse
-	(*NodeTunnelRequest)(nil),                    // 227: agentcompose.v2.NodeTunnelRequest
-	(*NodeTunnelResponse)(nil),                   // 228: agentcompose.v2.NodeTunnelResponse
-	(*NodeSessionOutput)(nil),                    // 229: agentcompose.v2.NodeSessionOutput
-	(*NodeSessionResult)(nil),                    // 230: agentcompose.v2.NodeSessionResult
-	(*NodeSessionStage)(nil),                     // 231: agentcompose.v2.NodeSessionStage
-	(*NodeCommandAck)(nil),                       // 232: agentcompose.v2.NodeCommandAck
-	(*NodeSessionSummary)(nil),                   // 233: agentcompose.v2.NodeSessionSummary
-	(*NodeError)(nil),                            // 234: agentcompose.v2.NodeError
-	(*ListNodesRequest)(nil),                     // 235: agentcompose.v2.ListNodesRequest
-	(*ListNodesResponse)(nil),                    // 236: agentcompose.v2.ListNodesResponse
-	(*NodeInfo)(nil),                             // 237: agentcompose.v2.NodeInfo
-	(*NodeCapacity)(nil),                         // 238: agentcompose.v2.NodeCapacity
-	(*SetNodeCapacityRequest)(nil),               // 239: agentcompose.v2.SetNodeCapacityRequest
-	(*SetNodeCapacityResponse)(nil),              // 240: agentcompose.v2.SetNodeCapacityResponse
-	(*MoveNodeRequest)(nil),                      // 241: agentcompose.v2.MoveNodeRequest
-	(*MoveNodeResponse)(nil),                     // 242: agentcompose.v2.MoveNodeResponse
-	(*ManageEditorRequest)(nil),                  // 243: agentcompose.v2.ManageEditorRequest
-	(*ManageEditorResponse)(nil),                 // 244: agentcompose.v2.ManageEditorResponse
-	(*ManageNodeEnvironmentRequest)(nil),         // 245: agentcompose.v2.ManageNodeEnvironmentRequest
-	(*ManageNodeEnvironmentResponse)(nil),        // 246: agentcompose.v2.ManageNodeEnvironmentResponse
-	(*SyncNodeEnvironmentRequest)(nil),           // 247: agentcompose.v2.SyncNodeEnvironmentRequest
-	(*SyncNodeEnvironmentResponse)(nil),          // 248: agentcompose.v2.SyncNodeEnvironmentResponse
-	(*InspectNodeEnvironmentRequest)(nil),        // 249: agentcompose.v2.InspectNodeEnvironmentRequest
-	(*InspectNodeEnvironmentResponse)(nil),       // 250: agentcompose.v2.InspectNodeEnvironmentResponse
-	(*InspectNodeSystemEnvRequest)(nil),          // 251: agentcompose.v2.InspectNodeSystemEnvRequest
-	(*InspectNodeSystemEnvResponse)(nil),         // 252: agentcompose.v2.InspectNodeSystemEnvResponse
-	(*SyncNodeSystemEnvRequest)(nil),             // 253: agentcompose.v2.SyncNodeSystemEnvRequest
-	(*SyncNodeSystemEnvResponse)(nil),            // 254: agentcompose.v2.SyncNodeSystemEnvResponse
-	(*ArchiveNodeSystemEnvResourceRequest)(nil),  // 255: agentcompose.v2.ArchiveNodeSystemEnvResourceRequest
-	(*ArchiveNodeSystemEnvResourceResponse)(nil), // 256: agentcompose.v2.ArchiveNodeSystemEnvResourceResponse
-	(*SelfUpgradeNodeRequest)(nil),               // 257: agentcompose.v2.SelfUpgradeNodeRequest
-	(*SelfUpgradeNodeResponse)(nil),              // 258: agentcompose.v2.SelfUpgradeNodeResponse
-	(*RuntimeUpgradeNodeRequest)(nil),            // 259: agentcompose.v2.RuntimeUpgradeNodeRequest
-	(*RuntimeUpgradeNodeResponse)(nil),           // 260: agentcompose.v2.RuntimeUpgradeNodeResponse
-	(*HostExecRequest)(nil),                      // 261: agentcompose.v2.HostExecRequest
-	(*HostExecResponse)(nil),                     // 262: agentcompose.v2.HostExecResponse
-	(*HostFileUploadRequest)(nil),                // 263: agentcompose.v2.HostFileUploadRequest
-	(*HostFileUploadResponse)(nil),               // 264: agentcompose.v2.HostFileUploadResponse
-	(*ApproveNodeRequest)(nil),                   // 265: agentcompose.v2.ApproveNodeRequest
-	(*ApproveNodeResponse)(nil),                  // 266: agentcompose.v2.ApproveNodeResponse
-	(*RevokeNodeRequest)(nil),                    // 267: agentcompose.v2.RevokeNodeRequest
-	(*RevokeNodeResponse)(nil),                   // 268: agentcompose.v2.RevokeNodeResponse
-	(*DeleteNodeRequest)(nil),                    // 269: agentcompose.v2.DeleteNodeRequest
-	(*DeleteNodeResponse)(nil),                   // 270: agentcompose.v2.DeleteNodeResponse
-	(*OnboardNodeRequest)(nil),                   // 271: agentcompose.v2.OnboardNodeRequest
-	(*OnboardNodeResponse)(nil),                  // 272: agentcompose.v2.OnboardNodeResponse
-	(*RevokeOnboardNodeRequest)(nil),             // 273: agentcompose.v2.RevokeOnboardNodeRequest
-	(*RevokeOnboardNodeResponse)(nil),            // 274: agentcompose.v2.RevokeOnboardNodeResponse
-	(*DispatchSessionRequest)(nil),               // 275: agentcompose.v2.DispatchSessionRequest
-	(*DispatchSessionResponse)(nil),              // 276: agentcompose.v2.DispatchSessionResponse
-	(*ConfigureNodeSessionLLMRequest)(nil),       // 277: agentcompose.v2.ConfigureNodeSessionLLMRequest
-	(*ApplyNodeSessionMCPsRequest)(nil),          // 278: agentcompose.v2.ApplyNodeSessionMCPsRequest
-	(*ApplyNodeSessionSkillsRequest)(nil),        // 279: agentcompose.v2.ApplyNodeSessionSkillsRequest
-	(*ApplyNodeSessionPluginsRequest)(nil),       // 280: agentcompose.v2.ApplyNodeSessionPluginsRequest
-	(*ConfigureNodeSessionModeRequest)(nil),      // 281: agentcompose.v2.ConfigureNodeSessionModeRequest
-	(*StartNodeSessionRuntimeRequest)(nil),       // 282: agentcompose.v2.StartNodeSessionRuntimeRequest
-	(*RestartNodeSessionRuntimeRequest)(nil),     // 283: agentcompose.v2.RestartNodeSessionRuntimeRequest
-	(*CollectNodeSessionArtifactsRequest)(nil),   // 284: agentcompose.v2.CollectNodeSessionArtifactsRequest
-	(*NodeSessionConfigAck)(nil),                 // 285: agentcompose.v2.NodeSessionConfigAck
-	(*DeleteNodeSessionRequest)(nil),             // 286: agentcompose.v2.DeleteNodeSessionRequest
-	(*DeleteNodeSessionResponse)(nil),            // 287: agentcompose.v2.DeleteNodeSessionResponse
-	(*FollowNodeSessionRequest)(nil),             // 288: agentcompose.v2.FollowNodeSessionRequest
-	(*NodeSessionEvent)(nil),                     // 289: agentcompose.v2.NodeSessionEvent
-	(*NodeSessionEventStructured)(nil),           // 290: agentcompose.v2.NodeSessionEventStructured
-	(*NodeProxyRequest)(nil),                     // 291: agentcompose.v2.NodeProxyRequest
-	(*NodeIosDiscover)(nil),                      // 292: agentcompose.v2.NodeIosDiscover
-	(*NodeIosDevice)(nil),                        // 293: agentcompose.v2.NodeIosDevice
-	(*NodeIosDevicesReport)(nil),                 // 294: agentcompose.v2.NodeIosDevicesReport
-	(*NodeIosClaimDevice)(nil),                   // 295: agentcompose.v2.NodeIosClaimDevice
-	(*NodeIosReleaseDevice)(nil),                 // 296: agentcompose.v2.NodeIosReleaseDevice
-	(*NodeIosConfigureDevice)(nil),               // 297: agentcompose.v2.NodeIosConfigureDevice
-	(*NodeIosSigningMaterial)(nil),               // 298: agentcompose.v2.NodeIosSigningMaterial
-	(*NodeIosWdaArtifact)(nil),                   // 299: agentcompose.v2.NodeIosWdaArtifact
-	(*NodeIosWdaJobRequest)(nil),                 // 300: agentcompose.v2.NodeIosWdaJobRequest
-	(*NodeIosJobCancel)(nil),                     // 301: agentcompose.v2.NodeIosJobCancel
-	(*NodeIosJobEvent)(nil),                      // 302: agentcompose.v2.NodeIosJobEvent
-	(*NodeIosJobResult)(nil),                     // 303: agentcompose.v2.NodeIosJobResult
-	(*NodeBuildRequest)(nil),                     // 304: agentcompose.v2.NodeBuildRequest
-	(*NodeBuildCancel)(nil),                      // 305: agentcompose.v2.NodeBuildCancel
-	(*NodeBuildEvent)(nil),                       // 306: agentcompose.v2.NodeBuildEvent
-	(*NodeBuildResult)(nil),                      // 307: agentcompose.v2.NodeBuildResult
-	(*NodeHostToolJob)(nil),                      // 308: agentcompose.v2.NodeHostToolJob
-	(*NodeHostToolJobCancel)(nil),                // 309: agentcompose.v2.NodeHostToolJobCancel
-	(*NodeHostToolJobEvent)(nil),                 // 310: agentcompose.v2.NodeHostToolJobEvent
-	(*NodeHostToolJobResult)(nil),                // 311: agentcompose.v2.NodeHostToolJobResult
-	nil,                                          // 312: agentcompose.v2.ProjectVolumeSpec.LabelsEntry
-	nil,                                          // 313: agentcompose.v2.ProjectVolumeSpec.OptionsEntry
-	nil,                                          // 314: agentcompose.v2.BuildSpec.ArgsEntry
-	nil,                                          // 315: agentcompose.v2.AttachHumanMessage.MetadataEntry
-	nil,                                          // 316: agentcompose.v2.AttachError.DetailsEntry
-	nil,                                          // 317: agentcompose.v2.BuildImageRequest.BuildArgsEntry
-	nil,                                          // 318: agentcompose.v2.CreateVolumeRequest.LabelsEntry
-	nil,                                          // 319: agentcompose.v2.CreateVolumeRequest.OptionsEntry
-	nil,                                          // 320: agentcompose.v2.Volume.LabelsEntry
-	nil,                                          // 321: agentcompose.v2.Volume.OptionsEntry
-	nil,                                          // 322: agentcompose.v2.Image.LabelsEntry
-	nil,                                          // 323: agentcompose.v2.NodeToolRunRequest.EnvEntry
-	nil,                                          // 324: agentcompose.v2.EditorModeSpec.NativeEntry
-	nil,                                          // 325: agentcompose.v2.NodeCapabilities.LabelsEntry
-	nil,                                          // 326: agentcompose.v2.NodeCreateSession.TagsEntry
-	nil,                                          // 327: agentcompose.v2.NodeLLMConfig.HeadersEntry
-	nil,                                          // 328: agentcompose.v2.NodeLLMConfig.ExtraEntry
-	nil,                                          // 329: agentcompose.v2.NodeCreateExecutionNode.LabelsEntry
-	nil,                                          // 330: agentcompose.v2.NodeTunnelRequest.HeadersEntry
-	nil,                                          // 331: agentcompose.v2.NodeTunnelResponse.HeadersEntry
-	nil,                                          // 332: agentcompose.v2.OnboardNodeRequest.LabelsEntry
-	nil,                                          // 333: agentcompose.v2.NodeProxyRequest.HeadersEntry
+	(*NodeUpgradeEvent)(nil),                     // 170: agentcompose.v2.NodeUpgradeEvent
+	(*NodeInstallHostTool)(nil),                  // 171: agentcompose.v2.NodeInstallHostTool
+	(*NodeTerminalOpen)(nil),                     // 172: agentcompose.v2.NodeTerminalOpen
+	(*NodeTerminalInput)(nil),                    // 173: agentcompose.v2.NodeTerminalInput
+	(*NodeTerminalResize)(nil),                   // 174: agentcompose.v2.NodeTerminalResize
+	(*NodeTerminalClose)(nil),                    // 175: agentcompose.v2.NodeTerminalClose
+	(*NodeTerminalAttach)(nil),                   // 176: agentcompose.v2.NodeTerminalAttach
+	(*NodeTerminalListRequest)(nil),              // 177: agentcompose.v2.NodeTerminalListRequest
+	(*NodeTerminalStatus)(nil),                   // 178: agentcompose.v2.NodeTerminalStatus
+	(*NodeTerminalListResult)(nil),               // 179: agentcompose.v2.NodeTerminalListResult
+	(*NodeTerminalInterrupt)(nil),                // 180: agentcompose.v2.NodeTerminalInterrupt
+	(*NodeTerminalOutput)(nil),                   // 181: agentcompose.v2.NodeTerminalOutput
+	(*NodeTerminalExit)(nil),                     // 182: agentcompose.v2.NodeTerminalExit
+	(*NodeHostExecRequest)(nil),                  // 183: agentcompose.v2.NodeHostExecRequest
+	(*NodeHostExecResult)(nil),                   // 184: agentcompose.v2.NodeHostExecResult
+	(*NodeToolRunRequest)(nil),                   // 185: agentcompose.v2.NodeToolRunRequest
+	(*NodeToolRunStop)(nil),                      // 186: agentcompose.v2.NodeToolRunStop
+	(*NodeToolRunEvent)(nil),                     // 187: agentcompose.v2.NodeToolRunEvent
+	(*NodeActiveToolRun)(nil),                    // 188: agentcompose.v2.NodeActiveToolRun
+	(*FollowToolRunRequest)(nil),                 // 189: agentcompose.v2.FollowToolRunRequest
+	(*NodeFileUploadRequest)(nil),                // 190: agentcompose.v2.NodeFileUploadRequest
+	(*NodeFileUploadResult)(nil),                 // 191: agentcompose.v2.NodeFileUploadResult
+	(*NodeRegister)(nil),                         // 192: agentcompose.v2.NodeRegister
+	(*NodeServerHello)(nil),                      // 193: agentcompose.v2.NodeServerHello
+	(*EditorModeSemantics)(nil),                  // 194: agentcompose.v2.EditorModeSemantics
+	(*EditorModeSpec)(nil),                       // 195: agentcompose.v2.EditorModeSpec
+	(*EditorCapability)(nil),                     // 196: agentcompose.v2.EditorCapability
+	(*NodeCapabilities)(nil),                     // 197: agentcompose.v2.NodeCapabilities
+	(*NodePublicIPReport)(nil),                   // 198: agentcompose.v2.NodePublicIPReport
+	(*NodeHeartbeat)(nil),                        // 199: agentcompose.v2.NodeHeartbeat
+	(*NodePublicIPLookupConfig)(nil),             // 200: agentcompose.v2.NodePublicIPLookupConfig
+	(*NodeProxyConfig)(nil),                      // 201: agentcompose.v2.NodeProxyConfig
+	(*GetPublicIPLookupConfigRequest)(nil),       // 202: agentcompose.v2.GetPublicIPLookupConfigRequest
+	(*UpdatePublicIPLookupConfigRequest)(nil),    // 203: agentcompose.v2.UpdatePublicIPLookupConfigRequest
+	(*GetNodeProxyConfigRequest)(nil),            // 204: agentcompose.v2.GetNodeProxyConfigRequest
+	(*UpdateNodeProxyConfigRequest)(nil),         // 205: agentcompose.v2.UpdateNodeProxyConfigRequest
+	(*SetNodeLastProxyRequest)(nil),              // 206: agentcompose.v2.SetNodeLastProxyRequest
+	(*SetNodeLastProxyResponse)(nil),             // 207: agentcompose.v2.SetNodeLastProxyResponse
+	(*NodeRegistered)(nil),                       // 208: agentcompose.v2.NodeRegistered
+	(*NodeCreateSession)(nil),                    // 209: agentcompose.v2.NodeCreateSession
+	(*NodeGitSpec)(nil),                          // 210: agentcompose.v2.NodeGitSpec
+	(*NodeLLMConfig)(nil),                        // 211: agentcompose.v2.NodeLLMConfig
+	(*NodePluginSpec)(nil),                       // 212: agentcompose.v2.NodePluginSpec
+	(*ConfigureSessionLLM)(nil),                  // 213: agentcompose.v2.ConfigureSessionLLM
+	(*ApplySessionMCPs)(nil),                     // 214: agentcompose.v2.ApplySessionMCPs
+	(*ApplySessionSkills)(nil),                   // 215: agentcompose.v2.ApplySessionSkills
+	(*ApplySessionPlugins)(nil),                  // 216: agentcompose.v2.ApplySessionPlugins
+	(*ConfigureSessionMode)(nil),                 // 217: agentcompose.v2.ConfigureSessionMode
+	(*StartSessionRuntime)(nil),                  // 218: agentcompose.v2.StartSessionRuntime
+	(*RestartSessionRuntime)(nil),                // 219: agentcompose.v2.RestartSessionRuntime
+	(*CollectSessionArtifacts)(nil),              // 220: agentcompose.v2.CollectSessionArtifacts
+	(*NodeDeleteSession)(nil),                    // 221: agentcompose.v2.NodeDeleteSession
+	(*NodeListSessions)(nil),                     // 222: agentcompose.v2.NodeListSessions
+	(*NodeSessionInput)(nil),                     // 223: agentcompose.v2.NodeSessionInput
+	(*NodeCreateExecutionNode)(nil),              // 224: agentcompose.v2.NodeCreateExecutionNode
+	(*NodeDeleteExecutionNode)(nil),              // 225: agentcompose.v2.NodeDeleteExecutionNode
+	(*SendSessionInputRequest)(nil),              // 226: agentcompose.v2.SendSessionInputRequest
+	(*SendSessionInputResponse)(nil),             // 227: agentcompose.v2.SendSessionInputResponse
+	(*NodeTunnelRequest)(nil),                    // 228: agentcompose.v2.NodeTunnelRequest
+	(*NodeTunnelResponse)(nil),                   // 229: agentcompose.v2.NodeTunnelResponse
+	(*NodeSessionOutput)(nil),                    // 230: agentcompose.v2.NodeSessionOutput
+	(*NodeSessionResult)(nil),                    // 231: agentcompose.v2.NodeSessionResult
+	(*NodeSessionStage)(nil),                     // 232: agentcompose.v2.NodeSessionStage
+	(*NodeCommandAck)(nil),                       // 233: agentcompose.v2.NodeCommandAck
+	(*NodeSessionSummary)(nil),                   // 234: agentcompose.v2.NodeSessionSummary
+	(*NodeError)(nil),                            // 235: agentcompose.v2.NodeError
+	(*ListNodesRequest)(nil),                     // 236: agentcompose.v2.ListNodesRequest
+	(*ListNodesResponse)(nil),                    // 237: agentcompose.v2.ListNodesResponse
+	(*NodeInfo)(nil),                             // 238: agentcompose.v2.NodeInfo
+	(*NodeCapacity)(nil),                         // 239: agentcompose.v2.NodeCapacity
+	(*SetNodeCapacityRequest)(nil),               // 240: agentcompose.v2.SetNodeCapacityRequest
+	(*SetNodeCapacityResponse)(nil),              // 241: agentcompose.v2.SetNodeCapacityResponse
+	(*MoveNodeRequest)(nil),                      // 242: agentcompose.v2.MoveNodeRequest
+	(*MoveNodeResponse)(nil),                     // 243: agentcompose.v2.MoveNodeResponse
+	(*ManageEditorRequest)(nil),                  // 244: agentcompose.v2.ManageEditorRequest
+	(*ManageEditorResponse)(nil),                 // 245: agentcompose.v2.ManageEditorResponse
+	(*ManageNodeEnvironmentRequest)(nil),         // 246: agentcompose.v2.ManageNodeEnvironmentRequest
+	(*ManageNodeEnvironmentResponse)(nil),        // 247: agentcompose.v2.ManageNodeEnvironmentResponse
+	(*SyncNodeEnvironmentRequest)(nil),           // 248: agentcompose.v2.SyncNodeEnvironmentRequest
+	(*SyncNodeEnvironmentResponse)(nil),          // 249: agentcompose.v2.SyncNodeEnvironmentResponse
+	(*InspectNodeEnvironmentRequest)(nil),        // 250: agentcompose.v2.InspectNodeEnvironmentRequest
+	(*InspectNodeEnvironmentResponse)(nil),       // 251: agentcompose.v2.InspectNodeEnvironmentResponse
+	(*InspectNodeSystemEnvRequest)(nil),          // 252: agentcompose.v2.InspectNodeSystemEnvRequest
+	(*InspectNodeSystemEnvResponse)(nil),         // 253: agentcompose.v2.InspectNodeSystemEnvResponse
+	(*SyncNodeSystemEnvRequest)(nil),             // 254: agentcompose.v2.SyncNodeSystemEnvRequest
+	(*SyncNodeSystemEnvResponse)(nil),            // 255: agentcompose.v2.SyncNodeSystemEnvResponse
+	(*ArchiveNodeSystemEnvResourceRequest)(nil),  // 256: agentcompose.v2.ArchiveNodeSystemEnvResourceRequest
+	(*ArchiveNodeSystemEnvResourceResponse)(nil), // 257: agentcompose.v2.ArchiveNodeSystemEnvResourceResponse
+	(*SelfUpgradeNodeRequest)(nil),               // 258: agentcompose.v2.SelfUpgradeNodeRequest
+	(*SelfUpgradeNodeResponse)(nil),              // 259: agentcompose.v2.SelfUpgradeNodeResponse
+	(*RuntimeUpgradeNodeRequest)(nil),            // 260: agentcompose.v2.RuntimeUpgradeNodeRequest
+	(*RuntimeUpgradeNodeResponse)(nil),           // 261: agentcompose.v2.RuntimeUpgradeNodeResponse
+	(*HostExecRequest)(nil),                      // 262: agentcompose.v2.HostExecRequest
+	(*HostExecResponse)(nil),                     // 263: agentcompose.v2.HostExecResponse
+	(*HostFileUploadRequest)(nil),                // 264: agentcompose.v2.HostFileUploadRequest
+	(*HostFileUploadResponse)(nil),               // 265: agentcompose.v2.HostFileUploadResponse
+	(*ApproveNodeRequest)(nil),                   // 266: agentcompose.v2.ApproveNodeRequest
+	(*ApproveNodeResponse)(nil),                  // 267: agentcompose.v2.ApproveNodeResponse
+	(*RevokeNodeRequest)(nil),                    // 268: agentcompose.v2.RevokeNodeRequest
+	(*RevokeNodeResponse)(nil),                   // 269: agentcompose.v2.RevokeNodeResponse
+	(*DeleteNodeRequest)(nil),                    // 270: agentcompose.v2.DeleteNodeRequest
+	(*DeleteNodeResponse)(nil),                   // 271: agentcompose.v2.DeleteNodeResponse
+	(*OnboardNodeRequest)(nil),                   // 272: agentcompose.v2.OnboardNodeRequest
+	(*OnboardNodeResponse)(nil),                  // 273: agentcompose.v2.OnboardNodeResponse
+	(*RevokeOnboardNodeRequest)(nil),             // 274: agentcompose.v2.RevokeOnboardNodeRequest
+	(*RevokeOnboardNodeResponse)(nil),            // 275: agentcompose.v2.RevokeOnboardNodeResponse
+	(*DispatchSessionRequest)(nil),               // 276: agentcompose.v2.DispatchSessionRequest
+	(*DispatchSessionResponse)(nil),              // 277: agentcompose.v2.DispatchSessionResponse
+	(*ConfigureNodeSessionLLMRequest)(nil),       // 278: agentcompose.v2.ConfigureNodeSessionLLMRequest
+	(*ApplyNodeSessionMCPsRequest)(nil),          // 279: agentcompose.v2.ApplyNodeSessionMCPsRequest
+	(*ApplyNodeSessionSkillsRequest)(nil),        // 280: agentcompose.v2.ApplyNodeSessionSkillsRequest
+	(*ApplyNodeSessionPluginsRequest)(nil),       // 281: agentcompose.v2.ApplyNodeSessionPluginsRequest
+	(*ConfigureNodeSessionModeRequest)(nil),      // 282: agentcompose.v2.ConfigureNodeSessionModeRequest
+	(*StartNodeSessionRuntimeRequest)(nil),       // 283: agentcompose.v2.StartNodeSessionRuntimeRequest
+	(*RestartNodeSessionRuntimeRequest)(nil),     // 284: agentcompose.v2.RestartNodeSessionRuntimeRequest
+	(*CollectNodeSessionArtifactsRequest)(nil),   // 285: agentcompose.v2.CollectNodeSessionArtifactsRequest
+	(*NodeSessionConfigAck)(nil),                 // 286: agentcompose.v2.NodeSessionConfigAck
+	(*DeleteNodeSessionRequest)(nil),             // 287: agentcompose.v2.DeleteNodeSessionRequest
+	(*DeleteNodeSessionResponse)(nil),            // 288: agentcompose.v2.DeleteNodeSessionResponse
+	(*FollowNodeSessionRequest)(nil),             // 289: agentcompose.v2.FollowNodeSessionRequest
+	(*NodeSessionEvent)(nil),                     // 290: agentcompose.v2.NodeSessionEvent
+	(*NodeSessionEventStructured)(nil),           // 291: agentcompose.v2.NodeSessionEventStructured
+	(*NodeProxyRequest)(nil),                     // 292: agentcompose.v2.NodeProxyRequest
+	(*NodeIosDiscover)(nil),                      // 293: agentcompose.v2.NodeIosDiscover
+	(*NodeIosDevice)(nil),                        // 294: agentcompose.v2.NodeIosDevice
+	(*NodeIosDevicesReport)(nil),                 // 295: agentcompose.v2.NodeIosDevicesReport
+	(*NodeIosClaimDevice)(nil),                   // 296: agentcompose.v2.NodeIosClaimDevice
+	(*NodeIosReleaseDevice)(nil),                 // 297: agentcompose.v2.NodeIosReleaseDevice
+	(*NodeIosConfigureDevice)(nil),               // 298: agentcompose.v2.NodeIosConfigureDevice
+	(*NodeIosSigningMaterial)(nil),               // 299: agentcompose.v2.NodeIosSigningMaterial
+	(*NodeIosWdaArtifact)(nil),                   // 300: agentcompose.v2.NodeIosWdaArtifact
+	(*NodeIosWdaJobRequest)(nil),                 // 301: agentcompose.v2.NodeIosWdaJobRequest
+	(*NodeIosJobCancel)(nil),                     // 302: agentcompose.v2.NodeIosJobCancel
+	(*NodeIosJobEvent)(nil),                      // 303: agentcompose.v2.NodeIosJobEvent
+	(*NodeIosJobResult)(nil),                     // 304: agentcompose.v2.NodeIosJobResult
+	(*NodeBuildRequest)(nil),                     // 305: agentcompose.v2.NodeBuildRequest
+	(*NodeBuildCancel)(nil),                      // 306: agentcompose.v2.NodeBuildCancel
+	(*NodeBuildEvent)(nil),                       // 307: agentcompose.v2.NodeBuildEvent
+	(*NodeBuildResult)(nil),                      // 308: agentcompose.v2.NodeBuildResult
+	(*NodeHostToolJob)(nil),                      // 309: agentcompose.v2.NodeHostToolJob
+	(*NodeHostToolJobCancel)(nil),                // 310: agentcompose.v2.NodeHostToolJobCancel
+	(*NodeHostToolJobEvent)(nil),                 // 311: agentcompose.v2.NodeHostToolJobEvent
+	(*NodeHostToolJobResult)(nil),                // 312: agentcompose.v2.NodeHostToolJobResult
+	nil,                                          // 313: agentcompose.v2.ProjectVolumeSpec.LabelsEntry
+	nil,                                          // 314: agentcompose.v2.ProjectVolumeSpec.OptionsEntry
+	nil,                                          // 315: agentcompose.v2.BuildSpec.ArgsEntry
+	nil,                                          // 316: agentcompose.v2.AttachHumanMessage.MetadataEntry
+	nil,                                          // 317: agentcompose.v2.AttachError.DetailsEntry
+	nil,                                          // 318: agentcompose.v2.BuildImageRequest.BuildArgsEntry
+	nil,                                          // 319: agentcompose.v2.CreateVolumeRequest.LabelsEntry
+	nil,                                          // 320: agentcompose.v2.CreateVolumeRequest.OptionsEntry
+	nil,                                          // 321: agentcompose.v2.Volume.LabelsEntry
+	nil,                                          // 322: agentcompose.v2.Volume.OptionsEntry
+	nil,                                          // 323: agentcompose.v2.Image.LabelsEntry
+	nil,                                          // 324: agentcompose.v2.NodeToolRunRequest.EnvEntry
+	nil,                                          // 325: agentcompose.v2.EditorModeSpec.NativeEntry
+	nil,                                          // 326: agentcompose.v2.NodeCapabilities.LabelsEntry
+	nil,                                          // 327: agentcompose.v2.NodeCreateSession.TagsEntry
+	nil,                                          // 328: agentcompose.v2.NodeLLMConfig.HeadersEntry
+	nil,                                          // 329: agentcompose.v2.NodeLLMConfig.ExtraEntry
+	nil,                                          // 330: agentcompose.v2.NodeCreateExecutionNode.LabelsEntry
+	nil,                                          // 331: agentcompose.v2.NodeTunnelRequest.HeadersEntry
+	nil,                                          // 332: agentcompose.v2.NodeTunnelResponse.HeadersEntry
+	nil,                                          // 333: agentcompose.v2.OnboardNodeRequest.LabelsEntry
+	nil,                                          // 334: agentcompose.v2.NodeProxyRequest.HeadersEntry
 }
 var file_proto_agentcompose_v2_agentcompose_proto_depIdxs = []int32{
 	50,  // 0: agentcompose.v2.ValidateProjectRequest.spec:type_name -> agentcompose.v2.ProjectSpec
@@ -26908,9 +27156,9 @@ var file_proto_agentcompose_v2_agentcompose_proto_depIdxs = []int32{
 	154, // 42: agentcompose.v2.AgentSpec.skills:type_name -> agentcompose.v2.SkillSpec
 	57,  // 43: agentcompose.v2.MCPServerSpec.env:type_name -> agentcompose.v2.EnvVarSpec
 	57,  // 44: agentcompose.v2.MCPServerSpec.headers:type_name -> agentcompose.v2.EnvVarSpec
-	312, // 45: agentcompose.v2.ProjectVolumeSpec.labels:type_name -> agentcompose.v2.ProjectVolumeSpec.LabelsEntry
-	313, // 46: agentcompose.v2.ProjectVolumeSpec.options:type_name -> agentcompose.v2.ProjectVolumeSpec.OptionsEntry
-	314, // 47: agentcompose.v2.BuildSpec.args:type_name -> agentcompose.v2.BuildSpec.ArgsEntry
+	313, // 45: agentcompose.v2.ProjectVolumeSpec.labels:type_name -> agentcompose.v2.ProjectVolumeSpec.LabelsEntry
+	314, // 46: agentcompose.v2.ProjectVolumeSpec.options:type_name -> agentcompose.v2.ProjectVolumeSpec.OptionsEntry
+	315, // 47: agentcompose.v2.BuildSpec.args:type_name -> agentcompose.v2.BuildSpec.ArgsEntry
 	61,  // 48: agentcompose.v2.SchedulerSpec.triggers:type_name -> agentcompose.v2.TriggerSpec
 	62,  // 49: agentcompose.v2.TriggerSpec.event:type_name -> agentcompose.v2.EventTriggerSpec
 	64,  // 50: agentcompose.v2.DriverSpec.boxlite:type_name -> agentcompose.v2.BoxliteDriverSpec
@@ -26988,13 +27236,13 @@ var file_proto_agentcompose_v2_agentcompose_proto_depIdxs = []int32{
 	98,  // 122: agentcompose.v2.ExecAttachStart.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
 	8,   // 123: agentcompose.v2.ExecAttachStart.mode:type_name -> agentcompose.v2.AttachRunMode
 	98,  // 124: agentcompose.v2.AttachResize.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
-	315, // 125: agentcompose.v2.AttachHumanMessage.metadata:type_name -> agentcompose.v2.AttachHumanMessage.MetadataEntry
+	316, // 125: agentcompose.v2.AttachHumanMessage.metadata:type_name -> agentcompose.v2.AttachHumanMessage.MetadataEntry
 	88,  // 126: agentcompose.v2.AttachStarted.run:type_name -> agentcompose.v2.RunSummary
 	9,   // 127: agentcompose.v2.AttachOutput.stream:type_name -> agentcompose.v2.StdioStream
 	73,  // 128: agentcompose.v2.AttachOutput.transcript:type_name -> agentcompose.v2.TranscriptEvent
 	111, // 129: agentcompose.v2.AttachResult.exec_result:type_name -> agentcompose.v2.ExecResult
 	88,  // 130: agentcompose.v2.AttachResult.run:type_name -> agentcompose.v2.RunSummary
-	316, // 131: agentcompose.v2.AttachError.details:type_name -> agentcompose.v2.AttachError.DetailsEntry
+	317, // 131: agentcompose.v2.AttachError.details:type_name -> agentcompose.v2.AttachError.DetailsEntry
 	92,  // 132: agentcompose.v2.ExecResult.command:type_name -> agentcompose.v2.ExecCommand
 	10,  // 133: agentcompose.v2.ListImagesRequest.store:type_name -> agentcompose.v2.ImageStoreKind
 	144, // 134: agentcompose.v2.ListImagesResponse.images:type_name -> agentcompose.v2.Image
@@ -27008,7 +27256,7 @@ var file_proto_agentcompose_v2_agentcompose_proto_depIdxs = []int32{
 	144, // 142: agentcompose.v2.InspectImageResponse.image:type_name -> agentcompose.v2.Image
 	146, // 143: agentcompose.v2.InspectImageResponse.store_status:type_name -> agentcompose.v2.ImageStoreStatus
 	10,  // 144: agentcompose.v2.RemoveImageRequest.store:type_name -> agentcompose.v2.ImageStoreKind
-	317, // 145: agentcompose.v2.BuildImageRequest.build_args:type_name -> agentcompose.v2.BuildImageRequest.BuildArgsEntry
+	318, // 145: agentcompose.v2.BuildImageRequest.build_args:type_name -> agentcompose.v2.BuildImageRequest.BuildArgsEntry
 	10,  // 146: agentcompose.v2.BuildImageRequest.store:type_name -> agentcompose.v2.ImageStoreKind
 	145, // 147: agentcompose.v2.BuildImageRequest.platform:type_name -> agentcompose.v2.ImagePlatform
 	12,  // 148: agentcompose.v2.BuildImageEvent.status:type_name -> agentcompose.v2.ImageOperationStatus
@@ -27027,338 +27275,340 @@ var file_proto_agentcompose_v2_agentcompose_proto_depIdxs = []int32{
 	15,  // 161: agentcompose.v2.CacheItem.status:type_name -> agentcompose.v2.CacheStatus
 	132, // 162: agentcompose.v2.CacheItem.references:type_name -> agentcompose.v2.CacheReference
 	143, // 163: agentcompose.v2.ListVolumesResponse.volumes:type_name -> agentcompose.v2.Volume
-	318, // 164: agentcompose.v2.CreateVolumeRequest.labels:type_name -> agentcompose.v2.CreateVolumeRequest.LabelsEntry
-	319, // 165: agentcompose.v2.CreateVolumeRequest.options:type_name -> agentcompose.v2.CreateVolumeRequest.OptionsEntry
+	319, // 164: agentcompose.v2.CreateVolumeRequest.labels:type_name -> agentcompose.v2.CreateVolumeRequest.LabelsEntry
+	320, // 165: agentcompose.v2.CreateVolumeRequest.options:type_name -> agentcompose.v2.CreateVolumeRequest.OptionsEntry
 	143, // 166: agentcompose.v2.CreateVolumeResponse.volume:type_name -> agentcompose.v2.Volume
 	143, // 167: agentcompose.v2.InspectVolumeResponse.volume:type_name -> agentcompose.v2.Volume
 	143, // 168: agentcompose.v2.PruneVolumesResponse.matched:type_name -> agentcompose.v2.Volume
 	143, // 169: agentcompose.v2.PruneVolumesResponse.removed:type_name -> agentcompose.v2.Volume
 	143, // 170: agentcompose.v2.PruneVolumesResponse.skipped:type_name -> agentcompose.v2.Volume
-	320, // 171: agentcompose.v2.Volume.labels:type_name -> agentcompose.v2.Volume.LabelsEntry
-	321, // 172: agentcompose.v2.Volume.options:type_name -> agentcompose.v2.Volume.OptionsEntry
+	321, // 171: agentcompose.v2.Volume.labels:type_name -> agentcompose.v2.Volume.LabelsEntry
+	322, // 172: agentcompose.v2.Volume.options:type_name -> agentcompose.v2.Volume.OptionsEntry
 	10,  // 173: agentcompose.v2.Image.store:type_name -> agentcompose.v2.ImageStoreKind
 	11,  // 174: agentcompose.v2.Image.availability_status:type_name -> agentcompose.v2.ImageAvailabilityStatus
 	145, // 175: agentcompose.v2.Image.platform:type_name -> agentcompose.v2.ImagePlatform
 	147, // 176: agentcompose.v2.Image.docker:type_name -> agentcompose.v2.DockerImageStatus
 	148, // 177: agentcompose.v2.Image.oci:type_name -> agentcompose.v2.OCIImageStatus
-	322, // 178: agentcompose.v2.Image.labels:type_name -> agentcompose.v2.Image.LabelsEntry
+	323, // 178: agentcompose.v2.Image.labels:type_name -> agentcompose.v2.Image.LabelsEntry
 	10,  // 179: agentcompose.v2.ImageStoreStatus.store:type_name -> agentcompose.v2.ImageStoreKind
 	67,  // 180: agentcompose.v2.StartRunRequest.run:type_name -> agentcompose.v2.RunAgentRequest
 	88,  // 181: agentcompose.v2.StartRunResponse.run:type_name -> agentcompose.v2.RunSummary
-	191, // 182: agentcompose.v2.NodeUpstreamFrame.register:type_name -> agentcompose.v2.NodeRegister
-	198, // 183: agentcompose.v2.NodeUpstreamFrame.heartbeat:type_name -> agentcompose.v2.NodeHeartbeat
-	229, // 184: agentcompose.v2.NodeUpstreamFrame.session_output:type_name -> agentcompose.v2.NodeSessionOutput
-	230, // 185: agentcompose.v2.NodeUpstreamFrame.session_result:type_name -> agentcompose.v2.NodeSessionResult
-	232, // 186: agentcompose.v2.NodeUpstreamFrame.command_ack:type_name -> agentcompose.v2.NodeCommandAck
-	234, // 187: agentcompose.v2.NodeUpstreamFrame.error:type_name -> agentcompose.v2.NodeError
-	228, // 188: agentcompose.v2.NodeUpstreamFrame.tunnel_response:type_name -> agentcompose.v2.NodeTunnelResponse
-	290, // 189: agentcompose.v2.NodeUpstreamFrame.session_event:type_name -> agentcompose.v2.NodeSessionEventStructured
-	180, // 190: agentcompose.v2.NodeUpstreamFrame.terminal_output:type_name -> agentcompose.v2.NodeTerminalOutput
-	181, // 191: agentcompose.v2.NodeUpstreamFrame.terminal_exit:type_name -> agentcompose.v2.NodeTerminalExit
-	183, // 192: agentcompose.v2.NodeUpstreamFrame.host_exec_result:type_name -> agentcompose.v2.NodeHostExecResult
-	190, // 193: agentcompose.v2.NodeUpstreamFrame.file_upload_result:type_name -> agentcompose.v2.NodeFileUploadResult
-	178, // 194: agentcompose.v2.NodeUpstreamFrame.terminal_list_result:type_name -> agentcompose.v2.NodeTerminalListResult
-	186, // 195: agentcompose.v2.NodeUpstreamFrame.tool_run_event:type_name -> agentcompose.v2.NodeToolRunEvent
-	231, // 196: agentcompose.v2.NodeUpstreamFrame.session_stage:type_name -> agentcompose.v2.NodeSessionStage
-	294, // 197: agentcompose.v2.NodeUpstreamFrame.ios_devices_report:type_name -> agentcompose.v2.NodeIosDevicesReport
-	302, // 198: agentcompose.v2.NodeUpstreamFrame.ios_job_event:type_name -> agentcompose.v2.NodeIosJobEvent
-	303, // 199: agentcompose.v2.NodeUpstreamFrame.ios_job_result:type_name -> agentcompose.v2.NodeIosJobResult
-	306, // 200: agentcompose.v2.NodeUpstreamFrame.node_build_event:type_name -> agentcompose.v2.NodeBuildEvent
-	307, // 201: agentcompose.v2.NodeUpstreamFrame.node_build_result:type_name -> agentcompose.v2.NodeBuildResult
-	310, // 202: agentcompose.v2.NodeUpstreamFrame.host_tool_job_event:type_name -> agentcompose.v2.NodeHostToolJobEvent
-	311, // 203: agentcompose.v2.NodeUpstreamFrame.host_tool_job_result:type_name -> agentcompose.v2.NodeHostToolJobResult
-	207, // 204: agentcompose.v2.NodeDownstreamFrame.registered:type_name -> agentcompose.v2.NodeRegistered
-	208, // 205: agentcompose.v2.NodeDownstreamFrame.create_session:type_name -> agentcompose.v2.NodeCreateSession
-	220, // 206: agentcompose.v2.NodeDownstreamFrame.delete_session:type_name -> agentcompose.v2.NodeDeleteSession
-	221, // 207: agentcompose.v2.NodeDownstreamFrame.list_sessions:type_name -> agentcompose.v2.NodeListSessions
-	234, // 208: agentcompose.v2.NodeDownstreamFrame.error:type_name -> agentcompose.v2.NodeError
-	227, // 209: agentcompose.v2.NodeDownstreamFrame.tunnel_request:type_name -> agentcompose.v2.NodeTunnelRequest
-	222, // 210: agentcompose.v2.NodeDownstreamFrame.session_input:type_name -> agentcompose.v2.NodeSessionInput
-	223, // 211: agentcompose.v2.NodeDownstreamFrame.create_execution_node:type_name -> agentcompose.v2.NodeCreateExecutionNode
-	224, // 212: agentcompose.v2.NodeDownstreamFrame.delete_execution_node:type_name -> agentcompose.v2.NodeDeleteExecutionNode
-	192, // 213: agentcompose.v2.NodeDownstreamFrame.server_hello:type_name -> agentcompose.v2.NodeServerHello
-	212, // 214: agentcompose.v2.NodeDownstreamFrame.configure_session_llm:type_name -> agentcompose.v2.ConfigureSessionLLM
-	213, // 215: agentcompose.v2.NodeDownstreamFrame.apply_session_mcps:type_name -> agentcompose.v2.ApplySessionMCPs
-	214, // 216: agentcompose.v2.NodeDownstreamFrame.apply_session_skills:type_name -> agentcompose.v2.ApplySessionSkills
-	215, // 217: agentcompose.v2.NodeDownstreamFrame.apply_session_plugins:type_name -> agentcompose.v2.ApplySessionPlugins
-	217, // 218: agentcompose.v2.NodeDownstreamFrame.start_session_runtime:type_name -> agentcompose.v2.StartSessionRuntime
-	218, // 219: agentcompose.v2.NodeDownstreamFrame.restart_session_runtime:type_name -> agentcompose.v2.RestartSessionRuntime
-	216, // 220: agentcompose.v2.NodeDownstreamFrame.configure_session_mode:type_name -> agentcompose.v2.ConfigureSessionMode
-	219, // 221: agentcompose.v2.NodeDownstreamFrame.collect_session_artifacts:type_name -> agentcompose.v2.CollectSessionArtifacts
-	291, // 222: agentcompose.v2.NodeDownstreamFrame.proxy_request:type_name -> agentcompose.v2.NodeProxyRequest
-	167, // 223: agentcompose.v2.NodeDownstreamFrame.manage_editor:type_name -> agentcompose.v2.NodeManageEditor
-	168, // 224: agentcompose.v2.NodeDownstreamFrame.self_upgrade:type_name -> agentcompose.v2.NodeSelfUpgrade
-	169, // 225: agentcompose.v2.NodeDownstreamFrame.runtime_upgrade:type_name -> agentcompose.v2.NodeRuntimeUpgrade
-	171, // 226: agentcompose.v2.NodeDownstreamFrame.terminal_open:type_name -> agentcompose.v2.NodeTerminalOpen
-	172, // 227: agentcompose.v2.NodeDownstreamFrame.terminal_input:type_name -> agentcompose.v2.NodeTerminalInput
-	173, // 228: agentcompose.v2.NodeDownstreamFrame.terminal_resize:type_name -> agentcompose.v2.NodeTerminalResize
-	174, // 229: agentcompose.v2.NodeDownstreamFrame.terminal_close:type_name -> agentcompose.v2.NodeTerminalClose
-	175, // 230: agentcompose.v2.NodeDownstreamFrame.terminal_attach:type_name -> agentcompose.v2.NodeTerminalAttach
-	176, // 231: agentcompose.v2.NodeDownstreamFrame.terminal_list:type_name -> agentcompose.v2.NodeTerminalListRequest
-	179, // 232: agentcompose.v2.NodeDownstreamFrame.terminal_interrupt:type_name -> agentcompose.v2.NodeTerminalInterrupt
-	182, // 233: agentcompose.v2.NodeDownstreamFrame.host_exec:type_name -> agentcompose.v2.NodeHostExecRequest
-	189, // 234: agentcompose.v2.NodeDownstreamFrame.file_upload:type_name -> agentcompose.v2.NodeFileUploadRequest
-	199, // 235: agentcompose.v2.NodeDownstreamFrame.public_ip_lookup_config:type_name -> agentcompose.v2.NodePublicIPLookupConfig
-	200, // 236: agentcompose.v2.NodeDownstreamFrame.node_proxy_config:type_name -> agentcompose.v2.NodeProxyConfig
-	184, // 237: agentcompose.v2.NodeDownstreamFrame.tool_run_request:type_name -> agentcompose.v2.NodeToolRunRequest
-	185, // 238: agentcompose.v2.NodeDownstreamFrame.tool_run_stop:type_name -> agentcompose.v2.NodeToolRunStop
-	159, // 239: agentcompose.v2.NodeDownstreamFrame.manage_environment:type_name -> agentcompose.v2.NodeManageEnvironment
-	160, // 240: agentcompose.v2.NodeDownstreamFrame.sync_environment:type_name -> agentcompose.v2.NodeSyncEnvironment
-	161, // 241: agentcompose.v2.NodeDownstreamFrame.inspect_environment:type_name -> agentcompose.v2.NodeInspectEnvironment
-	292, // 242: agentcompose.v2.NodeDownstreamFrame.ios_discover:type_name -> agentcompose.v2.NodeIosDiscover
-	295, // 243: agentcompose.v2.NodeDownstreamFrame.ios_claim_device:type_name -> agentcompose.v2.NodeIosClaimDevice
-	296, // 244: agentcompose.v2.NodeDownstreamFrame.ios_release_device:type_name -> agentcompose.v2.NodeIosReleaseDevice
-	297, // 245: agentcompose.v2.NodeDownstreamFrame.ios_configure_device:type_name -> agentcompose.v2.NodeIosConfigureDevice
-	300, // 246: agentcompose.v2.NodeDownstreamFrame.ios_wda_job:type_name -> agentcompose.v2.NodeIosWdaJobRequest
-	301, // 247: agentcompose.v2.NodeDownstreamFrame.ios_job_cancel:type_name -> agentcompose.v2.NodeIosJobCancel
-	163, // 248: agentcompose.v2.NodeDownstreamFrame.inspect_system_env:type_name -> agentcompose.v2.NodeInspectSystemEnv
-	164, // 249: agentcompose.v2.NodeDownstreamFrame.sync_system_env:type_name -> agentcompose.v2.NodeSyncSystemEnv
-	165, // 250: agentcompose.v2.NodeDownstreamFrame.archive_system_env_resource:type_name -> agentcompose.v2.NodeArchiveSystemEnvResource
-	304, // 251: agentcompose.v2.NodeDownstreamFrame.node_build:type_name -> agentcompose.v2.NodeBuildRequest
-	305, // 252: agentcompose.v2.NodeDownstreamFrame.node_build_cancel:type_name -> agentcompose.v2.NodeBuildCancel
-	170, // 253: agentcompose.v2.NodeDownstreamFrame.install_host_tool:type_name -> agentcompose.v2.NodeInstallHostTool
-	308, // 254: agentcompose.v2.NodeDownstreamFrame.host_tool_job:type_name -> agentcompose.v2.NodeHostToolJob
-	309, // 255: agentcompose.v2.NodeDownstreamFrame.host_tool_job_cancel:type_name -> agentcompose.v2.NodeHostToolJobCancel
-	158, // 256: agentcompose.v2.NodeDownstreamFrame.refresh_labels:type_name -> agentcompose.v2.NodeRefreshLabelsRequest
-	157, // 257: agentcompose.v2.NodeDownstreamFrame.ios_runner_control:type_name -> agentcompose.v2.NodeIosRunnerControl
-	19,  // 258: agentcompose.v2.NodeIosRunnerControl.action:type_name -> agentcompose.v2.IosRunnerControlAction
-	20,  // 259: agentcompose.v2.NodeManageEnvironment.action:type_name -> agentcompose.v2.EnvironmentAction
-	154, // 260: agentcompose.v2.NodeSyncEnvironment.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 261: agentcompose.v2.NodeSyncEnvironment.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	154, // 262: agentcompose.v2.NodeSyncSystemEnv.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 263: agentcompose.v2.NodeSyncSystemEnv.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	21,  // 264: agentcompose.v2.NodeManageEditor.action:type_name -> agentcompose.v2.EditorAction
-	98,  // 265: agentcompose.v2.NodeTerminalOpen.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
-	98,  // 266: agentcompose.v2.NodeTerminalResize.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
-	177, // 267: agentcompose.v2.NodeTerminalListResult.terminals:type_name -> agentcompose.v2.NodeTerminalStatus
-	323, // 268: agentcompose.v2.NodeToolRunRequest.env:type_name -> agentcompose.v2.NodeToolRunRequest.EnvEntry
-	22,  // 269: agentcompose.v2.NodeToolRunEvent.kind:type_name -> agentcompose.v2.NodeToolRunKind
-	196, // 270: agentcompose.v2.NodeRegister.capabilities:type_name -> agentcompose.v2.NodeCapabilities
-	17,  // 271: agentcompose.v2.NodeRegister.role:type_name -> agentcompose.v2.NodeRole
-	324, // 272: agentcompose.v2.EditorModeSpec.native:type_name -> agentcompose.v2.EditorModeSpec.NativeEntry
-	193, // 273: agentcompose.v2.EditorModeSpec.semantics:type_name -> agentcompose.v2.EditorModeSemantics
-	194, // 274: agentcompose.v2.EditorCapability.modes:type_name -> agentcompose.v2.EditorModeSpec
-	325, // 275: agentcompose.v2.NodeCapabilities.labels:type_name -> agentcompose.v2.NodeCapabilities.LabelsEntry
-	195, // 276: agentcompose.v2.NodeCapabilities.editors:type_name -> agentcompose.v2.EditorCapability
-	197, // 277: agentcompose.v2.NodeHeartbeat.public_ip_report:type_name -> agentcompose.v2.NodePublicIPReport
-	187, // 278: agentcompose.v2.NodeHeartbeat.active_tool_runs:type_name -> agentcompose.v2.NodeActiveToolRun
-	16,  // 279: agentcompose.v2.NodeRegistered.status:type_name -> agentcompose.v2.NodeStatus
-	209, // 280: agentcompose.v2.NodeCreateSession.git:type_name -> agentcompose.v2.NodeGitSpec
-	210, // 281: agentcompose.v2.NodeCreateSession.llm:type_name -> agentcompose.v2.NodeLLMConfig
-	53,  // 282: agentcompose.v2.NodeCreateSession.mcps:type_name -> agentcompose.v2.MCPServerSpec
-	154, // 283: agentcompose.v2.NodeCreateSession.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 284: agentcompose.v2.NodeCreateSession.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	57,  // 285: agentcompose.v2.NodeCreateSession.env:type_name -> agentcompose.v2.EnvVarSpec
-	55,  // 286: agentcompose.v2.NodeCreateSession.volumes:type_name -> agentcompose.v2.VolumeMountSpec
-	326, // 287: agentcompose.v2.NodeCreateSession.tags:type_name -> agentcompose.v2.NodeCreateSession.TagsEntry
-	327, // 288: agentcompose.v2.NodeLLMConfig.headers:type_name -> agentcompose.v2.NodeLLMConfig.HeadersEntry
-	328, // 289: agentcompose.v2.NodeLLMConfig.extra:type_name -> agentcompose.v2.NodeLLMConfig.ExtraEntry
-	210, // 290: agentcompose.v2.ConfigureSessionLLM.llm:type_name -> agentcompose.v2.NodeLLMConfig
-	53,  // 291: agentcompose.v2.ApplySessionMCPs.mcps:type_name -> agentcompose.v2.MCPServerSpec
-	154, // 292: agentcompose.v2.ApplySessionSkills.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 293: agentcompose.v2.ApplySessionPlugins.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	210, // 294: agentcompose.v2.NodeSessionInput.llm:type_name -> agentcompose.v2.NodeLLMConfig
-	18,  // 295: agentcompose.v2.NodeCreateExecutionNode.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
-	57,  // 296: agentcompose.v2.NodeCreateExecutionNode.env:type_name -> agentcompose.v2.EnvVarSpec
-	329, // 297: agentcompose.v2.NodeCreateExecutionNode.labels:type_name -> agentcompose.v2.NodeCreateExecutionNode.LabelsEntry
-	210, // 298: agentcompose.v2.SendSessionInputRequest.llm:type_name -> agentcompose.v2.NodeLLMConfig
-	330, // 299: agentcompose.v2.NodeTunnelRequest.headers:type_name -> agentcompose.v2.NodeTunnelRequest.HeadersEntry
-	331, // 300: agentcompose.v2.NodeTunnelResponse.headers:type_name -> agentcompose.v2.NodeTunnelResponse.HeadersEntry
-	9,   // 301: agentcompose.v2.NodeSessionOutput.stream:type_name -> agentcompose.v2.StdioStream
-	23,  // 302: agentcompose.v2.NodeSessionStage.stage:type_name -> agentcompose.v2.SessionStage
-	233, // 303: agentcompose.v2.NodeCommandAck.sessions:type_name -> agentcompose.v2.NodeSessionSummary
-	162, // 304: agentcompose.v2.NodeCommandAck.environment_inventory:type_name -> agentcompose.v2.NodeEnvironmentEntry
-	166, // 305: agentcompose.v2.NodeCommandAck.system_env_inventory:type_name -> agentcompose.v2.NodeSystemEnvEntry
-	196, // 306: agentcompose.v2.NodeCommandAck.refreshed_capabilities:type_name -> agentcompose.v2.NodeCapabilities
-	16,  // 307: agentcompose.v2.ListNodesRequest.status:type_name -> agentcompose.v2.NodeStatus
-	237, // 308: agentcompose.v2.ListNodesResponse.nodes:type_name -> agentcompose.v2.NodeInfo
-	16,  // 309: agentcompose.v2.NodeInfo.status:type_name -> agentcompose.v2.NodeStatus
-	196, // 310: agentcompose.v2.NodeInfo.capabilities:type_name -> agentcompose.v2.NodeCapabilities
-	17,  // 311: agentcompose.v2.NodeInfo.role:type_name -> agentcompose.v2.NodeRole
-	18,  // 312: agentcompose.v2.NodeInfo.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
-	238, // 313: agentcompose.v2.NodeInfo.capacity:type_name -> agentcompose.v2.NodeCapacity
-	238, // 314: agentcompose.v2.SetNodeCapacityRequest.capacity:type_name -> agentcompose.v2.NodeCapacity
-	238, // 315: agentcompose.v2.SetNodeCapacityResponse.capacity:type_name -> agentcompose.v2.NodeCapacity
-	237, // 316: agentcompose.v2.MoveNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
-	21,  // 317: agentcompose.v2.ManageEditorRequest.action:type_name -> agentcompose.v2.EditorAction
-	20,  // 318: agentcompose.v2.ManageNodeEnvironmentRequest.action:type_name -> agentcompose.v2.EnvironmentAction
-	154, // 319: agentcompose.v2.SyncNodeEnvironmentRequest.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 320: agentcompose.v2.SyncNodeEnvironmentRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	162, // 321: agentcompose.v2.InspectNodeEnvironmentResponse.installed:type_name -> agentcompose.v2.NodeEnvironmentEntry
-	166, // 322: agentcompose.v2.InspectNodeSystemEnvResponse.installed:type_name -> agentcompose.v2.NodeSystemEnvEntry
-	154, // 323: agentcompose.v2.SyncNodeSystemEnvRequest.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 324: agentcompose.v2.SyncNodeSystemEnvRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	166, // 325: agentcompose.v2.SyncNodeSystemEnvResponse.touched:type_name -> agentcompose.v2.NodeSystemEnvEntry
-	237, // 326: agentcompose.v2.ApproveNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
-	237, // 327: agentcompose.v2.RevokeNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
-	17,  // 328: agentcompose.v2.OnboardNodeRequest.role:type_name -> agentcompose.v2.NodeRole
-	18,  // 329: agentcompose.v2.OnboardNodeRequest.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
-	332, // 330: agentcompose.v2.OnboardNodeRequest.labels:type_name -> agentcompose.v2.OnboardNodeRequest.LabelsEntry
-	237, // 331: agentcompose.v2.OnboardNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
-	237, // 332: agentcompose.v2.RevokeOnboardNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
-	208, // 333: agentcompose.v2.DispatchSessionRequest.session:type_name -> agentcompose.v2.NodeCreateSession
-	210, // 334: agentcompose.v2.ConfigureNodeSessionLLMRequest.llm:type_name -> agentcompose.v2.NodeLLMConfig
-	53,  // 335: agentcompose.v2.ApplyNodeSessionMCPsRequest.mcps:type_name -> agentcompose.v2.MCPServerSpec
-	154, // 336: agentcompose.v2.ApplyNodeSessionSkillsRequest.skills:type_name -> agentcompose.v2.SkillSpec
-	211, // 337: agentcompose.v2.ApplyNodeSessionPluginsRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
-	229, // 338: agentcompose.v2.NodeSessionEvent.output:type_name -> agentcompose.v2.NodeSessionOutput
-	230, // 339: agentcompose.v2.NodeSessionEvent.result:type_name -> agentcompose.v2.NodeSessionResult
-	290, // 340: agentcompose.v2.NodeSessionEvent.structured:type_name -> agentcompose.v2.NodeSessionEventStructured
-	333, // 341: agentcompose.v2.NodeProxyRequest.headers:type_name -> agentcompose.v2.NodeProxyRequest.HeadersEntry
-	24,  // 342: agentcompose.v2.NodeIosDevice.connection_type:type_name -> agentcompose.v2.IosConnectionType
-	25,  // 343: agentcompose.v2.NodeIosDevice.wda_state:type_name -> agentcompose.v2.IosWdaState
-	293, // 344: agentcompose.v2.NodeIosDevicesReport.devices:type_name -> agentcompose.v2.NodeIosDevice
-	27,  // 345: agentcompose.v2.NodeIosSigningMaterial.mode:type_name -> agentcompose.v2.IosSigningMode
-	26,  // 346: agentcompose.v2.NodeIosWdaJobRequest.action:type_name -> agentcompose.v2.IosWdaJobAction
-	299, // 347: agentcompose.v2.NodeIosWdaJobRequest.artifact:type_name -> agentcompose.v2.NodeIosWdaArtifact
-	298, // 348: agentcompose.v2.NodeIosWdaJobRequest.signing:type_name -> agentcompose.v2.NodeIosSigningMaterial
-	28,  // 349: agentcompose.v2.NodeIosJobEvent.stage:type_name -> agentcompose.v2.IosJobStage
-	28,  // 350: agentcompose.v2.NodeIosJobResult.stage_reached:type_name -> agentcompose.v2.IosJobStage
-	29,  // 351: agentcompose.v2.ProjectService.ValidateProject:input_type -> agentcompose.v2.ValidateProjectRequest
-	31,  // 352: agentcompose.v2.ProjectService.ApplyProject:input_type -> agentcompose.v2.ApplyProjectRequest
-	33,  // 353: agentcompose.v2.ProjectService.GetProject:input_type -> agentcompose.v2.GetProjectRequest
-	35,  // 354: agentcompose.v2.ProjectService.ListProjects:input_type -> agentcompose.v2.ListProjectsRequest
-	37,  // 355: agentcompose.v2.ProjectService.RemoveProject:input_type -> agentcompose.v2.RemoveProjectRequest
-	39,  // 356: agentcompose.v2.ProjectService.WatchProject:input_type -> agentcompose.v2.WatchProjectRequest
-	67,  // 357: agentcompose.v2.RunService.RunAgent:input_type -> agentcompose.v2.RunAgentRequest
-	152, // 358: agentcompose.v2.RunService.StartRun:input_type -> agentcompose.v2.StartRunRequest
-	67,  // 359: agentcompose.v2.RunService.RunAgentStream:input_type -> agentcompose.v2.RunAgentRequest
-	70,  // 360: agentcompose.v2.RunService.RunAttach:input_type -> agentcompose.v2.RunAttachRequest
-	74,  // 361: agentcompose.v2.RunService.GetRun:input_type -> agentcompose.v2.GetRunRequest
-	76,  // 362: agentcompose.v2.RunService.ListRuns:input_type -> agentcompose.v2.ListRunsRequest
-	78,  // 363: agentcompose.v2.RunService.FollowRunLogs:input_type -> agentcompose.v2.FollowRunLogsRequest
-	80,  // 364: agentcompose.v2.RunService.StopRun:input_type -> agentcompose.v2.StopRunRequest
-	90,  // 365: agentcompose.v2.ExecService.Exec:input_type -> agentcompose.v2.ExecRequest
-	90,  // 366: agentcompose.v2.ExecService.ExecStream:input_type -> agentcompose.v2.ExecRequest
-	95,  // 367: agentcompose.v2.ExecService.ExecAttach:input_type -> agentcompose.v2.ExecAttachRequest
-	112, // 368: agentcompose.v2.ImageService.ListImages:input_type -> agentcompose.v2.ListImagesRequest
-	114, // 369: agentcompose.v2.ImageService.PullImage:input_type -> agentcompose.v2.PullImageRequest
-	116, // 370: agentcompose.v2.ImageService.InspectImage:input_type -> agentcompose.v2.InspectImageRequest
-	118, // 371: agentcompose.v2.ImageService.RemoveImage:input_type -> agentcompose.v2.RemoveImageRequest
-	120, // 372: agentcompose.v2.ImageService.BuildImage:input_type -> agentcompose.v2.BuildImageRequest
-	123, // 373: agentcompose.v2.CacheService.ListCaches:input_type -> agentcompose.v2.ListCachesRequest
-	125, // 374: agentcompose.v2.CacheService.InspectCache:input_type -> agentcompose.v2.InspectCacheRequest
-	127, // 375: agentcompose.v2.CacheService.PruneCaches:input_type -> agentcompose.v2.PruneCachesRequest
-	129, // 376: agentcompose.v2.CacheService.RemoveCache:input_type -> agentcompose.v2.RemoveCacheRequest
-	133, // 377: agentcompose.v2.VolumeService.ListVolumes:input_type -> agentcompose.v2.ListVolumesRequest
-	135, // 378: agentcompose.v2.VolumeService.CreateVolume:input_type -> agentcompose.v2.CreateVolumeRequest
-	137, // 379: agentcompose.v2.VolumeService.InspectVolume:input_type -> agentcompose.v2.InspectVolumeRequest
-	139, // 380: agentcompose.v2.VolumeService.RemoveVolume:input_type -> agentcompose.v2.RemoveVolumeRequest
-	141, // 381: agentcompose.v2.VolumeService.PruneVolumes:input_type -> agentcompose.v2.PruneVolumesRequest
-	82,  // 382: agentcompose.v2.SandboxService.RemoveSandbox:input_type -> agentcompose.v2.RemoveSandboxRequest
-	84,  // 383: agentcompose.v2.SandboxService.GetSandboxStats:input_type -> agentcompose.v2.GetSandboxStatsRequest
-	155, // 384: agentcompose.v2.NodeService.NodeConnect:input_type -> agentcompose.v2.NodeUpstreamFrame
-	235, // 385: agentcompose.v2.NodeService.ListNodes:input_type -> agentcompose.v2.ListNodesRequest
-	201, // 386: agentcompose.v2.NodeService.GetPublicIPLookupConfig:input_type -> agentcompose.v2.GetPublicIPLookupConfigRequest
-	202, // 387: agentcompose.v2.NodeService.UpdatePublicIPLookupConfig:input_type -> agentcompose.v2.UpdatePublicIPLookupConfigRequest
-	203, // 388: agentcompose.v2.NodeService.GetNodeProxyConfig:input_type -> agentcompose.v2.GetNodeProxyConfigRequest
-	204, // 389: agentcompose.v2.NodeService.UpdateNodeProxyConfig:input_type -> agentcompose.v2.UpdateNodeProxyConfigRequest
-	205, // 390: agentcompose.v2.NodeService.SetNodeLastProxy:input_type -> agentcompose.v2.SetNodeLastProxyRequest
-	239, // 391: agentcompose.v2.NodeService.SetNodeCapacity:input_type -> agentcompose.v2.SetNodeCapacityRequest
-	241, // 392: agentcompose.v2.NodeService.MoveNode:input_type -> agentcompose.v2.MoveNodeRequest
-	243, // 393: agentcompose.v2.NodeService.ManageEditor:input_type -> agentcompose.v2.ManageEditorRequest
-	245, // 394: agentcompose.v2.NodeService.ManageNodeEnvironment:input_type -> agentcompose.v2.ManageNodeEnvironmentRequest
-	247, // 395: agentcompose.v2.NodeService.SyncNodeEnvironment:input_type -> agentcompose.v2.SyncNodeEnvironmentRequest
-	249, // 396: agentcompose.v2.NodeService.InspectNodeEnvironment:input_type -> agentcompose.v2.InspectNodeEnvironmentRequest
-	251, // 397: agentcompose.v2.NodeService.InspectNodeSystemEnv:input_type -> agentcompose.v2.InspectNodeSystemEnvRequest
-	253, // 398: agentcompose.v2.NodeService.SyncNodeSystemEnv:input_type -> agentcompose.v2.SyncNodeSystemEnvRequest
-	255, // 399: agentcompose.v2.NodeService.ArchiveNodeSystemEnvResource:input_type -> agentcompose.v2.ArchiveNodeSystemEnvResourceRequest
-	257, // 400: agentcompose.v2.NodeService.SelfUpgradeNode:input_type -> agentcompose.v2.SelfUpgradeNodeRequest
-	259, // 401: agentcompose.v2.NodeService.RuntimeUpgradeNode:input_type -> agentcompose.v2.RuntimeUpgradeNodeRequest
-	261, // 402: agentcompose.v2.NodeService.HostExec:input_type -> agentcompose.v2.HostExecRequest
-	263, // 403: agentcompose.v2.NodeService.HostFileUpload:input_type -> agentcompose.v2.HostFileUploadRequest
-	265, // 404: agentcompose.v2.NodeService.ApproveNode:input_type -> agentcompose.v2.ApproveNodeRequest
-	267, // 405: agentcompose.v2.NodeService.RevokeNode:input_type -> agentcompose.v2.RevokeNodeRequest
-	269, // 406: agentcompose.v2.NodeService.DeleteNode:input_type -> agentcompose.v2.DeleteNodeRequest
-	271, // 407: agentcompose.v2.NodeService.OnboardNode:input_type -> agentcompose.v2.OnboardNodeRequest
-	273, // 408: agentcompose.v2.NodeService.RevokeOnboardNode:input_type -> agentcompose.v2.RevokeOnboardNodeRequest
-	275, // 409: agentcompose.v2.NodeService.DispatchSession:input_type -> agentcompose.v2.DispatchSessionRequest
-	286, // 410: agentcompose.v2.NodeService.DeleteNodeSession:input_type -> agentcompose.v2.DeleteNodeSessionRequest
-	288, // 411: agentcompose.v2.NodeService.FollowNodeSession:input_type -> agentcompose.v2.FollowNodeSessionRequest
-	225, // 412: agentcompose.v2.NodeService.SendSessionInput:input_type -> agentcompose.v2.SendSessionInputRequest
-	277, // 413: agentcompose.v2.NodeService.ConfigureNodeSessionLLM:input_type -> agentcompose.v2.ConfigureNodeSessionLLMRequest
-	278, // 414: agentcompose.v2.NodeService.ApplyNodeSessionMCPs:input_type -> agentcompose.v2.ApplyNodeSessionMCPsRequest
-	279, // 415: agentcompose.v2.NodeService.ApplyNodeSessionSkills:input_type -> agentcompose.v2.ApplyNodeSessionSkillsRequest
-	280, // 416: agentcompose.v2.NodeService.ApplyNodeSessionPlugins:input_type -> agentcompose.v2.ApplyNodeSessionPluginsRequest
-	281, // 417: agentcompose.v2.NodeService.ConfigureNodeSessionMode:input_type -> agentcompose.v2.ConfigureNodeSessionModeRequest
-	282, // 418: agentcompose.v2.NodeService.StartNodeSessionRuntime:input_type -> agentcompose.v2.StartNodeSessionRuntimeRequest
-	283, // 419: agentcompose.v2.NodeService.RestartNodeSessionRuntime:input_type -> agentcompose.v2.RestartNodeSessionRuntimeRequest
-	284, // 420: agentcompose.v2.NodeService.CollectNodeSessionArtifacts:input_type -> agentcompose.v2.CollectNodeSessionArtifactsRequest
-	30,  // 421: agentcompose.v2.ProjectService.ValidateProject:output_type -> agentcompose.v2.ValidateProjectResponse
-	32,  // 422: agentcompose.v2.ProjectService.ApplyProject:output_type -> agentcompose.v2.ApplyProjectResponse
-	34,  // 423: agentcompose.v2.ProjectService.GetProject:output_type -> agentcompose.v2.GetProjectResponse
-	36,  // 424: agentcompose.v2.ProjectService.ListProjects:output_type -> agentcompose.v2.ListProjectsResponse
-	38,  // 425: agentcompose.v2.ProjectService.RemoveProject:output_type -> agentcompose.v2.RemoveProjectResponse
-	40,  // 426: agentcompose.v2.ProjectService.WatchProject:output_type -> agentcompose.v2.WatchProjectResponse
-	68,  // 427: agentcompose.v2.RunService.RunAgent:output_type -> agentcompose.v2.RunAgentResponse
-	153, // 428: agentcompose.v2.RunService.StartRun:output_type -> agentcompose.v2.StartRunResponse
-	69,  // 429: agentcompose.v2.RunService.RunAgentStream:output_type -> agentcompose.v2.RunAgentStreamResponse
-	71,  // 430: agentcompose.v2.RunService.RunAttach:output_type -> agentcompose.v2.RunAttachResponse
-	75,  // 431: agentcompose.v2.RunService.GetRun:output_type -> agentcompose.v2.GetRunResponse
-	77,  // 432: agentcompose.v2.RunService.ListRuns:output_type -> agentcompose.v2.ListRunsResponse
-	79,  // 433: agentcompose.v2.RunService.FollowRunLogs:output_type -> agentcompose.v2.RunLogChunk
-	81,  // 434: agentcompose.v2.RunService.StopRun:output_type -> agentcompose.v2.StopRunResponse
-	93,  // 435: agentcompose.v2.ExecService.Exec:output_type -> agentcompose.v2.ExecResponse
-	94,  // 436: agentcompose.v2.ExecService.ExecStream:output_type -> agentcompose.v2.ExecStreamResponse
-	96,  // 437: agentcompose.v2.ExecService.ExecAttach:output_type -> agentcompose.v2.ExecAttachResponse
-	113, // 438: agentcompose.v2.ImageService.ListImages:output_type -> agentcompose.v2.ListImagesResponse
-	115, // 439: agentcompose.v2.ImageService.PullImage:output_type -> agentcompose.v2.PullImageResponse
-	117, // 440: agentcompose.v2.ImageService.InspectImage:output_type -> agentcompose.v2.InspectImageResponse
-	119, // 441: agentcompose.v2.ImageService.RemoveImage:output_type -> agentcompose.v2.RemoveImageResponse
-	121, // 442: agentcompose.v2.ImageService.BuildImage:output_type -> agentcompose.v2.BuildImageEvent
-	124, // 443: agentcompose.v2.CacheService.ListCaches:output_type -> agentcompose.v2.ListCachesResponse
-	126, // 444: agentcompose.v2.CacheService.InspectCache:output_type -> agentcompose.v2.InspectCacheResponse
-	128, // 445: agentcompose.v2.CacheService.PruneCaches:output_type -> agentcompose.v2.PruneCachesResponse
-	130, // 446: agentcompose.v2.CacheService.RemoveCache:output_type -> agentcompose.v2.RemoveCacheResponse
-	134, // 447: agentcompose.v2.VolumeService.ListVolumes:output_type -> agentcompose.v2.ListVolumesResponse
-	136, // 448: agentcompose.v2.VolumeService.CreateVolume:output_type -> agentcompose.v2.CreateVolumeResponse
-	138, // 449: agentcompose.v2.VolumeService.InspectVolume:output_type -> agentcompose.v2.InspectVolumeResponse
-	140, // 450: agentcompose.v2.VolumeService.RemoveVolume:output_type -> agentcompose.v2.RemoveVolumeResponse
-	142, // 451: agentcompose.v2.VolumeService.PruneVolumes:output_type -> agentcompose.v2.PruneVolumesResponse
-	83,  // 452: agentcompose.v2.SandboxService.RemoveSandbox:output_type -> agentcompose.v2.RemoveSandboxResponse
-	85,  // 453: agentcompose.v2.SandboxService.GetSandboxStats:output_type -> agentcompose.v2.GetSandboxStatsResponse
-	156, // 454: agentcompose.v2.NodeService.NodeConnect:output_type -> agentcompose.v2.NodeDownstreamFrame
-	236, // 455: agentcompose.v2.NodeService.ListNodes:output_type -> agentcompose.v2.ListNodesResponse
-	199, // 456: agentcompose.v2.NodeService.GetPublicIPLookupConfig:output_type -> agentcompose.v2.NodePublicIPLookupConfig
-	199, // 457: agentcompose.v2.NodeService.UpdatePublicIPLookupConfig:output_type -> agentcompose.v2.NodePublicIPLookupConfig
-	200, // 458: agentcompose.v2.NodeService.GetNodeProxyConfig:output_type -> agentcompose.v2.NodeProxyConfig
-	200, // 459: agentcompose.v2.NodeService.UpdateNodeProxyConfig:output_type -> agentcompose.v2.NodeProxyConfig
-	206, // 460: agentcompose.v2.NodeService.SetNodeLastProxy:output_type -> agentcompose.v2.SetNodeLastProxyResponse
-	240, // 461: agentcompose.v2.NodeService.SetNodeCapacity:output_type -> agentcompose.v2.SetNodeCapacityResponse
-	242, // 462: agentcompose.v2.NodeService.MoveNode:output_type -> agentcompose.v2.MoveNodeResponse
-	244, // 463: agentcompose.v2.NodeService.ManageEditor:output_type -> agentcompose.v2.ManageEditorResponse
-	246, // 464: agentcompose.v2.NodeService.ManageNodeEnvironment:output_type -> agentcompose.v2.ManageNodeEnvironmentResponse
-	248, // 465: agentcompose.v2.NodeService.SyncNodeEnvironment:output_type -> agentcompose.v2.SyncNodeEnvironmentResponse
-	250, // 466: agentcompose.v2.NodeService.InspectNodeEnvironment:output_type -> agentcompose.v2.InspectNodeEnvironmentResponse
-	252, // 467: agentcompose.v2.NodeService.InspectNodeSystemEnv:output_type -> agentcompose.v2.InspectNodeSystemEnvResponse
-	254, // 468: agentcompose.v2.NodeService.SyncNodeSystemEnv:output_type -> agentcompose.v2.SyncNodeSystemEnvResponse
-	256, // 469: agentcompose.v2.NodeService.ArchiveNodeSystemEnvResource:output_type -> agentcompose.v2.ArchiveNodeSystemEnvResourceResponse
-	258, // 470: agentcompose.v2.NodeService.SelfUpgradeNode:output_type -> agentcompose.v2.SelfUpgradeNodeResponse
-	260, // 471: agentcompose.v2.NodeService.RuntimeUpgradeNode:output_type -> agentcompose.v2.RuntimeUpgradeNodeResponse
-	262, // 472: agentcompose.v2.NodeService.HostExec:output_type -> agentcompose.v2.HostExecResponse
-	264, // 473: agentcompose.v2.NodeService.HostFileUpload:output_type -> agentcompose.v2.HostFileUploadResponse
-	266, // 474: agentcompose.v2.NodeService.ApproveNode:output_type -> agentcompose.v2.ApproveNodeResponse
-	268, // 475: agentcompose.v2.NodeService.RevokeNode:output_type -> agentcompose.v2.RevokeNodeResponse
-	270, // 476: agentcompose.v2.NodeService.DeleteNode:output_type -> agentcompose.v2.DeleteNodeResponse
-	272, // 477: agentcompose.v2.NodeService.OnboardNode:output_type -> agentcompose.v2.OnboardNodeResponse
-	274, // 478: agentcompose.v2.NodeService.RevokeOnboardNode:output_type -> agentcompose.v2.RevokeOnboardNodeResponse
-	276, // 479: agentcompose.v2.NodeService.DispatchSession:output_type -> agentcompose.v2.DispatchSessionResponse
-	287, // 480: agentcompose.v2.NodeService.DeleteNodeSession:output_type -> agentcompose.v2.DeleteNodeSessionResponse
-	289, // 481: agentcompose.v2.NodeService.FollowNodeSession:output_type -> agentcompose.v2.NodeSessionEvent
-	226, // 482: agentcompose.v2.NodeService.SendSessionInput:output_type -> agentcompose.v2.SendSessionInputResponse
-	285, // 483: agentcompose.v2.NodeService.ConfigureNodeSessionLLM:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 484: agentcompose.v2.NodeService.ApplyNodeSessionMCPs:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 485: agentcompose.v2.NodeService.ApplyNodeSessionSkills:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 486: agentcompose.v2.NodeService.ApplyNodeSessionPlugins:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 487: agentcompose.v2.NodeService.ConfigureNodeSessionMode:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 488: agentcompose.v2.NodeService.StartNodeSessionRuntime:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 489: agentcompose.v2.NodeService.RestartNodeSessionRuntime:output_type -> agentcompose.v2.NodeSessionConfigAck
-	285, // 490: agentcompose.v2.NodeService.CollectNodeSessionArtifacts:output_type -> agentcompose.v2.NodeSessionConfigAck
-	421, // [421:491] is the sub-list for method output_type
-	351, // [351:421] is the sub-list for method input_type
-	351, // [351:351] is the sub-list for extension type_name
-	351, // [351:351] is the sub-list for extension extendee
-	0,   // [0:351] is the sub-list for field type_name
+	192, // 182: agentcompose.v2.NodeUpstreamFrame.register:type_name -> agentcompose.v2.NodeRegister
+	199, // 183: agentcompose.v2.NodeUpstreamFrame.heartbeat:type_name -> agentcompose.v2.NodeHeartbeat
+	230, // 184: agentcompose.v2.NodeUpstreamFrame.session_output:type_name -> agentcompose.v2.NodeSessionOutput
+	231, // 185: agentcompose.v2.NodeUpstreamFrame.session_result:type_name -> agentcompose.v2.NodeSessionResult
+	233, // 186: agentcompose.v2.NodeUpstreamFrame.command_ack:type_name -> agentcompose.v2.NodeCommandAck
+	235, // 187: agentcompose.v2.NodeUpstreamFrame.error:type_name -> agentcompose.v2.NodeError
+	229, // 188: agentcompose.v2.NodeUpstreamFrame.tunnel_response:type_name -> agentcompose.v2.NodeTunnelResponse
+	291, // 189: agentcompose.v2.NodeUpstreamFrame.session_event:type_name -> agentcompose.v2.NodeSessionEventStructured
+	181, // 190: agentcompose.v2.NodeUpstreamFrame.terminal_output:type_name -> agentcompose.v2.NodeTerminalOutput
+	182, // 191: agentcompose.v2.NodeUpstreamFrame.terminal_exit:type_name -> agentcompose.v2.NodeTerminalExit
+	184, // 192: agentcompose.v2.NodeUpstreamFrame.host_exec_result:type_name -> agentcompose.v2.NodeHostExecResult
+	191, // 193: agentcompose.v2.NodeUpstreamFrame.file_upload_result:type_name -> agentcompose.v2.NodeFileUploadResult
+	179, // 194: agentcompose.v2.NodeUpstreamFrame.terminal_list_result:type_name -> agentcompose.v2.NodeTerminalListResult
+	187, // 195: agentcompose.v2.NodeUpstreamFrame.tool_run_event:type_name -> agentcompose.v2.NodeToolRunEvent
+	232, // 196: agentcompose.v2.NodeUpstreamFrame.session_stage:type_name -> agentcompose.v2.NodeSessionStage
+	295, // 197: agentcompose.v2.NodeUpstreamFrame.ios_devices_report:type_name -> agentcompose.v2.NodeIosDevicesReport
+	303, // 198: agentcompose.v2.NodeUpstreamFrame.ios_job_event:type_name -> agentcompose.v2.NodeIosJobEvent
+	304, // 199: agentcompose.v2.NodeUpstreamFrame.ios_job_result:type_name -> agentcompose.v2.NodeIosJobResult
+	307, // 200: agentcompose.v2.NodeUpstreamFrame.node_build_event:type_name -> agentcompose.v2.NodeBuildEvent
+	308, // 201: agentcompose.v2.NodeUpstreamFrame.node_build_result:type_name -> agentcompose.v2.NodeBuildResult
+	311, // 202: agentcompose.v2.NodeUpstreamFrame.host_tool_job_event:type_name -> agentcompose.v2.NodeHostToolJobEvent
+	312, // 203: agentcompose.v2.NodeUpstreamFrame.host_tool_job_result:type_name -> agentcompose.v2.NodeHostToolJobResult
+	170, // 204: agentcompose.v2.NodeUpstreamFrame.node_upgrade_event:type_name -> agentcompose.v2.NodeUpgradeEvent
+	208, // 205: agentcompose.v2.NodeDownstreamFrame.registered:type_name -> agentcompose.v2.NodeRegistered
+	209, // 206: agentcompose.v2.NodeDownstreamFrame.create_session:type_name -> agentcompose.v2.NodeCreateSession
+	221, // 207: agentcompose.v2.NodeDownstreamFrame.delete_session:type_name -> agentcompose.v2.NodeDeleteSession
+	222, // 208: agentcompose.v2.NodeDownstreamFrame.list_sessions:type_name -> agentcompose.v2.NodeListSessions
+	235, // 209: agentcompose.v2.NodeDownstreamFrame.error:type_name -> agentcompose.v2.NodeError
+	228, // 210: agentcompose.v2.NodeDownstreamFrame.tunnel_request:type_name -> agentcompose.v2.NodeTunnelRequest
+	223, // 211: agentcompose.v2.NodeDownstreamFrame.session_input:type_name -> agentcompose.v2.NodeSessionInput
+	224, // 212: agentcompose.v2.NodeDownstreamFrame.create_execution_node:type_name -> agentcompose.v2.NodeCreateExecutionNode
+	225, // 213: agentcompose.v2.NodeDownstreamFrame.delete_execution_node:type_name -> agentcompose.v2.NodeDeleteExecutionNode
+	193, // 214: agentcompose.v2.NodeDownstreamFrame.server_hello:type_name -> agentcompose.v2.NodeServerHello
+	213, // 215: agentcompose.v2.NodeDownstreamFrame.configure_session_llm:type_name -> agentcompose.v2.ConfigureSessionLLM
+	214, // 216: agentcompose.v2.NodeDownstreamFrame.apply_session_mcps:type_name -> agentcompose.v2.ApplySessionMCPs
+	215, // 217: agentcompose.v2.NodeDownstreamFrame.apply_session_skills:type_name -> agentcompose.v2.ApplySessionSkills
+	216, // 218: agentcompose.v2.NodeDownstreamFrame.apply_session_plugins:type_name -> agentcompose.v2.ApplySessionPlugins
+	218, // 219: agentcompose.v2.NodeDownstreamFrame.start_session_runtime:type_name -> agentcompose.v2.StartSessionRuntime
+	219, // 220: agentcompose.v2.NodeDownstreamFrame.restart_session_runtime:type_name -> agentcompose.v2.RestartSessionRuntime
+	217, // 221: agentcompose.v2.NodeDownstreamFrame.configure_session_mode:type_name -> agentcompose.v2.ConfigureSessionMode
+	220, // 222: agentcompose.v2.NodeDownstreamFrame.collect_session_artifacts:type_name -> agentcompose.v2.CollectSessionArtifacts
+	292, // 223: agentcompose.v2.NodeDownstreamFrame.proxy_request:type_name -> agentcompose.v2.NodeProxyRequest
+	167, // 224: agentcompose.v2.NodeDownstreamFrame.manage_editor:type_name -> agentcompose.v2.NodeManageEditor
+	168, // 225: agentcompose.v2.NodeDownstreamFrame.self_upgrade:type_name -> agentcompose.v2.NodeSelfUpgrade
+	169, // 226: agentcompose.v2.NodeDownstreamFrame.runtime_upgrade:type_name -> agentcompose.v2.NodeRuntimeUpgrade
+	172, // 227: agentcompose.v2.NodeDownstreamFrame.terminal_open:type_name -> agentcompose.v2.NodeTerminalOpen
+	173, // 228: agentcompose.v2.NodeDownstreamFrame.terminal_input:type_name -> agentcompose.v2.NodeTerminalInput
+	174, // 229: agentcompose.v2.NodeDownstreamFrame.terminal_resize:type_name -> agentcompose.v2.NodeTerminalResize
+	175, // 230: agentcompose.v2.NodeDownstreamFrame.terminal_close:type_name -> agentcompose.v2.NodeTerminalClose
+	176, // 231: agentcompose.v2.NodeDownstreamFrame.terminal_attach:type_name -> agentcompose.v2.NodeTerminalAttach
+	177, // 232: agentcompose.v2.NodeDownstreamFrame.terminal_list:type_name -> agentcompose.v2.NodeTerminalListRequest
+	180, // 233: agentcompose.v2.NodeDownstreamFrame.terminal_interrupt:type_name -> agentcompose.v2.NodeTerminalInterrupt
+	183, // 234: agentcompose.v2.NodeDownstreamFrame.host_exec:type_name -> agentcompose.v2.NodeHostExecRequest
+	190, // 235: agentcompose.v2.NodeDownstreamFrame.file_upload:type_name -> agentcompose.v2.NodeFileUploadRequest
+	200, // 236: agentcompose.v2.NodeDownstreamFrame.public_ip_lookup_config:type_name -> agentcompose.v2.NodePublicIPLookupConfig
+	201, // 237: agentcompose.v2.NodeDownstreamFrame.node_proxy_config:type_name -> agentcompose.v2.NodeProxyConfig
+	185, // 238: agentcompose.v2.NodeDownstreamFrame.tool_run_request:type_name -> agentcompose.v2.NodeToolRunRequest
+	186, // 239: agentcompose.v2.NodeDownstreamFrame.tool_run_stop:type_name -> agentcompose.v2.NodeToolRunStop
+	159, // 240: agentcompose.v2.NodeDownstreamFrame.manage_environment:type_name -> agentcompose.v2.NodeManageEnvironment
+	160, // 241: agentcompose.v2.NodeDownstreamFrame.sync_environment:type_name -> agentcompose.v2.NodeSyncEnvironment
+	161, // 242: agentcompose.v2.NodeDownstreamFrame.inspect_environment:type_name -> agentcompose.v2.NodeInspectEnvironment
+	293, // 243: agentcompose.v2.NodeDownstreamFrame.ios_discover:type_name -> agentcompose.v2.NodeIosDiscover
+	296, // 244: agentcompose.v2.NodeDownstreamFrame.ios_claim_device:type_name -> agentcompose.v2.NodeIosClaimDevice
+	297, // 245: agentcompose.v2.NodeDownstreamFrame.ios_release_device:type_name -> agentcompose.v2.NodeIosReleaseDevice
+	298, // 246: agentcompose.v2.NodeDownstreamFrame.ios_configure_device:type_name -> agentcompose.v2.NodeIosConfigureDevice
+	301, // 247: agentcompose.v2.NodeDownstreamFrame.ios_wda_job:type_name -> agentcompose.v2.NodeIosWdaJobRequest
+	302, // 248: agentcompose.v2.NodeDownstreamFrame.ios_job_cancel:type_name -> agentcompose.v2.NodeIosJobCancel
+	163, // 249: agentcompose.v2.NodeDownstreamFrame.inspect_system_env:type_name -> agentcompose.v2.NodeInspectSystemEnv
+	164, // 250: agentcompose.v2.NodeDownstreamFrame.sync_system_env:type_name -> agentcompose.v2.NodeSyncSystemEnv
+	165, // 251: agentcompose.v2.NodeDownstreamFrame.archive_system_env_resource:type_name -> agentcompose.v2.NodeArchiveSystemEnvResource
+	305, // 252: agentcompose.v2.NodeDownstreamFrame.node_build:type_name -> agentcompose.v2.NodeBuildRequest
+	306, // 253: agentcompose.v2.NodeDownstreamFrame.node_build_cancel:type_name -> agentcompose.v2.NodeBuildCancel
+	171, // 254: agentcompose.v2.NodeDownstreamFrame.install_host_tool:type_name -> agentcompose.v2.NodeInstallHostTool
+	309, // 255: agentcompose.v2.NodeDownstreamFrame.host_tool_job:type_name -> agentcompose.v2.NodeHostToolJob
+	310, // 256: agentcompose.v2.NodeDownstreamFrame.host_tool_job_cancel:type_name -> agentcompose.v2.NodeHostToolJobCancel
+	158, // 257: agentcompose.v2.NodeDownstreamFrame.refresh_labels:type_name -> agentcompose.v2.NodeRefreshLabelsRequest
+	157, // 258: agentcompose.v2.NodeDownstreamFrame.ios_runner_control:type_name -> agentcompose.v2.NodeIosRunnerControl
+	19,  // 259: agentcompose.v2.NodeIosRunnerControl.action:type_name -> agentcompose.v2.IosRunnerControlAction
+	20,  // 260: agentcompose.v2.NodeManageEnvironment.action:type_name -> agentcompose.v2.EnvironmentAction
+	210, // 261: agentcompose.v2.NodeManageEnvironment.git:type_name -> agentcompose.v2.NodeGitSpec
+	154, // 262: agentcompose.v2.NodeSyncEnvironment.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 263: agentcompose.v2.NodeSyncEnvironment.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	154, // 264: agentcompose.v2.NodeSyncSystemEnv.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 265: agentcompose.v2.NodeSyncSystemEnv.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	21,  // 266: agentcompose.v2.NodeManageEditor.action:type_name -> agentcompose.v2.EditorAction
+	98,  // 267: agentcompose.v2.NodeTerminalOpen.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
+	98,  // 268: agentcompose.v2.NodeTerminalResize.terminal_size:type_name -> agentcompose.v2.AttachTerminalSize
+	178, // 269: agentcompose.v2.NodeTerminalListResult.terminals:type_name -> agentcompose.v2.NodeTerminalStatus
+	324, // 270: agentcompose.v2.NodeToolRunRequest.env:type_name -> agentcompose.v2.NodeToolRunRequest.EnvEntry
+	22,  // 271: agentcompose.v2.NodeToolRunEvent.kind:type_name -> agentcompose.v2.NodeToolRunKind
+	197, // 272: agentcompose.v2.NodeRegister.capabilities:type_name -> agentcompose.v2.NodeCapabilities
+	17,  // 273: agentcompose.v2.NodeRegister.role:type_name -> agentcompose.v2.NodeRole
+	325, // 274: agentcompose.v2.EditorModeSpec.native:type_name -> agentcompose.v2.EditorModeSpec.NativeEntry
+	194, // 275: agentcompose.v2.EditorModeSpec.semantics:type_name -> agentcompose.v2.EditorModeSemantics
+	195, // 276: agentcompose.v2.EditorCapability.modes:type_name -> agentcompose.v2.EditorModeSpec
+	326, // 277: agentcompose.v2.NodeCapabilities.labels:type_name -> agentcompose.v2.NodeCapabilities.LabelsEntry
+	196, // 278: agentcompose.v2.NodeCapabilities.editors:type_name -> agentcompose.v2.EditorCapability
+	198, // 279: agentcompose.v2.NodeHeartbeat.public_ip_report:type_name -> agentcompose.v2.NodePublicIPReport
+	188, // 280: agentcompose.v2.NodeHeartbeat.active_tool_runs:type_name -> agentcompose.v2.NodeActiveToolRun
+	16,  // 281: agentcompose.v2.NodeRegistered.status:type_name -> agentcompose.v2.NodeStatus
+	210, // 282: agentcompose.v2.NodeCreateSession.git:type_name -> agentcompose.v2.NodeGitSpec
+	211, // 283: agentcompose.v2.NodeCreateSession.llm:type_name -> agentcompose.v2.NodeLLMConfig
+	53,  // 284: agentcompose.v2.NodeCreateSession.mcps:type_name -> agentcompose.v2.MCPServerSpec
+	154, // 285: agentcompose.v2.NodeCreateSession.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 286: agentcompose.v2.NodeCreateSession.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	57,  // 287: agentcompose.v2.NodeCreateSession.env:type_name -> agentcompose.v2.EnvVarSpec
+	55,  // 288: agentcompose.v2.NodeCreateSession.volumes:type_name -> agentcompose.v2.VolumeMountSpec
+	327, // 289: agentcompose.v2.NodeCreateSession.tags:type_name -> agentcompose.v2.NodeCreateSession.TagsEntry
+	328, // 290: agentcompose.v2.NodeLLMConfig.headers:type_name -> agentcompose.v2.NodeLLMConfig.HeadersEntry
+	329, // 291: agentcompose.v2.NodeLLMConfig.extra:type_name -> agentcompose.v2.NodeLLMConfig.ExtraEntry
+	211, // 292: agentcompose.v2.ConfigureSessionLLM.llm:type_name -> agentcompose.v2.NodeLLMConfig
+	53,  // 293: agentcompose.v2.ApplySessionMCPs.mcps:type_name -> agentcompose.v2.MCPServerSpec
+	154, // 294: agentcompose.v2.ApplySessionSkills.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 295: agentcompose.v2.ApplySessionPlugins.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	211, // 296: agentcompose.v2.NodeSessionInput.llm:type_name -> agentcompose.v2.NodeLLMConfig
+	18,  // 297: agentcompose.v2.NodeCreateExecutionNode.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
+	57,  // 298: agentcompose.v2.NodeCreateExecutionNode.env:type_name -> agentcompose.v2.EnvVarSpec
+	330, // 299: agentcompose.v2.NodeCreateExecutionNode.labels:type_name -> agentcompose.v2.NodeCreateExecutionNode.LabelsEntry
+	211, // 300: agentcompose.v2.SendSessionInputRequest.llm:type_name -> agentcompose.v2.NodeLLMConfig
+	331, // 301: agentcompose.v2.NodeTunnelRequest.headers:type_name -> agentcompose.v2.NodeTunnelRequest.HeadersEntry
+	332, // 302: agentcompose.v2.NodeTunnelResponse.headers:type_name -> agentcompose.v2.NodeTunnelResponse.HeadersEntry
+	9,   // 303: agentcompose.v2.NodeSessionOutput.stream:type_name -> agentcompose.v2.StdioStream
+	23,  // 304: agentcompose.v2.NodeSessionStage.stage:type_name -> agentcompose.v2.SessionStage
+	234, // 305: agentcompose.v2.NodeCommandAck.sessions:type_name -> agentcompose.v2.NodeSessionSummary
+	162, // 306: agentcompose.v2.NodeCommandAck.environment_inventory:type_name -> agentcompose.v2.NodeEnvironmentEntry
+	166, // 307: agentcompose.v2.NodeCommandAck.system_env_inventory:type_name -> agentcompose.v2.NodeSystemEnvEntry
+	197, // 308: agentcompose.v2.NodeCommandAck.refreshed_capabilities:type_name -> agentcompose.v2.NodeCapabilities
+	16,  // 309: agentcompose.v2.ListNodesRequest.status:type_name -> agentcompose.v2.NodeStatus
+	238, // 310: agentcompose.v2.ListNodesResponse.nodes:type_name -> agentcompose.v2.NodeInfo
+	16,  // 311: agentcompose.v2.NodeInfo.status:type_name -> agentcompose.v2.NodeStatus
+	197, // 312: agentcompose.v2.NodeInfo.capabilities:type_name -> agentcompose.v2.NodeCapabilities
+	17,  // 313: agentcompose.v2.NodeInfo.role:type_name -> agentcompose.v2.NodeRole
+	18,  // 314: agentcompose.v2.NodeInfo.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
+	239, // 315: agentcompose.v2.NodeInfo.capacity:type_name -> agentcompose.v2.NodeCapacity
+	239, // 316: agentcompose.v2.SetNodeCapacityRequest.capacity:type_name -> agentcompose.v2.NodeCapacity
+	239, // 317: agentcompose.v2.SetNodeCapacityResponse.capacity:type_name -> agentcompose.v2.NodeCapacity
+	238, // 318: agentcompose.v2.MoveNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
+	21,  // 319: agentcompose.v2.ManageEditorRequest.action:type_name -> agentcompose.v2.EditorAction
+	20,  // 320: agentcompose.v2.ManageNodeEnvironmentRequest.action:type_name -> agentcompose.v2.EnvironmentAction
+	154, // 321: agentcompose.v2.SyncNodeEnvironmentRequest.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 322: agentcompose.v2.SyncNodeEnvironmentRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	162, // 323: agentcompose.v2.InspectNodeEnvironmentResponse.installed:type_name -> agentcompose.v2.NodeEnvironmentEntry
+	166, // 324: agentcompose.v2.InspectNodeSystemEnvResponse.installed:type_name -> agentcompose.v2.NodeSystemEnvEntry
+	154, // 325: agentcompose.v2.SyncNodeSystemEnvRequest.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 326: agentcompose.v2.SyncNodeSystemEnvRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	166, // 327: agentcompose.v2.SyncNodeSystemEnvResponse.touched:type_name -> agentcompose.v2.NodeSystemEnvEntry
+	238, // 328: agentcompose.v2.ApproveNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
+	238, // 329: agentcompose.v2.RevokeNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
+	17,  // 330: agentcompose.v2.OnboardNodeRequest.role:type_name -> agentcompose.v2.NodeRole
+	18,  // 331: agentcompose.v2.OnboardNodeRequest.startup_method:type_name -> agentcompose.v2.NodeStartupMethod
+	333, // 332: agentcompose.v2.OnboardNodeRequest.labels:type_name -> agentcompose.v2.OnboardNodeRequest.LabelsEntry
+	238, // 333: agentcompose.v2.OnboardNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
+	238, // 334: agentcompose.v2.RevokeOnboardNodeResponse.node:type_name -> agentcompose.v2.NodeInfo
+	209, // 335: agentcompose.v2.DispatchSessionRequest.session:type_name -> agentcompose.v2.NodeCreateSession
+	211, // 336: agentcompose.v2.ConfigureNodeSessionLLMRequest.llm:type_name -> agentcompose.v2.NodeLLMConfig
+	53,  // 337: agentcompose.v2.ApplyNodeSessionMCPsRequest.mcps:type_name -> agentcompose.v2.MCPServerSpec
+	154, // 338: agentcompose.v2.ApplyNodeSessionSkillsRequest.skills:type_name -> agentcompose.v2.SkillSpec
+	212, // 339: agentcompose.v2.ApplyNodeSessionPluginsRequest.plugins:type_name -> agentcompose.v2.NodePluginSpec
+	230, // 340: agentcompose.v2.NodeSessionEvent.output:type_name -> agentcompose.v2.NodeSessionOutput
+	231, // 341: agentcompose.v2.NodeSessionEvent.result:type_name -> agentcompose.v2.NodeSessionResult
+	291, // 342: agentcompose.v2.NodeSessionEvent.structured:type_name -> agentcompose.v2.NodeSessionEventStructured
+	334, // 343: agentcompose.v2.NodeProxyRequest.headers:type_name -> agentcompose.v2.NodeProxyRequest.HeadersEntry
+	24,  // 344: agentcompose.v2.NodeIosDevice.connection_type:type_name -> agentcompose.v2.IosConnectionType
+	25,  // 345: agentcompose.v2.NodeIosDevice.wda_state:type_name -> agentcompose.v2.IosWdaState
+	294, // 346: agentcompose.v2.NodeIosDevicesReport.devices:type_name -> agentcompose.v2.NodeIosDevice
+	27,  // 347: agentcompose.v2.NodeIosSigningMaterial.mode:type_name -> agentcompose.v2.IosSigningMode
+	26,  // 348: agentcompose.v2.NodeIosWdaJobRequest.action:type_name -> agentcompose.v2.IosWdaJobAction
+	300, // 349: agentcompose.v2.NodeIosWdaJobRequest.artifact:type_name -> agentcompose.v2.NodeIosWdaArtifact
+	299, // 350: agentcompose.v2.NodeIosWdaJobRequest.signing:type_name -> agentcompose.v2.NodeIosSigningMaterial
+	28,  // 351: agentcompose.v2.NodeIosJobEvent.stage:type_name -> agentcompose.v2.IosJobStage
+	28,  // 352: agentcompose.v2.NodeIosJobResult.stage_reached:type_name -> agentcompose.v2.IosJobStage
+	29,  // 353: agentcompose.v2.ProjectService.ValidateProject:input_type -> agentcompose.v2.ValidateProjectRequest
+	31,  // 354: agentcompose.v2.ProjectService.ApplyProject:input_type -> agentcompose.v2.ApplyProjectRequest
+	33,  // 355: agentcompose.v2.ProjectService.GetProject:input_type -> agentcompose.v2.GetProjectRequest
+	35,  // 356: agentcompose.v2.ProjectService.ListProjects:input_type -> agentcompose.v2.ListProjectsRequest
+	37,  // 357: agentcompose.v2.ProjectService.RemoveProject:input_type -> agentcompose.v2.RemoveProjectRequest
+	39,  // 358: agentcompose.v2.ProjectService.WatchProject:input_type -> agentcompose.v2.WatchProjectRequest
+	67,  // 359: agentcompose.v2.RunService.RunAgent:input_type -> agentcompose.v2.RunAgentRequest
+	152, // 360: agentcompose.v2.RunService.StartRun:input_type -> agentcompose.v2.StartRunRequest
+	67,  // 361: agentcompose.v2.RunService.RunAgentStream:input_type -> agentcompose.v2.RunAgentRequest
+	70,  // 362: agentcompose.v2.RunService.RunAttach:input_type -> agentcompose.v2.RunAttachRequest
+	74,  // 363: agentcompose.v2.RunService.GetRun:input_type -> agentcompose.v2.GetRunRequest
+	76,  // 364: agentcompose.v2.RunService.ListRuns:input_type -> agentcompose.v2.ListRunsRequest
+	78,  // 365: agentcompose.v2.RunService.FollowRunLogs:input_type -> agentcompose.v2.FollowRunLogsRequest
+	80,  // 366: agentcompose.v2.RunService.StopRun:input_type -> agentcompose.v2.StopRunRequest
+	90,  // 367: agentcompose.v2.ExecService.Exec:input_type -> agentcompose.v2.ExecRequest
+	90,  // 368: agentcompose.v2.ExecService.ExecStream:input_type -> agentcompose.v2.ExecRequest
+	95,  // 369: agentcompose.v2.ExecService.ExecAttach:input_type -> agentcompose.v2.ExecAttachRequest
+	112, // 370: agentcompose.v2.ImageService.ListImages:input_type -> agentcompose.v2.ListImagesRequest
+	114, // 371: agentcompose.v2.ImageService.PullImage:input_type -> agentcompose.v2.PullImageRequest
+	116, // 372: agentcompose.v2.ImageService.InspectImage:input_type -> agentcompose.v2.InspectImageRequest
+	118, // 373: agentcompose.v2.ImageService.RemoveImage:input_type -> agentcompose.v2.RemoveImageRequest
+	120, // 374: agentcompose.v2.ImageService.BuildImage:input_type -> agentcompose.v2.BuildImageRequest
+	123, // 375: agentcompose.v2.CacheService.ListCaches:input_type -> agentcompose.v2.ListCachesRequest
+	125, // 376: agentcompose.v2.CacheService.InspectCache:input_type -> agentcompose.v2.InspectCacheRequest
+	127, // 377: agentcompose.v2.CacheService.PruneCaches:input_type -> agentcompose.v2.PruneCachesRequest
+	129, // 378: agentcompose.v2.CacheService.RemoveCache:input_type -> agentcompose.v2.RemoveCacheRequest
+	133, // 379: agentcompose.v2.VolumeService.ListVolumes:input_type -> agentcompose.v2.ListVolumesRequest
+	135, // 380: agentcompose.v2.VolumeService.CreateVolume:input_type -> agentcompose.v2.CreateVolumeRequest
+	137, // 381: agentcompose.v2.VolumeService.InspectVolume:input_type -> agentcompose.v2.InspectVolumeRequest
+	139, // 382: agentcompose.v2.VolumeService.RemoveVolume:input_type -> agentcompose.v2.RemoveVolumeRequest
+	141, // 383: agentcompose.v2.VolumeService.PruneVolumes:input_type -> agentcompose.v2.PruneVolumesRequest
+	82,  // 384: agentcompose.v2.SandboxService.RemoveSandbox:input_type -> agentcompose.v2.RemoveSandboxRequest
+	84,  // 385: agentcompose.v2.SandboxService.GetSandboxStats:input_type -> agentcompose.v2.GetSandboxStatsRequest
+	155, // 386: agentcompose.v2.NodeService.NodeConnect:input_type -> agentcompose.v2.NodeUpstreamFrame
+	236, // 387: agentcompose.v2.NodeService.ListNodes:input_type -> agentcompose.v2.ListNodesRequest
+	202, // 388: agentcompose.v2.NodeService.GetPublicIPLookupConfig:input_type -> agentcompose.v2.GetPublicIPLookupConfigRequest
+	203, // 389: agentcompose.v2.NodeService.UpdatePublicIPLookupConfig:input_type -> agentcompose.v2.UpdatePublicIPLookupConfigRequest
+	204, // 390: agentcompose.v2.NodeService.GetNodeProxyConfig:input_type -> agentcompose.v2.GetNodeProxyConfigRequest
+	205, // 391: agentcompose.v2.NodeService.UpdateNodeProxyConfig:input_type -> agentcompose.v2.UpdateNodeProxyConfigRequest
+	206, // 392: agentcompose.v2.NodeService.SetNodeLastProxy:input_type -> agentcompose.v2.SetNodeLastProxyRequest
+	240, // 393: agentcompose.v2.NodeService.SetNodeCapacity:input_type -> agentcompose.v2.SetNodeCapacityRequest
+	242, // 394: agentcompose.v2.NodeService.MoveNode:input_type -> agentcompose.v2.MoveNodeRequest
+	244, // 395: agentcompose.v2.NodeService.ManageEditor:input_type -> agentcompose.v2.ManageEditorRequest
+	246, // 396: agentcompose.v2.NodeService.ManageNodeEnvironment:input_type -> agentcompose.v2.ManageNodeEnvironmentRequest
+	248, // 397: agentcompose.v2.NodeService.SyncNodeEnvironment:input_type -> agentcompose.v2.SyncNodeEnvironmentRequest
+	250, // 398: agentcompose.v2.NodeService.InspectNodeEnvironment:input_type -> agentcompose.v2.InspectNodeEnvironmentRequest
+	252, // 399: agentcompose.v2.NodeService.InspectNodeSystemEnv:input_type -> agentcompose.v2.InspectNodeSystemEnvRequest
+	254, // 400: agentcompose.v2.NodeService.SyncNodeSystemEnv:input_type -> agentcompose.v2.SyncNodeSystemEnvRequest
+	256, // 401: agentcompose.v2.NodeService.ArchiveNodeSystemEnvResource:input_type -> agentcompose.v2.ArchiveNodeSystemEnvResourceRequest
+	258, // 402: agentcompose.v2.NodeService.SelfUpgradeNode:input_type -> agentcompose.v2.SelfUpgradeNodeRequest
+	260, // 403: agentcompose.v2.NodeService.RuntimeUpgradeNode:input_type -> agentcompose.v2.RuntimeUpgradeNodeRequest
+	262, // 404: agentcompose.v2.NodeService.HostExec:input_type -> agentcompose.v2.HostExecRequest
+	264, // 405: agentcompose.v2.NodeService.HostFileUpload:input_type -> agentcompose.v2.HostFileUploadRequest
+	266, // 406: agentcompose.v2.NodeService.ApproveNode:input_type -> agentcompose.v2.ApproveNodeRequest
+	268, // 407: agentcompose.v2.NodeService.RevokeNode:input_type -> agentcompose.v2.RevokeNodeRequest
+	270, // 408: agentcompose.v2.NodeService.DeleteNode:input_type -> agentcompose.v2.DeleteNodeRequest
+	272, // 409: agentcompose.v2.NodeService.OnboardNode:input_type -> agentcompose.v2.OnboardNodeRequest
+	274, // 410: agentcompose.v2.NodeService.RevokeOnboardNode:input_type -> agentcompose.v2.RevokeOnboardNodeRequest
+	276, // 411: agentcompose.v2.NodeService.DispatchSession:input_type -> agentcompose.v2.DispatchSessionRequest
+	287, // 412: agentcompose.v2.NodeService.DeleteNodeSession:input_type -> agentcompose.v2.DeleteNodeSessionRequest
+	289, // 413: agentcompose.v2.NodeService.FollowNodeSession:input_type -> agentcompose.v2.FollowNodeSessionRequest
+	226, // 414: agentcompose.v2.NodeService.SendSessionInput:input_type -> agentcompose.v2.SendSessionInputRequest
+	278, // 415: agentcompose.v2.NodeService.ConfigureNodeSessionLLM:input_type -> agentcompose.v2.ConfigureNodeSessionLLMRequest
+	279, // 416: agentcompose.v2.NodeService.ApplyNodeSessionMCPs:input_type -> agentcompose.v2.ApplyNodeSessionMCPsRequest
+	280, // 417: agentcompose.v2.NodeService.ApplyNodeSessionSkills:input_type -> agentcompose.v2.ApplyNodeSessionSkillsRequest
+	281, // 418: agentcompose.v2.NodeService.ApplyNodeSessionPlugins:input_type -> agentcompose.v2.ApplyNodeSessionPluginsRequest
+	282, // 419: agentcompose.v2.NodeService.ConfigureNodeSessionMode:input_type -> agentcompose.v2.ConfigureNodeSessionModeRequest
+	283, // 420: agentcompose.v2.NodeService.StartNodeSessionRuntime:input_type -> agentcompose.v2.StartNodeSessionRuntimeRequest
+	284, // 421: agentcompose.v2.NodeService.RestartNodeSessionRuntime:input_type -> agentcompose.v2.RestartNodeSessionRuntimeRequest
+	285, // 422: agentcompose.v2.NodeService.CollectNodeSessionArtifacts:input_type -> agentcompose.v2.CollectNodeSessionArtifactsRequest
+	30,  // 423: agentcompose.v2.ProjectService.ValidateProject:output_type -> agentcompose.v2.ValidateProjectResponse
+	32,  // 424: agentcompose.v2.ProjectService.ApplyProject:output_type -> agentcompose.v2.ApplyProjectResponse
+	34,  // 425: agentcompose.v2.ProjectService.GetProject:output_type -> agentcompose.v2.GetProjectResponse
+	36,  // 426: agentcompose.v2.ProjectService.ListProjects:output_type -> agentcompose.v2.ListProjectsResponse
+	38,  // 427: agentcompose.v2.ProjectService.RemoveProject:output_type -> agentcompose.v2.RemoveProjectResponse
+	40,  // 428: agentcompose.v2.ProjectService.WatchProject:output_type -> agentcompose.v2.WatchProjectResponse
+	68,  // 429: agentcompose.v2.RunService.RunAgent:output_type -> agentcompose.v2.RunAgentResponse
+	153, // 430: agentcompose.v2.RunService.StartRun:output_type -> agentcompose.v2.StartRunResponse
+	69,  // 431: agentcompose.v2.RunService.RunAgentStream:output_type -> agentcompose.v2.RunAgentStreamResponse
+	71,  // 432: agentcompose.v2.RunService.RunAttach:output_type -> agentcompose.v2.RunAttachResponse
+	75,  // 433: agentcompose.v2.RunService.GetRun:output_type -> agentcompose.v2.GetRunResponse
+	77,  // 434: agentcompose.v2.RunService.ListRuns:output_type -> agentcompose.v2.ListRunsResponse
+	79,  // 435: agentcompose.v2.RunService.FollowRunLogs:output_type -> agentcompose.v2.RunLogChunk
+	81,  // 436: agentcompose.v2.RunService.StopRun:output_type -> agentcompose.v2.StopRunResponse
+	93,  // 437: agentcompose.v2.ExecService.Exec:output_type -> agentcompose.v2.ExecResponse
+	94,  // 438: agentcompose.v2.ExecService.ExecStream:output_type -> agentcompose.v2.ExecStreamResponse
+	96,  // 439: agentcompose.v2.ExecService.ExecAttach:output_type -> agentcompose.v2.ExecAttachResponse
+	113, // 440: agentcompose.v2.ImageService.ListImages:output_type -> agentcompose.v2.ListImagesResponse
+	115, // 441: agentcompose.v2.ImageService.PullImage:output_type -> agentcompose.v2.PullImageResponse
+	117, // 442: agentcompose.v2.ImageService.InspectImage:output_type -> agentcompose.v2.InspectImageResponse
+	119, // 443: agentcompose.v2.ImageService.RemoveImage:output_type -> agentcompose.v2.RemoveImageResponse
+	121, // 444: agentcompose.v2.ImageService.BuildImage:output_type -> agentcompose.v2.BuildImageEvent
+	124, // 445: agentcompose.v2.CacheService.ListCaches:output_type -> agentcompose.v2.ListCachesResponse
+	126, // 446: agentcompose.v2.CacheService.InspectCache:output_type -> agentcompose.v2.InspectCacheResponse
+	128, // 447: agentcompose.v2.CacheService.PruneCaches:output_type -> agentcompose.v2.PruneCachesResponse
+	130, // 448: agentcompose.v2.CacheService.RemoveCache:output_type -> agentcompose.v2.RemoveCacheResponse
+	134, // 449: agentcompose.v2.VolumeService.ListVolumes:output_type -> agentcompose.v2.ListVolumesResponse
+	136, // 450: agentcompose.v2.VolumeService.CreateVolume:output_type -> agentcompose.v2.CreateVolumeResponse
+	138, // 451: agentcompose.v2.VolumeService.InspectVolume:output_type -> agentcompose.v2.InspectVolumeResponse
+	140, // 452: agentcompose.v2.VolumeService.RemoveVolume:output_type -> agentcompose.v2.RemoveVolumeResponse
+	142, // 453: agentcompose.v2.VolumeService.PruneVolumes:output_type -> agentcompose.v2.PruneVolumesResponse
+	83,  // 454: agentcompose.v2.SandboxService.RemoveSandbox:output_type -> agentcompose.v2.RemoveSandboxResponse
+	85,  // 455: agentcompose.v2.SandboxService.GetSandboxStats:output_type -> agentcompose.v2.GetSandboxStatsResponse
+	156, // 456: agentcompose.v2.NodeService.NodeConnect:output_type -> agentcompose.v2.NodeDownstreamFrame
+	237, // 457: agentcompose.v2.NodeService.ListNodes:output_type -> agentcompose.v2.ListNodesResponse
+	200, // 458: agentcompose.v2.NodeService.GetPublicIPLookupConfig:output_type -> agentcompose.v2.NodePublicIPLookupConfig
+	200, // 459: agentcompose.v2.NodeService.UpdatePublicIPLookupConfig:output_type -> agentcompose.v2.NodePublicIPLookupConfig
+	201, // 460: agentcompose.v2.NodeService.GetNodeProxyConfig:output_type -> agentcompose.v2.NodeProxyConfig
+	201, // 461: agentcompose.v2.NodeService.UpdateNodeProxyConfig:output_type -> agentcompose.v2.NodeProxyConfig
+	207, // 462: agentcompose.v2.NodeService.SetNodeLastProxy:output_type -> agentcompose.v2.SetNodeLastProxyResponse
+	241, // 463: agentcompose.v2.NodeService.SetNodeCapacity:output_type -> agentcompose.v2.SetNodeCapacityResponse
+	243, // 464: agentcompose.v2.NodeService.MoveNode:output_type -> agentcompose.v2.MoveNodeResponse
+	245, // 465: agentcompose.v2.NodeService.ManageEditor:output_type -> agentcompose.v2.ManageEditorResponse
+	247, // 466: agentcompose.v2.NodeService.ManageNodeEnvironment:output_type -> agentcompose.v2.ManageNodeEnvironmentResponse
+	249, // 467: agentcompose.v2.NodeService.SyncNodeEnvironment:output_type -> agentcompose.v2.SyncNodeEnvironmentResponse
+	251, // 468: agentcompose.v2.NodeService.InspectNodeEnvironment:output_type -> agentcompose.v2.InspectNodeEnvironmentResponse
+	253, // 469: agentcompose.v2.NodeService.InspectNodeSystemEnv:output_type -> agentcompose.v2.InspectNodeSystemEnvResponse
+	255, // 470: agentcompose.v2.NodeService.SyncNodeSystemEnv:output_type -> agentcompose.v2.SyncNodeSystemEnvResponse
+	257, // 471: agentcompose.v2.NodeService.ArchiveNodeSystemEnvResource:output_type -> agentcompose.v2.ArchiveNodeSystemEnvResourceResponse
+	259, // 472: agentcompose.v2.NodeService.SelfUpgradeNode:output_type -> agentcompose.v2.SelfUpgradeNodeResponse
+	261, // 473: agentcompose.v2.NodeService.RuntimeUpgradeNode:output_type -> agentcompose.v2.RuntimeUpgradeNodeResponse
+	263, // 474: agentcompose.v2.NodeService.HostExec:output_type -> agentcompose.v2.HostExecResponse
+	265, // 475: agentcompose.v2.NodeService.HostFileUpload:output_type -> agentcompose.v2.HostFileUploadResponse
+	267, // 476: agentcompose.v2.NodeService.ApproveNode:output_type -> agentcompose.v2.ApproveNodeResponse
+	269, // 477: agentcompose.v2.NodeService.RevokeNode:output_type -> agentcompose.v2.RevokeNodeResponse
+	271, // 478: agentcompose.v2.NodeService.DeleteNode:output_type -> agentcompose.v2.DeleteNodeResponse
+	273, // 479: agentcompose.v2.NodeService.OnboardNode:output_type -> agentcompose.v2.OnboardNodeResponse
+	275, // 480: agentcompose.v2.NodeService.RevokeOnboardNode:output_type -> agentcompose.v2.RevokeOnboardNodeResponse
+	277, // 481: agentcompose.v2.NodeService.DispatchSession:output_type -> agentcompose.v2.DispatchSessionResponse
+	288, // 482: agentcompose.v2.NodeService.DeleteNodeSession:output_type -> agentcompose.v2.DeleteNodeSessionResponse
+	290, // 483: agentcompose.v2.NodeService.FollowNodeSession:output_type -> agentcompose.v2.NodeSessionEvent
+	227, // 484: agentcompose.v2.NodeService.SendSessionInput:output_type -> agentcompose.v2.SendSessionInputResponse
+	286, // 485: agentcompose.v2.NodeService.ConfigureNodeSessionLLM:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 486: agentcompose.v2.NodeService.ApplyNodeSessionMCPs:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 487: agentcompose.v2.NodeService.ApplyNodeSessionSkills:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 488: agentcompose.v2.NodeService.ApplyNodeSessionPlugins:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 489: agentcompose.v2.NodeService.ConfigureNodeSessionMode:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 490: agentcompose.v2.NodeService.StartNodeSessionRuntime:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 491: agentcompose.v2.NodeService.RestartNodeSessionRuntime:output_type -> agentcompose.v2.NodeSessionConfigAck
+	286, // 492: agentcompose.v2.NodeService.CollectNodeSessionArtifacts:output_type -> agentcompose.v2.NodeSessionConfigAck
+	423, // [423:493] is the sub-list for method output_type
+	353, // [353:423] is the sub-list for method input_type
+	353, // [353:353] is the sub-list for extension type_name
+	353, // [353:353] is the sub-list for extension extendee
+	0,   // [0:353] is the sub-list for field type_name
 }
 
 func init() { file_proto_agentcompose_v2_agentcompose_proto_init() }
@@ -27429,6 +27679,7 @@ func file_proto_agentcompose_v2_agentcompose_proto_init() {
 		(*NodeUpstreamFrame_NodeBuildResult)(nil),
 		(*NodeUpstreamFrame_HostToolJobEvent)(nil),
 		(*NodeUpstreamFrame_HostToolJobResult)(nil),
+		(*NodeUpstreamFrame_NodeUpgradeEvent)(nil),
 	}
 	file_proto_agentcompose_v2_agentcompose_proto_msgTypes[127].OneofWrappers = []any{
 		(*NodeDownstreamFrame_Registered)(nil),
@@ -27486,7 +27737,7 @@ func file_proto_agentcompose_v2_agentcompose_proto_init() {
 		(*NodeDownstreamFrame_RefreshLabels)(nil),
 		(*NodeDownstreamFrame_IosRunnerControl)(nil),
 	}
-	file_proto_agentcompose_v2_agentcompose_proto_msgTypes[260].OneofWrappers = []any{
+	file_proto_agentcompose_v2_agentcompose_proto_msgTypes[261].OneofWrappers = []any{
 		(*NodeSessionEvent_Output)(nil),
 		(*NodeSessionEvent_Result)(nil),
 		(*NodeSessionEvent_Structured)(nil),
@@ -27497,7 +27748,7 @@ func file_proto_agentcompose_v2_agentcompose_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agentcompose_v2_agentcompose_proto_rawDesc), len(file_proto_agentcompose_v2_agentcompose_proto_rawDesc)),
 			NumEnums:      29,
-			NumMessages:   305,
+			NumMessages:   306,
 			NumExtensions: 0,
 			NumServices:   8,
 		},

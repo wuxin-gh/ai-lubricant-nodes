@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -68,6 +69,20 @@ type Options struct {
 	// offers it with no operator action. The server gates iOS device management
 	// frames on this label, independent of the node role.
 	IosMgmtAllowed bool
+	// IosMgmtMode is the raw --ios verdict ("auto"/"on"/"off"). It exists because
+	// IosMgmtAllowed is resolved ONCE at process start: with "auto", a usbmuxd
+	// that was briefly unavailable at boot would strand the capability (and with
+	// it the whole iOS console) for the lifetime of the process, even though the
+	// Apple service came back a minute later. When the mode is "auto" the label
+	// is re-probed on every capability assembly (register + refresh_labels)
+	// instead of trusting the boot-time verdict. Empty = a caller that only sets
+	// IosMgmtAllowed, which keeps the historical sticky behaviour.
+	IosMgmtMode string
+	// WorkRoot is the local directory holding session workspaces. Reported as a
+	// capability label so the server can address an environment's HOME
+	// (``<work_root>/envs/<env_id>``) when it needs the node to read that
+	// environment's editor session records.
+	WorkRoot string
 	TLSInsecure      bool
 	MinBackoff       time.Duration
 	MaxBackoff       time.Duration
@@ -139,9 +154,24 @@ type Client struct {
 	mu            sync.Mutex
 	nodeID        string
 	currentStream *connect.BidiStreamForClient[agentcomposev2.NodeUpstreamFrame, agentcomposev2.NodeDownstreamFrame]
-	publicIP      publicIPState
-	publicIPWake  chan struct{}
-	proxy         proxyState
+	// registered gates EmitUpstream until the server has acked registration.
+	// The stream is live (and setCurrentStream has run) as soon as the hello
+	// arrives, but the server rejects any frame that precedes register with
+	// "first frame must be register" and drops the whole stream. Handler
+	// goroutines that outlive a dispatch call — the iOS device manager's
+	// inventory reports, session output pumps — would otherwise win that race
+	// whenever register's capability probes are slow. Guarded by mu.
+	registered   bool
+	// approved mirrors the registration ack's status. A node that registered but
+	// is still PENDING must not drive devices: the operator has not adopted it
+	// yet, and starting the iOS runner loop there would put the phone into
+	// Automation for a node nobody owns. Approved nodes are the only ones that
+	// serve devices. Guarded by mu; waiters use approvedCond.
+	approved     bool
+	approvedCond *sync.Cond
+	publicIP     publicIPState
+	publicIPWake chan struct{}
+	proxy        proxyState
 	// gatewayOrigin is the DATA service origin (MCP SSE gateway) announced by
 	// the server's NodeServerHello. The node dials the CONTROL plane, which is
 	// a separate process/port serving no /mcp/* routes — relative MCP spec
@@ -154,12 +184,14 @@ type Client struct {
 // NewClient builds a client for the given options. Call SetHandler before Run.
 func NewClient(opts Options, logger *slog.Logger) *Client {
 	httpClient := newNodeHTTPClient(opts)
-	return &Client{
+	c := &Client{
 		opts:         opts,
 		logger:       logger,
 		client:       agentcomposev2connect.NewNodeServiceClient(httpClient, opts.Server),
 		publicIPWake: make(chan struct{}, 1),
 	}
+	c.approvedCond = sync.NewCond(&c.mu)
+	return c
 }
 
 // SetHandler installs the role-specific downstream handler. It is separate from
@@ -319,6 +351,11 @@ func (c *Client) serve(ctx context.Context) error {
 		return fmt.Errorf("expected registration ack, got %T", first.GetFrame())
 	}
 	c.setNodeID(registered.GetNodeId())
+	// Registration is done: from here handler goroutines may emit upstream
+	// frames. Opened only after the ack, never before — see the registered
+	// field's comment for the race this closes.
+	c.setRegistered(true)
+	defer c.setRegistered(false)
 	c.logger.Info("node registered",
 		"node_id", registered.GetNodeId(),
 		"status", registered.GetStatus().String(),
@@ -326,6 +363,7 @@ func (c *Client) serve(ctx context.Context) error {
 	if registered.GetStatus() == agentcomposev2.NodeStatus_NODE_STATUS_REVOKED {
 		return fmt.Errorf("node is revoked by the server")
 	}
+	c.setApproved(registered.GetStatus() == agentcomposev2.NodeStatus_NODE_STATUS_APPROVED)
 
 	// Heartbeat and public-IP resolver loops run alongside downstream dispatch.
 	// The resolver never blocks registration, command handling, or heartbeats.
@@ -337,7 +375,7 @@ func (c *Client) serve(ctx context.Context) error {
 		// cancels streamCtx so the blocked dispatchLoop Receive returns and
 		// serve() unwinds into Run()'s reconnect — otherwise the node would
 		// stay silently offline until the process restarts.
-		c.heartbeatLoop(streamCtx, cancel, stream)
+		c.heartbeatLoop(streamCtx, cancel)
 	}()
 	go func() {
 		defer wg.Done()
@@ -418,11 +456,11 @@ func (c *Client) capabilityLabels(ctx context.Context) map[string]string {
 		labels["system_env"] = "true"
 	}
 	// ios_mgmt advertises that this host can enumerate/drive iPhones (usbmuxd
-	// reachable). Hardcoded like terminal/host_exec: it is a host capability, not
-	// an operator label, so user configuration cannot fake or clear it. The
-	// server gates iOS device management frames on this label alone — role is
-	// irrelevant, so an execution node with a phone attached is drivable.
-	if c.opts.IosMgmtAllowed {
+	// reachable). The boot verdict (opts.IosMgmtAllowed) is only honored for an
+	// explicit --ios on/off: under "auto" the label is re-probed here so a
+	// process that booted before the Apple service was ready recovers on its next
+	// register/refresh instead of staying stranded for its whole lifetime.
+	if c.resolveIosMgmt() {
 		labels["ios_mgmt"] = "true"
 	}
 	// startup_method reports how this node is actually started on its host:
@@ -433,10 +471,34 @@ func (c *Client) capabilityLabels(ctx context.Context) map[string]string {
 	// Hardcoded like terminal/host_exec: it is a binary capability, not an
 	// operator label, so user configuration cannot override it.
 	labels["startup_method"] = StartupMethodLabel()
+	// work_root 是节点放会话工作区的地方（``<work_root>/envs/<env_id>`` 就是每个
+	// 环境的 HOME）。上报它，服务端才能让节点去读**那个**环境里编辑器的会话记录
+	// ——会话历史归编辑器管，但它在哪个目录下只有节点知道。硬编码同 terminal：
+	// 这是节点事实，不是操作者标签，用户配置不能覆盖。
+	if v := strings.TrimSpace(c.opts.WorkRoot); v != "" {
+		labels["work_root"] = v
+	}
 	return labels
 }
 
-func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, stream *connect.BidiStreamForClient[agentcomposev2.NodeUpstreamFrame, agentcomposev2.NodeDownstreamFrame]) {
+// resolveIosMgmt is the ios_mgmt verdict for this capability snapshot.
+//
+// `--ios auto` means "this is a fact about the host, look it up", so it is
+// re-probed here rather than frozen at the boot-time value: the Apple Mobile
+// Device Service is started by the host, not by the node, and a node that boots
+// a moment before it comes up would otherwise carry a false verdict for its whole
+// lifetime (the label drives both host selection in the console and the server's
+// frame gate). An explicit `--ios on|off` is an operator decision and stays
+// exactly as decided — re-probing it would let a transient usbmuxd outage override
+// an operator who forced the capability on.
+func (c *Client) resolveIosMgmt() bool {
+	if IosMgmtProbed(c.opts.IosMgmtMode) {
+		return UsbmuxdAvailable()
+	}
+	return c.opts.IosMgmtAllowed
+}
+
+func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 	ticker := time.NewTicker(c.opts.Heartbeat)
 	defer ticker.Stop()
 	for {
@@ -461,7 +523,11 @@ func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, s
 			frame := &agentcomposev2.NodeUpstreamFrame{
 				Frame: &agentcomposev2.NodeUpstreamFrame_Heartbeat{Heartbeat: heartbeat},
 			}
-			if err := stream.Send(frame); err != nil {
+			// EmitUpstream, not stream.Send: this loop runs concurrently with the
+			// handler's own emitters, and connect-go's write side is not safe for
+			// concurrent use (an envelope is written as a prefix then a payload,
+			// so two writers interleave into a corrupt frame).
+			if err := c.EmitUpstream(frame); err != nil {
 				c.logger.Warn("heartbeat send failed", "error", err)
 				// The stream is dead. Cancel it so dispatchLoop's blocked
 				// Receive returns and serve() falls through to reconnect;
@@ -673,6 +739,12 @@ func (c *Client) publicIPReport() *agentcomposev2.NodePublicIPReport {
 // reach the stream through this accessor; if the connection has dropped, output
 // stays queued and this returns ErrStreamGone.
 //
+// Frames are refused until the server has acked registration. The stream exists
+// from the hello onward, so without this gate a background reporter (the iOS
+// device manager starts its inventory loop before Run) can land a frame ahead of
+// register — the server answers "first frame must be register" and tears the
+// whole stream down, and the node reconnects into the same race forever.
+//
 // Every upstream frame passes through here, so this is the single choke point
 // that keeps an ack/result sendable when a child process emitted non-UTF-8 text
 // (a Windows GBK npm error would otherwise fail the whole marshal and the
@@ -682,11 +754,40 @@ func (c *Client) publicIPReport() *agentcomposev2.NodePublicIPReport {
 func (c *Client) EmitUpstream(frame *agentcomposev2.NodeUpstreamFrame) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.currentStream == nil {
+	if c.currentStream == nil || !c.registered {
 		return ErrStreamGone
 	}
 	SanitizeProtoStrings(frame)
 	return c.currentStream.Send(frame)
+}
+
+// UpgradeEventEmitter returns an UpgradeProgressFunc that streams progress for
+// one upgrade step (kind: "runtime"|"node") as NodeUpgradeEvent frames, each
+// echoing serverFrameID so the server can attribute events to the driving
+// command — including after a reconnect (a mid-download drop must not abort the
+// upgrade, so late events from the detached goroutine still flow once the new
+// stream registers). seq is a closure-local monotonic counter. Emission
+// failures are swallowed: a dropped progress frame must never fail the upgrade.
+func (c *Client) UpgradeEventEmitter(serverFrameID, kind string) UpgradeProgressFunc {
+	var seq atomic.Int64
+	return func(stage, message string, percent int, currentBytes, totalBytes int64) {
+		ev := &agentcomposev2.NodeUpgradeEvent{
+			ServerFrameId: serverFrameID,
+			Kind:          kind,
+			Seq:           seq.Add(1),
+			Stage:         stage,
+			Message:       message,
+			Percent:       int32(percent),
+			CurrentBytes:  currentBytes,
+			TotalBytes:    totalBytes,
+			ReportedAt:    time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := c.EmitUpstream(&agentcomposev2.NodeUpstreamFrame{
+			Frame: &agentcomposev2.NodeUpstreamFrame_NodeUpgradeEvent{NodeUpgradeEvent: ev},
+		}); err != nil {
+			c.logger.Debug("upgrade event not sent", "kind", kind, "stage", stage, "error", err)
+		}
+	}
 }
 
 // SendAck acks a command with the optional session list (for ListSessions).
@@ -862,10 +963,63 @@ func (c *Client) setCurrentStream(stream *connect.BidiStreamForClient[agentcompo
 	c.mu.Unlock()
 }
 
+// setRegistered opens or closes the upstream gate that EmitUpstream honors.
+// It is opened exactly once per stream, right after the registration ack.
+func (c *Client) setRegistered(v bool) {
+	c.mu.Lock()
+	c.registered = v
+	c.mu.Unlock()
+}
+
 func (c *Client) setNodeID(id string) {
 	c.mu.Lock()
 	c.nodeID = id
 	c.mu.Unlock()
+}
+
+// setApproved records whether this node is currently approved, waking every
+// WaitApproved waiter on the transition to true. Called from the registration
+// ack (and, when the server pushes a status update, from that handler).
+func (c *Client) setApproved(v bool) {
+	c.mu.Lock()
+	changed := c.approved != v
+	c.approved = v
+	c.mu.Unlock()
+	if changed && v {
+		c.approvedCond.Broadcast()
+	}
+}
+
+// WaitApproved blocks until the node is approved, ctx is cancelled, or the
+// client shuts down. A caller that already sees approved returns immediately.
+// The companion IsApproved lets a caller poll instead of blocking.
+func (c *Client) WaitApproved(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for !c.approved {
+		// sync.Cond has no ctx-awareness, so wake it on cancellation and re-check.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				c.approvedCond.Broadcast()
+			case <-stop:
+			}
+		}()
+		c.approvedCond.Wait()
+		close(stop)
+	}
+	return nil
+}
+
+// IsApproved reports the last status the server sent us.
+func (c *Client) IsApproved() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.approved
 }
 
 func (c *Client) nodeIDValue() string {

@@ -101,7 +101,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			"download_url", payload.SelfUpgrade.GetDownloadUrl())
 		c.SendAck(frameID, nil, nil)
 		go func(spec *agentcomposev2.NodeSelfUpgrade) {
-			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy()); err != nil {
+			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy(), c.UpgradeEventEmitter(frameID, "node")); err != nil {
 				if agent.IsRestartExit(err) {
 					c.Logger().Info("self-upgrade: restarting into new binary")
 					os.Exit(0)
@@ -113,7 +113,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		// Detached from the stream ctx: the download can take minutes and a
 		// reconnect must not abort it (see agent.DetachStreamContext).
 		go func(spec *agentcomposev2.NodeRuntimeUpgrade) {
-			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
+			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy(), c.UpgradeEventEmitter(frameID, "runtime"))
 			if err != nil {
 				c.Logger().Error("runtime-upgrade failed", "error", err)
 			}

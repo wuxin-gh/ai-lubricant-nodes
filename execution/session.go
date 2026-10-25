@@ -137,6 +137,17 @@ type nodeSession struct {
 	runtimeDir          string
 	workspaceOwned      bool
 	persistentWorkspace bool
+	// worktreeEnvID is set when the working tree is a worktree cut from that
+	// environment's shared checkout. delete() uses it to detach the worktree
+	// (rather than just removing a directory) so git does not keep a stale
+	// registration that would block a later add at the same path.
+	worktreeEnvID string
+	// worktreeRepoDir is the shared checkout that worktree was cut from. It is the
+	// environment's durable clone (envs/<id>/repo) for a managed environment, or
+	// the operator's imported tree for an adopted one. delete() prunes the
+	// worktree registration out of THIS repo's .git — pruning the wrong one would
+	// leave a stale registration that blocks the next `worktree add`.
+	worktreeRepoDir string
 	// skillsDir/pluginsDir hold synced skills/plugins.
 	stateRoot  string
 	home       string
@@ -248,7 +259,53 @@ func (m *sessionManager) create(ctx context.Context, spec *agentcomposev2.NodeCr
 		workDir = filepath.Join(m.opts.workRoot, sanitizeSessionDir(shared))
 		workspaceOwned = false
 	}
+	// Environment-backed worktree: the task's working tree is cut from the
+	// environment's shared checkout instead of cloned. The path is resolved here
+	// (so the session struct and the file service both point at it) but the
+	// checkout itself happens in provisionSession, which is the slow part.
+	worktreeWorkspace := usesWorktree(spec)
+	worktreeEnvID := ""
+	worktreeRepoDir := ""
+	if worktreeWorkspace {
+		worktreeEnvID = strings.TrimSpace(spec.GetTags()[envIDTag])
+		workDir = m.envWorktreeDir(worktreeEnvID, strings.TrimSpace(spec.GetTaskId()))
+		workspaceOwned = false
+		persistentWorkspace = true
+		// The shared checkout the worktree is cut from: the operator's imported
+		// tree when this environment was adopted, else the managed clone. Kept on
+		// the session so delete() prunes the registration out of the right repo.
+		if imported := importedCheckoutPath(spec); imported != "" {
+			worktreeRepoDir = imported
+		} else {
+			worktreeRepoDir = m.envRepoDir(worktreeEnvID)
+		}
+	}
+	// External workspace: 导入（external）= 会话跑在节点上已存在的目录里，环境只是
+	// 借用它，什么都不创建、什么都不动；新建（fresh）= 同一条路径但目录归我们，
+	// provisionSession 会把它建出来并 clone 进去。两者的区别只在目录是否已存在，
+	// 位置来源（external_workdir 标签）完全一致。
+	externalWorkspace := externalWorktreePath(spec)
+	envBackedWorkspace := worktreeWorkspace || externalWorkspace != ""
+	if externalWorkspace != "" {
+		workDir = externalWorkspace
+		workspaceOwned = false
+		persistentWorkspace = true
+	}
 	runtimeDir := filepath.Join(workDir, ".agent-compose", "sessions", sanitizeSessionDir(sessionID))
+	if envBackedWorkspace {
+		// Runtime state lives beside the worktrees, not inside one. The worktree
+		// must stay a pure git checkout: an untracked `.agent-compose/` in it
+		// would show up in the very `git status` the pause hook reports, making
+		// every session look like it has uncommitted changes. The same rule
+		// applies to an adopted checkout — it is the operator's tree, and the
+		// node must not leave litter in it.
+		envID := worktreeEnvID
+		if externalWorkspace != "" {
+			envID = strings.TrimSpace(spec.GetTags()[envIDTag])
+		}
+		runtimeDir = filepath.Join(m.envDir(envID),
+			".agent-compose", "sessions", sanitizeSessionDir(sessionID))
+	}
 	base := runtimeDir
 	stateRoot := filepath.Join(base, "state")
 	skillsDir := filepath.Join(base, "skills")
@@ -258,7 +315,16 @@ func (m *sessionManager) create(ctx context.Context, spec *agentcomposev2.NodeCr
 		return fmt.Errorf("create session %s: %w", sessionID, err)
 	}
 	m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_WORKSPACE_PREPARE, true, "准备工作目录", nil)
-	for _, dir := range []string{workDir, stateRoot, home, skillsDir, pluginsDir} {
+	// The worktree itself is deliberately NOT pre-created: `git worktree add`
+	// refuses a non-empty target, so creating it here would break the checkout
+	// that provisionSession is about to perform. An adopted checkout is not
+	// created either — it must already exist, and MkdirAll'ing it would turn a
+	// typo'd path into a silently empty tree the agent then works in.
+	dirs := []string{stateRoot, home, skillsDir, pluginsDir}
+	if !envBackedWorkspace {
+		dirs = append(dirs, workDir)
+	}
+	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			wrapped := fmt.Errorf("create session %s: prepare dir %s: %w", sessionID, dir, err)
 			m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_WORKSPACE_PREPARE, false, "", wrapped)
@@ -287,6 +353,8 @@ func (m *sessionManager) create(ctx context.Context, spec *agentcomposev2.NodeCr
 		stateRoot:           stateRoot,
 		workspaceOwned:      workspaceOwned,
 		persistentWorkspace: persistentWorkspace,
+		worktreeEnvID:       worktreeEnvID,
+		worktreeRepoDir:     worktreeRepoDir,
 		provider:            provider,
 		skillsDir:           skillsDir,
 		pluginsDir:          pluginsDir,
@@ -321,25 +389,80 @@ func (m *sessionManager) provisionSession(ctx context.Context, session *nodeSess
 	sessionID := session.id
 	workDir := session.workDir
 
+	// 导入（external）与新建（fresh）共用同一条目标路径，区别只在目录是否已在：
+	// 导入的树属于操作者，节点一个字节都不能动，缺失就是任务的失败；新建的树归
+	// 我们，不存在（或只有上次失败的残渣）就建出来并 clone 进去，provisionGit
+	// 本身幂等——重派发落在已有检出上会直接跳过。
+	if external := externalWorktreePath(spec); external != "" {
+		if workspaceMode(spec) == workspaceModeFresh {
+			m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, true, "新建工作目录并拉取代码", nil)
+			if git := spec.GetGit(); git != nil && strings.TrimSpace(git.GetUrl()) != "" {
+				if err := m.provisionGit(ctx, external, git); err != nil {
+					wrapped := fmt.Errorf("create session %s: %w", sessionID, err)
+					m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, false, "", wrapped)
+					m.removeFailedSession(sessionID)
+					return
+				}
+			}
+		} else {
+			m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, true, "沿用节点已有目录", nil)
+			info, statErr := os.Stat(external)
+			if statErr != nil || !info.IsDir() {
+				err := fmt.Errorf("adopted checkout %s is not a directory", external)
+				m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, false, "", err)
+				m.removeFailedSession(sessionID)
+				return
+			}
+		}
+	}
+
 	// Provision the working tree locally: clone the repo and optionally branch.
 	// The provider CLI only reads local disk, so everything must land here.
-	if git := spec.GetGit(); git != nil && strings.TrimSpace(git.GetUrl()) != "" {
-		branch := strings.TrimSpace(git.GetBranch())
-		detail := "拉取代码"
-		if branch != "" {
-			detail = "拉取代码（分支 " + branch + "）"
-		}
-		m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, true, detail, nil)
-		// Shared editor sessions can arrive concurrently. Serialize workspace
-		// initialization so only one clone targets a given editor checkout.
-		m.workspaceMu.Lock()
-		err := m.provisionGit(ctx, workDir, git)
-		m.workspaceMu.Unlock()
-		if err != nil {
-			wrapped := fmt.Errorf("create session %s: %w", sessionID, err)
-			m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, false, "", wrapped)
-			m.removeFailedSession(sessionID)
-			return
+	// An adopted checkout is skipped entirely — it is already on disk, and the
+	// node must not fetch into (or otherwise mutate) a tree that belongs to the
+	// operator.
+	if externalWorktreePath(spec) == "" {
+		if git := spec.GetGit(); git != nil && strings.TrimSpace(git.GetUrl()) != "" {
+			branch := strings.TrimSpace(git.GetBranch())
+			detail := "拉取代码"
+			if branch != "" {
+				detail = "拉取代码（分支 " + branch + "）"
+			}
+			if session.worktreeEnvID != "" {
+				detail = "从环境检出工作区"
+			}
+			m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, true, detail, nil)
+			// Shared editor sessions can arrive concurrently. Serialize workspace
+			// initialization so only one clone targets a given editor checkout.
+			m.workspaceMu.Lock()
+			var err error
+			if session.worktreeEnvID != "" {
+				// Environment-backed: the shared checkout is cloned once and this
+				// task's worktree is cut from it. The shared checkout is the point —
+				// every task on this environment reuses its object database.
+				var path string
+				path, err = m.prepareWorktree(ctx, session, spec, git)
+				if err == nil {
+					// The path was resolved in create() from the same env/task ids,
+					// so this only guards against the two ever diverging.
+					session.workDir = path
+					// Dependency directories the shared checkout already has are
+					// linked in rather than reinstalled per task. Absent ones are
+					// simply skipped — an environment that never ran an install has
+					// nothing to share, and that is not an error. The source is the
+					// worktree's own shared checkout (managed clone or imported tree).
+					linkSharedDeps(path, session.worktreeRepoDir, sharedDepDirs)
+				}
+			} else {
+				err = m.provisionGit(ctx, workDir, git)
+			}
+			m.workspaceMu.Unlock()
+			if err != nil {
+				wrapped := fmt.Errorf("create session %s: %w", sessionID, err)
+				m.reportStage(sessionID, agentcomposev2.SessionStage_SESSION_STAGE_GIT_CLONE, false, "", wrapped)
+				m.removeFailedSession(sessionID)
+				return
+			}
 		}
 	}
 
@@ -402,8 +525,15 @@ func (m *sessionManager) provisionSession(ctx context.Context, session *nodeSess
 	// point the executor is still nil, so flushing would drop every frame as
 	// "session is not interactive". That was the silent-loss path for any first
 	// message that arrived during provisioning.
+	//
+	// Only flip provisioning→provisioned: startRuntime now refuses to run while
+	// provisioning, but a restart (or a future caller) that already moved the
+	// state past provisioned must not be dragged back to it — that would let a
+	// second auto-start below spawn a duplicate editor.
 	session.mu.Lock()
-	session.state = sessionProvisioned
+	if session.state == sessionProvisioning {
+		session.state = sessionProvisioned
+	}
 	session.mu.Unlock()
 
 	m.logger.Info("session provisioned", "session_id", sessionID, "provider", session.provider, "work_dir", workDir)
@@ -476,6 +606,24 @@ func (m *sessionManager) startRuntime(sessionID string) error {
 	session.mu.Lock()
 	if session.state == sessionRunning {
 		session.mu.Unlock()
+		return nil
+	}
+	// Refuse to start while provisioning is still running, as a no-op (not an
+	// error). The gateway probes an existing handle with StartSessionRuntime to
+	// tell a live session from a stale one (see
+	// task_service._dispatch_persisted_task_runtime), and that probe can land
+	// during the clone. Starting here would mark the session running and report
+	// stage=running while the working tree is still being prepared — the page
+	// then unblocks the 目录/终端 buttons against a file service that is not up
+	// yet, and the second auto-start at the end of provisioning spawns a
+	// duplicate editor process (the first becomes an orphan). Provisioning ends
+	// by transitioning to provisioned and (when not defer_start) calling
+	// startRuntime itself, so returning early loses nothing. It must NOT be an
+	// error: the probe reads a not-ok ack as "stale handle" and re-dispatches,
+	// which would then collide with the in-flight create.
+	if session.state == sessionProvisioning {
+		session.mu.Unlock()
+		m.logger.Info("start runtime deferred: session still provisioning", "session_id", sessionID)
 		return nil
 	}
 	// selectExecutor is where the runtime pre-flight lives (provider on PATH +
@@ -1317,7 +1465,7 @@ func (m *sessionManager) reportResult(session *nodeSession, exitCode int32, succ
 // hundred ms later (process spawn + Node module load). A frame arriving in that
 // window used to be written into a nil pipe and silently lost — the turn never
 // ran, no failure was reported, and the gateway's message row stuck at
-// ``dispatching`` while the page span "生成中" forever.
+// “dispatching“ while the page span "生成中" forever.
 //
 // For human_message, if the caller did not supply a config snapshot the node
 // stamps the session's current model/mode/llm onto the frame so the runtime
@@ -1621,6 +1769,13 @@ func (m *sessionManager) delete(sessionID string) error {
 	}
 	if err := os.RemoveAll(removeDir); err != nil {
 		return fmt.Errorf("delete session %s: remove runtime dir: %w", sessionID, err)
+	}
+	// A worktree-backed session also detaches its working tree from the
+	// environment's shared checkout: leaving it registered would make a later
+	// `worktree add` at the same path fail. The branch and any commits the task
+	// made are deliberately kept.
+	if session.worktreeEnvID != "" {
+		m.removeWorktree(session.worktreeEnvID, session.taskID, session.worktreeRepoDir)
 	}
 	m.logger.Info("session deleted", "session_id", sessionID)
 	return nil

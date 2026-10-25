@@ -320,6 +320,16 @@ model = %q
 	if reasoningEffort != "" {
 		head += fmt.Sprintf("model_reasoning_effort = %q\n", reasoningEffort)
 	}
+	// 模型映射（任务侧 model_mapping → llm.extra["CODEX_MODEL_CATALOG"] → 进程
+	// env → 这里）：写出 codex 的 model_catalog_json 文件并让 config.toml 指向
+	// 它，/model 菜单才列得出网关的自定义模型名。没配映射时保留 config.toml 里
+	// 已有的 model_catalog_json 行（重写 head 会把它丢掉，等于任务跑一次就把
+	// 操作者自己的映射关了）。
+	if catalogHead, _ := writeCodexModelCatalog(home, llm.GetExtra()["CODEX_MODEL_CATALOG"]); catalogHead != "" {
+		head += catalogHead
+	} else if preserved := existingModelCatalogField(existing); preserved != "" {
+		head += preserved
+	}
 	head += fmt.Sprintf(`
 [model_providers.agent_compose]
 name = "agent-compose"
@@ -344,6 +354,90 @@ persistence = "save-all"
 		return fmt.Errorf("write codex config: %w", err)
 	}
 	return nil
+}
+
+// codexModelCatalogFilename 是本平台写进 config.toml 的 model_catalog_json
+// 文件名（相对路径，codex 相对 config.toml 所在目录解析）。带平台前缀，避免与
+// 操作者/其它工具的同名文件撞车。
+const codexModelCatalogFilename = "ai-lubricant-model-catalog.json"
+
+// codexCatalogRow 是后端 _task_llm_config 下发的一行（名字/实际模型/context）。
+type codexCatalogRow struct {
+	Name         string `json:"name"`
+	Model        string `json:"model"`
+	ContextWindow int   `json:"context_window"`
+}
+
+// writeCodexModelCatalog 解析 CODEX_MODEL_CATALOG 并写出目录文件。
+// 返回 "model_catalog_json = \"...\"\n"（成功时）；mapping 为空 → ("", false)
+// 表示「没配映射」（调用方走保留既有字段的分支）；写入失败 → ("", true) 且已记日志。
+func writeCodexModelCatalog(home, raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	var rows []codexCatalogRow
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		return "", true
+	}
+	type entry struct {
+		Slug              string   `json:"slug"`
+		DisplayName       string   `json:"display_name"`
+		Description       string   `json:"description"`
+		ContextWindow     int      `json:"context_window"`
+		MaxContextWindow  int      `json:"max_context_window"`
+		Priority          int      `json:"priority"`
+		AdditionalSpeedTiers []string `json:"additional_speed_tiers"`
+		ServiceTiers      []string `json:"service_tiers"`
+		AvailabilityNux   *interface{} `json:"availability_nux"`
+		Upgrade           *interface{} `json:"upgrade"`
+	}
+	entries := make([]entry, 0, len(rows))
+	for i, row := range rows {
+		if strings.TrimSpace(row.Model) == "" {
+			continue
+		}
+		name := strings.TrimSpace(row.Name)
+		if name == "" {
+			name = row.Model
+		}
+		ctx := row.ContextWindow
+		if ctx <= 0 {
+			ctx = 128000
+		}
+		entries = append(entries, entry{
+			Slug: row.Model, DisplayName: name, Description: name,
+			ContextWindow: ctx, MaxContextWindow: ctx, Priority: 1000 + i,
+			AdditionalSpeedTiers: []string{}, ServiceTiers: []string{},
+		})
+	}
+	if len(entries) == 0 {
+		return "", true
+	}
+	data, err := json.Marshal(map[string]any{"models": entries})
+	if err != nil {
+		return "", true
+	}
+	dir := filepath.Dir(codexConfigPath(home))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", true
+	}
+	if err := os.WriteFile(filepath.Join(dir, codexModelCatalogFilename), data, 0o644); err != nil {
+		return "", true
+	}
+	return fmt.Sprintf("model_catalog_json = %q\n", codexModelCatalogFilename), true
+}
+
+// existingModelCatalogField 从 config.toml 原文里取出一行 model_catalog_json
+// = "..."（若有），用于「任务没配映射」时保住操作者自己的映射设置。
+func existingModelCatalogField(existing []byte) string {
+	for _, line := range strings.Split(string(existing), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "model_catalog_json") {
+			return line + "\n"
+		}
+	}
+	return ""
 }
 
 func writeCodexMCPConfig(home string, mcps []*agentcomposev2.MCPServerSpec) error {

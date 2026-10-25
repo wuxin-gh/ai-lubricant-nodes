@@ -1,14 +1,15 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import process from "node:process";
-import { join } from "node:path";
-import { flattenEnvMap } from "../mcp-config.js";
+import { basename, join } from "node:path";
+import { flattenEnvMap, readPluginMCPServers } from "../mcp-config.js";
 import { resolveClaudeMode } from "./mode.js";
 import { uniqueDirectories } from "../paths.js";
 import { readStoredThread, writeStoredThread } from "../session-state.js";
 import { UpstreamStatusError } from "../retry.js";
 import { jsonString } from "../text.js";
 import { TranscriptWriter } from "../transcript.js";
+import { gitStashGuardHook } from "../workspace-guard.js";
 import type { AgentResult, RunnerOptions, StoredThread } from "../types.js";
 
 type PendingToolUse = {
@@ -36,6 +37,46 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function textOf(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * One human-readable line describing what a tool call is doing.
+ *
+ * The console shows this as the timeline node's caption, so the shape is "the
+ * object this step acts on" rather than a sentence: a file path for Read/Edit,
+ * the command for Bash, the pattern for Grep/Glob. Claude's own `description`
+ * parameter (present on Bash) is preferred when set — it is the model's own
+ * statement of intent and reads better than anything derived from the input.
+ *
+ * Returns undefined when nothing useful can be derived, so the field is simply
+ * absent rather than an empty string the UI would have to special-case.
+ */
+function toolStepSummary(toolName: string, input: Record<string, unknown>): string | undefined {
+  const description = textOf(input.description);
+  if (description) return description;
+  const path = textOf(input.file_path) || textOf(input.notebook_path);
+  const pattern = textOf(input.pattern);
+  switch (toolName) {
+    case "Read":
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+    case "NotebookEdit":
+      return path || undefined;
+    case "Bash":
+      return textOf(input.command) || undefined;
+    case "Grep":
+    case "Glob":
+      return pattern ? (path ? `${pattern} · ${path}` : pattern) : undefined;
+    case "WebFetch":
+      return textOf(input.url) || undefined;
+    case "WebSearch":
+      return textOf(input.query) || undefined;
+    case "Task":
+      return textOf(input.description) || undefined;
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -110,6 +151,13 @@ function claudeMessageToItems(
         const id = textOf(rawBlock.id) || `${uuid}:${index}`;
         const toolName = textOf(rawBlock.name) || "工具调用";
         toolNamesById?.set(id, toolName);
+        const input = isRecord(rawBlock.input) ? rawBlock.input : {};
+        // One human-readable line for what this step is doing. The console renders
+        // it as the timeline node's caption; without it every step reads as a bare
+        // tool name and the reader has to expand the card to learn anything.
+        // Derived here (the layer that knows the provider's tool vocabulary)
+        // rather than in the UI, which would need a table per provider.
+        const summary = toolStepSummary(toolName, input);
         items.push({
           id,
           type: "tool_call",
@@ -118,8 +166,9 @@ function claudeMessageToItems(
           logical_event_id: id,
           event_kind: "tool",
           phase: "start",
-          input: rawBlock.input ?? {},
+          input,
           status: "running",
+          ...(summary ? { summary } : {}),
           ...(model ? { model } : {}),
           ...(usage ? { usage } : {}),
         });
@@ -384,7 +433,24 @@ function claudeEnvironment(): NodeJS.ProcessEnv {
  * re-enable telemetry for task turns — task turns must never leak the
  * operator's HOME context.
  */
-function claudeSettingsLlmEnv(): Record<string, string> {
+/**
+ * claudeSettingsLlmEnv returns the settings-env block that pins this turn's LLM
+ * snapshot above the session HOME's own settings.json.
+ *
+ * **Shape matters**: the SDK's `Settings` type puts environment variables under
+ * a nested `env` key (`settings.env`), matching settings.json's own layout. This
+ * used to return a FLAT map that was spread onto the settings root
+ * (`settings: { ...claudeSettingsLlmEnv() }`), which made every entry an unknown
+ * top-level settings field — the SDK ignores those silently, so the override
+ * never happened. In system-env mode (HOME = the operator's real HOME) the CLI
+ * then read `~/.claude/settings.json`'s `env` block, whose ANTHROPIC_AUTH_TOKEN
+ * outranks the process env the node planted, and every task turn authenticated
+ * with the operator's key instead of the task's child key.
+ *
+ * Returned as `{ env: {...} }` so the caller spreads it at the settings root
+ * where the SDK expects to find it.
+ */
+export function claudeSettingsLlmEnv(): { env: Record<string, string> } {
   const endpoint = String(process.env.LLM_API_ENDPOINT || "").trim();
   const key = String(process.env.LLM_API_KEY || "").trim();
   const model = String(process.env.LLM_MODEL || "").trim();
@@ -395,40 +461,73 @@ function claudeSettingsLlmEnv(): Record<string, string> {
     env.ANTHROPIC_AUTH_TOKEN = key;
   }
   if (model) env.ANTHROPIC_MODEL = model;
+  // 模型映射（任务侧 model_mapping → llm.extra → 进程 env）的四个角色档：
+  // claude code 按角色把 Sonnet/Opus/Fable/Haiku 映射到实际模型。提进 settings
+  // env 块而不只留在进程 env，是同一个系统档场景——操作者的 ccswitch 在
+  // ~/.claude/settings.json 里也写了这些键，settings.json env 压过进程 env，
+  // 不提进来就会被操作者的映射盖掉（与 ANTHROPIC_MODEL 一样）。只有配了的档
+  // 才写，缺的档由 claude code 自己回落到上一级/兜底。
+  for (const role of ["SONNET", "OPUS", "FABLE", "HAIKU"]) {
+    const envKey = `ANTHROPIC_DEFAULT_${role}_MODEL`;
+    const value = String(process.env[envKey] || "").trim();
+    if (value) env[envKey] = value;
+  }
   // Fixed task-privacy switches (see doc comment above).
   env.DISABLE_TELEMETRY = "1";
   env.DISABLE_ERROR_REPORTING = "1";
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  return env;
+  return { env };
 }
 
 /**
- * Discover local plugin packages the node laid down under home/.agents/plugins.
- * Each immediate child directory that carries a `.claude-plugin/plugin.json` is
- * a Claude Code plugin the SDK can load wholesale (commands, agents, skills,
- * hooks) — this is how a multi-skill repo (e.g. obra/superpowers) reaches the
- * session. Returns absolute paths; a missing dir yields an empty list.
+ * Discover the plugin packages this session should load.
+ *
+ * Two trees are swept, and a plugin is identified by its manifest `name` in
+ * both, so the same plugin present in each is loaded once rather than twice
+ * (a duplicate registration of every skill, command and hook it ships):
+ *
+ * - `home/.agents/plugins` — provider-neutral packages the node synced. Only
+ *   the isolated tier writes this tree, so it is empty elsewhere.
+ * - claude's own marketplace tree under the HOME, read from its install ledger.
+ *   A system-env session runs against the operator's real HOME, where every
+ *   plugin they installed lives; the node never writes there, so without this
+ *   sweep those plugins simply do not exist for the session.
  *
  * activePlugins narrows the result: a non-empty list means only those package
  * names load this run (the env-tier activation subset); empty/undefined keeps
- * the historic "load everything present" behaviour.
+ * the historic "load everything present" behaviour. A name is matched against
+ * the manifest name and against the ledger's `<name>@<marketplace>` key.
  */
 function discoverLocalPlugins(home: string, activePlugins?: string[]): string[] {
-  const root = join(home, ".agents", "plugins");
+  const wanted = activePlugins && activePlugins.length > 0
+    ? new Set(activePlugins.map((name) => name.trim()).filter(Boolean))
+    : null;
+  const byName = new Map<string, string>();
+  const add = (name: string, dir: string, aliases: string[] = []): void => {
+    const key = name.trim();
+    if (!key || byName.has(key)) return;
+    if (wanted && !wanted.has(key) && !aliases.some((alias) => wanted.has(alias))) return;
+    byName.set(key, dir);
+  };
+  for (const dir of readPluginDirs(join(home, ".agents", "plugins"))) {
+    add(claudePluginName(dir) || basename(dir), dir, [basename(dir)]);
+  }
+  for (const { key, dir } of readClaudeInstalledPlugins(home)) {
+    add(claudePluginName(dir) || key.split("@")[0], dir, [key, key.split("@")[0]]);
+  }
+  return [...byName.values()];
+}
+
+/** Immediate child directories of `root`, or [] when it does not exist. */
+function readPluginDirs(root: string): string[] {
   let entries: string[];
   try {
     entries = readdirSync(root);
   } catch {
     return [];
   }
-  const wanted = activePlugins && activePlugins.length > 0
-    ? new Set(activePlugins.map((name) => name.trim()).filter(Boolean))
-    : null;
-  const plugins: string[] = [];
+  const out: string[] = [];
   for (const entry of entries) {
-    if (wanted && !wanted.has(entry.trim())) {
-      continue;
-    }
     const dir = join(root, entry);
     try {
       if (!statSync(dir).isDirectory()) continue;
@@ -436,10 +535,56 @@ function discoverLocalPlugins(home: string, activePlugins?: string[]): string[] 
       continue;
     }
     if (existsSync(join(dir, ".claude-plugin", "plugin.json"))) {
-      plugins.push(dir);
+      out.push(dir);
     }
   }
-  return plugins;
+  return out;
+}
+
+/**
+ * Read claude's own plugin ledger: `~/.claude/plugins/installed_plugins.json`,
+ * which maps `"<name>@<marketplace>"` to per-scope install records. This is what
+ * `claude plugin install` writes, and it — not `enabledPlugins` in settings — is
+ * the authoritative list of what the operator has installed.
+ *
+ * Deduped by plugin NAME, not by ledger key: the same plugin installed from two
+ * marketplaces is two ledger entries pointing at two identical copies, and
+ * loading both would register every skill, command and hook twice.
+ */
+function readClaudeInstalledPlugins(home: string): { key: string; dir: string }[] {
+  const ledger = join(home, ".claude", "plugins", "installed_plugins.json");
+  let parsed: { plugins?: Record<string, { installPath?: string }[]> };
+  try {
+    parsed = JSON.parse(readFileSync(ledger, "utf-8"));
+  } catch {
+    return [];
+  }
+  const records = parsed?.plugins;
+  if (!records || typeof records !== "object") return [];
+  const out: { key: string; dir: string }[] = [];
+  const seenNames = new Set<string>();
+  for (const [key, scopes] of Object.entries(records)) {
+    if (!Array.isArray(scopes) || scopes.length === 0) continue;
+    const dir = String(scopes[0]?.installPath || "").trim();
+    if (!dir || !existsSync(join(dir, ".claude-plugin", "plugin.json"))) continue;
+    const name = claudePluginName(dir) || key.split("@")[0];
+    if (!name || seenNames.has(name)) continue;
+    seenNames.add(name);
+    out.push({ key: key.trim(), dir });
+  }
+  return out;
+}
+
+/** The manifest's own `name`, which is what the plugin calls itself. */
+function claudePluginName(dir: string): string {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(join(dir, ".claude-plugin", "plugin.json"), "utf-8"),
+    ) as { name?: unknown };
+    return typeof manifest?.name === "string" ? manifest.name.trim() : "";
+  } catch {
+    return "";
+  }
 }
 
 function toClaudeMCPConfig(config: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -484,12 +629,23 @@ export class ClaudeRunner {
 
   queryOptions(stored: StoredThread | null): Record<string, unknown> {
     const executable = claudeExecutable();
-    const mcpServers = toClaudeMCPConfig(this.options.mcpConfig as Record<string, unknown> | undefined);
     const permissionMode = resolveClaudeMode(this.options.mode);
     // Plugin packages the node synced for this session. The SDK loads each one
     // wholesale from its .claude-plugin/plugin.json, so a package's own skills
     // arrive without being listed in `skills` below.
     const localPlugins = discoverLocalPlugins(this.options.home, this.options.plugins);
+    // Plugin-declared MCP servers are resolved by the runtime and merged into
+    // `mcpServers`, not left to the CLI: the session runs with
+    // `strictMcpConfig`, under which the CLI ignores every MCP source except
+    // the ones passed explicitly — plugins included. The flag stays on because
+    // it is what stops a task's cloned repo from shipping a `.mcp.json` that
+    // injects servers into the agent. Task servers win on a name collision:
+    // they carry this run's freshly minted tokens.
+    const mcpServers = {
+      ...readPluginMCPServers(localPlugins),
+      ...(toClaudeMCPConfig(this.options.mcpConfig as Record<string, unknown> | undefined) ?? {}),
+    };
+    const hasMcpServers = Object.keys(mcpServers).length > 0;
     return {
       cwd: this.options.workspace,
       env: claudeEnvironment(),
@@ -505,12 +661,17 @@ export class ClaudeRunner {
       // with gpt-oss-120b ran as claude-opus-4-8 instead.
       ...(this.options.model ? { model: this.options.model } : {}),
       resume: stored?.threadId,
-      ...(mcpServers ? {
+      ...(hasMcpServers ? {
         mcpServers,
         strictMcpConfig: true,
       } : {}),
+      // `skipMcpDiscovery` because this runner already read each plugin's own
+      // .mcp.json above; letting the CLI read it too would double-register the
+      // servers under a second name. A plugin like claude-mem is built around
+      // its MCP tools, so losing them silently is worse than the small
+      // duplication this avoids.
       ...(localPlugins.length > 0 ? {
-        plugins: localPlugins.map((path) => ({ type: "local" as const, path })),
+        plugins: localPlugins.map((path) => ({ type: "local" as const, path, skipMcpDiscovery: true })),
       } : {}),
       // `settingSources: ['user']` is what makes the SDK read ~/.claude (the
       // session home), where the node mirrors synced skills. Plugin-provided
@@ -529,6 +690,20 @@ export class ClaudeRunner {
         },
       } : {}),
       ...(this.options.abortController ? { abortController: this.options.abortController } : {}),
+      // Hard gate: `git stash` in a task workspace pollutes the SHARED stash
+      // stack (refs/stash lives in the checkout every worktree of that
+      // environment shares). bypassPermissions does NOT consult canUseTool —
+      // the SDK documents that a PreToolUse hook is the only gate that runs —
+      // so this hook is what actually stops it. The deny reason teaches the
+      // model the WIP-commit alternative (see workspace-guard.ts).
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "Bash",
+            hooks: [gitStashGuardHook],
+          },
+        ],
+      },
       ...(this.options.systemContext ? {
         systemPrompt: {
           type: "preset",
@@ -548,9 +723,11 @@ export class ClaudeRunner {
         ...(this.options.autoCompactWindow && this.options.autoCompactWindow > 0
           ? { autoCompactWindow: this.options.autoCompactWindow }
           : {}),
-        // Task LLM config rides --settings env so it outranks the session
-        // HOME's own settings.json (ccswitch's env block in system-env mode).
-        // See claudeSettingsLlmEnv for the full rationale.
+        // Task LLM config rides the settings `env` block so it outranks the
+        // session HOME's own settings.json (ccswitch's env block in system-env
+        // mode). Spread at the root: the helper returns `{ env: {...} }`, the
+        // shape the SDK's Settings type expects. See claudeSettingsLlmEnv for
+        // why a flat map silently did nothing.
         ...claudeSettingsLlmEnv(),
       },
     };
@@ -846,6 +1023,32 @@ export class ClaudeRunner {
       }
     } finally {
       stream.close?.();
+      // Persist the thread id even when the turn FAILED. The CLI may have
+      // created or forked a session before erroring (result.threadId is filled
+      // from the streamed session_id above), and the gateway binds a Task's
+      // provider thread on its FIRST request. If that first turn fails and we
+      // skip this write, the runtime has no stored thread to resume, so the next
+      // turn forks a brand-new session — while the gateway still enforces the
+      // first one and 403s ("Task API Key 与 provider 会话不匹配"). Writing here
+      // (not only on the success path below) keeps the stored thread aligned
+      // with whatever the CLI actually used.
+      if (result.threadId) {
+        try {
+          await writeStoredThread(
+            this.options.stateRoot,
+            "claude",
+            result.threadId,
+            undefined,
+            this.options.sessionScope,
+          );
+        } catch (persistError) {
+          // Best-effort: never let a state-write failure mask the turn's own
+          // error (this runs inside finally while an exception propagates).
+          process.stderr.write(
+            `[claude-session] persist thread on failure path failed: ${persistError instanceof Error ? persistError.message : String(persistError)}\n`,
+          );
+        }
+      }
     }
 
     result.transcript = this.writer.transcript();

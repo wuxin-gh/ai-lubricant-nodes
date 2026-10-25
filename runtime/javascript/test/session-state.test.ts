@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { providerStatePath, readStoredThread, writeStoredThread } from "../src/session-state.js";
+import { providerStatePath, readStoredThread, seedResumeThread, writeStoredThread } from "../src/session-state.js";
 import { withTempSession } from "./helpers.js";
 
 describe("provider thread state", () => {
@@ -104,3 +104,40 @@ describe("provider thread state", () => {
     });
   });
 });
+
+  it("seeds an adopt-resume hint when state is absent", async () => {
+    await withTempSession(async (root) => {
+      const stateRoot = path.join(root, "state");
+      const seeded = await seedResumeThread(stateRoot, "claude", "ext-uuid-1", "scope-a");
+      expect(seeded).toBe(true);
+      await expect(readStoredThread(stateRoot, "claude", "scope-a")).resolves.toEqual({
+        provider: "claude",
+        threadId: "ext-uuid-1",
+        updatedAt: expect.any(String),
+      });
+    });
+  });
+
+  it("never overrules an already-recorded thread with a later hint", async () => {
+    await withTempSession(async (root) => {
+      const stateRoot = path.join(root, "state");
+      // runner 在首轮后可能 fork 了新 threadId（见 claude.ts:889）并已落盘。
+      await writeStoredThread(stateRoot, "claude", "forked-after-first-turn", new Date(), "scope-a");
+
+      // 后来重派发又带了原 hint 进来：绝不能覆盖，否则之前轮次全丢。
+      const seeded = await seedResumeThread(stateRoot, "claude", "original-ext-uuid", "scope-a");
+      expect(seeded).toBe(false);
+
+      const current = await readStoredThread(stateRoot, "claude", "scope-a");
+      expect(current?.threadId).toBe("forked-after-first-turn");
+    });
+  });
+
+  it("refuses blank or whitespace resume hints", async () => {
+    await withTempSession(async (root) => {
+      const stateRoot = path.join(root, "state");
+      expect(await seedResumeThread(stateRoot, "claude", "")).toBe(false);
+      expect(await seedResumeThread(stateRoot, "claude", "   ")).toBe(false);
+      expect(await readStoredThread(stateRoot, "claude")).toBeNull();
+    });
+  });

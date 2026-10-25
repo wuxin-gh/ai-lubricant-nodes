@@ -164,23 +164,38 @@ func runtimePackageVersion(dir string) string {
 // is retained until the staged package has passed structural validation. The
 // per-frame proxy takes precedence; when unset it falls back to the node's
 // persisted egress-proxy snapshot. Callers without a Client pass a zero fallback.
-func RuntimeUpgrade(ctx context.Context, spec *agentcomposev2.NodeRuntimeUpgrade, log *slog.Logger, fallback proxySpec) error {
+// onProgress (may be nil) streams NodeUpgradeEvent stages; unlike SelfUpgrade
+// this one returns normally, so its terminal "done" event is sent here and the
+// ack stays authoritative.
+func RuntimeUpgrade(ctx context.Context, spec *agentcomposev2.NodeRuntimeUpgrade, log *slog.Logger, fallback proxySpec, onProgress UpgradeProgressFunc) error {
 	if log == nil {
 		log = slog.Default()
 	}
+	emit := func(stage, msg string, pct int, cur, total int64) {
+		if onProgress != nil {
+			onProgress(stage, msg, pct, cur, total)
+		}
+	}
+	fail := func(stage, msg string) {
+		emit("failed", msg, 0, 0, 0)
+	}
 	if spec == nil {
+		fail("downloading", "runtime-upgrade: nil spec")
 		return fmt.Errorf("runtime-upgrade: nil spec")
 	}
 	url := strings.TrimSpace(spec.GetDownloadUrl())
 	if url == "" {
+		fail("downloading", "runtime-upgrade: download_url is required")
 		return fmt.Errorf("runtime-upgrade: download_url is required")
 	}
 	target, err := RuntimeDir()
 	if err != nil {
+		fail("downloading", fmt.Sprintf("resolve install dir: %v", err))
 		return fmt.Errorf("runtime-upgrade: resolve install dir: %w", err)
 	}
 	parent := filepath.Dir(target)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
+		fail("downloading", fmt.Sprintf("prepare install dir: %v", err))
 		return fmt.Errorf("runtime-upgrade: prepare install dir: %w", err)
 	}
 	archivePath := target + ".tar.gz.new"
@@ -201,27 +216,36 @@ func RuntimeUpgrade(ctx context.Context, spec *agentcomposev2.NodeRuntimeUpgrade
 	if pspec.mode == "" && pspec.url == "" && pspec.urlPrefix == "" {
 		pspec = fallback
 	}
-	if err := downloadTo(ctx, url, archivePath, pspec); err != nil {
+	emit("downloading", "开始下载 runtime 归档", 0, 0, 0)
+	if err := progressDownload(ctx, url, archivePath, pspec, onProgress); err != nil {
+		fail("downloading", fmt.Sprintf("下载 runtime 归档失败：%v", err))
 		return err
 	}
 	if want := strings.TrimSpace(spec.GetSha256()); want != "" {
+		emit("verifying", "校验 sha256", 92, 0, 0)
 		if err := verifySHA256(archivePath, want); err != nil {
+			fail("verifying", fmt.Sprintf("sha256 校验失败：%v", err))
 			return err
 		}
 	}
+	emit("extracting", "解压 runtime 归档", 96, 0, 0)
 	if err := extractRuntimeArchive(archivePath, stage); err != nil {
 		_ = os.RemoveAll(stage)
+		fail("extracting", fmt.Sprintf("解压失败：%v", err))
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(stage, "dist", "cli.js")); err != nil {
 		_ = os.RemoveAll(stage)
+		fail("extracting", "归档缺少 runtime/dist/cli.js")
 		return fmt.Errorf("runtime-upgrade: archive is missing runtime/dist/cli.js")
 	}
 
+	emit("activating", "激活新 runtime", 98, 0, 0)
 	_ = os.RemoveAll(backup)
 	if _, err := os.Stat(target); err == nil {
 		if err := os.Rename(target, backup); err != nil {
 			_ = os.RemoveAll(stage)
+			fail("activating", fmt.Sprintf("保留当前 runtime 失败：%v", err))
 			return fmt.Errorf("runtime-upgrade: preserve current runtime: %w", err)
 		}
 	}
@@ -229,6 +253,7 @@ func RuntimeUpgrade(ctx context.Context, spec *agentcomposev2.NodeRuntimeUpgrade
 		if _, backupErr := os.Stat(backup); backupErr == nil {
 			_ = os.Rename(backup, target)
 		}
+		fail("activating", fmt.Sprintf("切换 runtime 失败：%v", err))
 		return fmt.Errorf("runtime-upgrade: activate staged runtime: %w", err)
 	}
 	_ = os.RemoveAll(backup)
@@ -240,6 +265,7 @@ func RuntimeUpgrade(ctx context.Context, spec *agentcomposev2.NodeRuntimeUpgrade
 			log.Warn("runtime-upgrade: write release marker failed", "err", err)
 		}
 	}
+	emit("done", "Runtime 已切换", 100, 0, 0)
 	log.Info("runtime-upgrade: installed", "path", target, "target_version", spec.GetTargetVersion())
 	return nil
 }

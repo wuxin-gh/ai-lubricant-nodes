@@ -52,6 +52,14 @@ func (f *fakeEnumerator) List(context.Context) ([]EnumeratedDevice, error) {
 	return out, nil
 }
 
+// setDevices replaces what the next enumeration sees — the test's way of
+// unplugging a phone mid-scenario.
+func (f *fakeEnumerator) setDevices(devices ...EnumeratedDevice) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.list = devices
+}
+
 func (f *fakeEnumerator) Subscribe(context.Context) (<-chan DeviceEvent, <-chan error, func(), error) {
 	if f.subErr != nil {
 		return nil, nil, nil, f.subErr
@@ -202,6 +210,48 @@ func claimReq(udid string) *agentcomposev2.NodeIosClaimDevice {
 }
 
 // ── discovery ────────────────────────────────────────────────────────────
+
+func TestIsPresentTracksEnumeration(t *testing.T) {
+	m, _, _, _, _ := testManager(t,
+		EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1},
+	)
+	// Before any scan nothing is known, so nothing is present.
+	if m.IsPresent("udid-a") {
+		t.Fatal("device must not be present before the first enumeration")
+	}
+	m.Rescan(context.Background())
+	if !m.IsPresent("udid-a") {
+		t.Fatal("device should be present after being enumerated")
+	}
+
+	// An unknown UDID is never present (a job for another host's phone must not
+	// read as online here).
+	if m.IsPresent("udid-unknown") {
+		t.Fatal("unknown udid must not be present")
+	}
+	if m.IsPresent("") {
+		t.Fatal("empty udid must not be present")
+	}
+}
+
+func TestIsPresentFalseAfterDeviceDisappears(t *testing.T) {
+	m, enum, _, _, _ := testManager(t,
+		EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1},
+	)
+	m.Rescan(context.Background())
+	if !m.IsPresent("udid-a") {
+		t.Fatal("precondition: device present")
+	}
+
+	// The phone is unplugged: the next enumeration no longer lists it. The claim
+	// survives (an unplug must not silently release the device), but presence —
+	// the online axis the console gates on — does not.
+	enum.setDevices()
+	m.Rescan(context.Background())
+	if m.IsPresent("udid-a") {
+		t.Fatal("device must not be present once enumeration stops listing it")
+	}
+}
 
 func TestRescanReportsDiscoveredDevices(t *testing.T) {
 	m, _, _, _, reports := testManager(t,
@@ -668,14 +718,15 @@ func TestExpiryTransitionToExpired(t *testing.T) {
 }
 
 func TestExpiryOnlyReadyTransitions(t *testing.T) {
-	// A PREPARING device must not be flipped by the time check — only READY
-	// devices advance, and only a WDA job completion promotes back.
+	// The expiry badge tracks the CONTROL axis: READY / INSTALLED / RENEWAL_DUE
+	// advance to EXPIRED when the profile is past. The initialization-axis
+	// states (UNSPECIFIED / MISSING / PREPARING / FAILED) have no recorded
+	// profile and must be left alone. EXPIRED is terminal here (not demoted).
 	for _, state := range []agentcomposev2.IosWdaState{
 		agentcomposev2.IosWdaState_IOS_WDA_STATE_UNSPECIFIED,
 		agentcomposev2.IosWdaState_IOS_WDA_STATE_MISSING,
 		agentcomposev2.IosWdaState_IOS_WDA_STATE_PREPARING,
 		agentcomposev2.IosWdaState_IOS_WDA_STATE_FAILED,
-		agentcomposev2.IosWdaState_IOS_WDA_STATE_RENEWAL_DUE, // not demoted
 		agentcomposev2.IosWdaState_IOS_WDA_STATE_EXPIRED,     // not demoted
 	} {
 		m, _ := expiryManager(t, state,
@@ -684,6 +735,24 @@ func TestExpiryOnlyReadyTransitions(t *testing.T) {
 		snap := m.Snapshot("")
 		if got := snap.Devices[0].GetWdaState(); got != state {
 			t.Fatalf("state %v must be left alone by the expiry check, got %v", state, got)
+		}
+	}
+}
+
+func TestExpiryAdvancesControlAxisStates(t *testing.T) {
+	// READY / INSTALLED / RENEWAL_DUE all carry a recorded profile expiry, so a
+	// past expiry must surface as EXPIRED regardless of control-link state.
+	for _, state := range []agentcomposev2.IosWdaState{
+		agentcomposev2.IosWdaState_IOS_WDA_STATE_READY,
+		agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED,
+		agentcomposev2.IosWdaState_IOS_WDA_STATE_RENEWAL_DUE,
+	} {
+		m, _ := expiryManager(t, state,
+			time.Now().Add(-1*time.Hour).UTC().Format(time.RFC3339))
+		m.Rescan(context.Background())
+		snap := m.Snapshot("")
+		if got := snap.Devices[0].GetWdaState(); got != agentcomposev2.IosWdaState_IOS_WDA_STATE_EXPIRED {
+			t.Fatalf("state %v with a past profile must become EXPIRED, got %v", state, got)
 		}
 	}
 }
@@ -843,5 +912,79 @@ func TestControlRunnerUnknownDevice(t *testing.T) {
 		Action: agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP,
 	}); err == nil {
 		t.Fatal("STOP on an unknown UDID must error")
+	}
+}
+
+// ── 探测：INSTALLED 设备自动拉起、userStopped 不被探测、attach 清 pin ────────────
+
+// installedManager sets up a claimed, present, INSTALLED device whose runner is
+// already known-installed (skipProvisioning fast path), then the caller drives
+// Rescan to run probeControl the way the periodic ticker does.
+func installedManager(t *testing.T) (*DeviceManager, *fakeRunner) {
+	t.Helper()
+	m, _, _, runner, _ := testManager(t, EnumeratedDevice{UDID: "udid-a", ConnectionType: "USB", DeviceID: 1})
+	m.Rescan(context.Background())
+	m.mu.Lock()
+	dev := m.devices["udid-a"]
+	dev.present = true
+	dev.claimed = true
+	dev.credentialPath = filepath.Join(t.TempDir(), "cred.json")
+	dev.wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_INSTALLED
+	dev.deviceControlOn = false
+	dev.userStopped = false
+	m.mu.Unlock()
+	return m, runner
+}
+
+func TestProbeControlStartsInstalledDevice(t *testing.T) {
+	// An INSTALLED device whose loop is not running is probed on Rescan:
+	// the device-control loop is started automatically, so a freshly-installed
+	// runner reaches READY without an operator pressing anything.
+	m, runner := installedManager(t)
+	m.Rescan(context.Background())
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "probe starts the loop")
+}
+
+func TestProbeSkipsUserStopped(t *testing.T) {
+	// An operator-stopped loop stays down: probeControl must not resurrect it.
+	m, runner := installedManager(t)
+	// Simulate an operator STOP (sets userStopped).
+	if err := m.ControlRunner(context.Background(), &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_STOP,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 0 }, "loop stopped")
+
+	m.Rescan(context.Background())
+	// Give the prober a chance to (incorrectly) restart.
+	time.Sleep(50 * time.Millisecond)
+	if n := runner.liveCount("udid-a"); n != 0 {
+		t.Fatalf("probe restarted an operator-stopped loop; live=%d", n)
+	}
+	// And an explicit START clears the pin and brings it back.
+	if err := m.ControlRunner(context.Background(), &agentcomposev2.NodeIosRunnerControl{
+		DeviceId: m.devices["udid-a"].deviceID,
+		Udid:     "udid-a",
+		Action:   agentcomposev2.IosRunnerControlAction_IOS_RUNNER_CONTROL_ACTION_START,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return runner.liveCount("udid-a") == 1 }, "START brings the loop back")
+}
+
+func TestProbeSkipsReadyDevices(t *testing.T) {
+	// READY devices (control link up) and MISSING/PREPARING are not probed.
+	m, runner := installedManager(t)
+	m.mu.Lock()
+	m.devices["udid-a"].wdaState = agentcomposev2.IosWdaState_IOS_WDA_STATE_READY
+	m.devices["udid-a"].deviceControlOn = true
+	m.mu.Unlock()
+	m.Rescan(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if n := runner.startCount("udid-a"); n != 0 {
+		t.Fatalf("READY device must not be probed (link already up); startCount=%d", n)
 	}
 }

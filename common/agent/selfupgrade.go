@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,12 +47,24 @@ func IsRestartExit(err error) bool { return errors.Is(err, errRestartExit) }
 // restarts into it. The per-frame proxy (admin override for this one upgrade)
 // takes precedence; when unset it falls back to the node's persisted egress-proxy
 // snapshot pushed by the server. Callers without a Client pass a zero fallback.
-func SelfUpgrade(ctx context.Context, spec *agentcomposev2.NodeSelfUpgrade, log *slog.Logger, fallback proxySpec) error {
+// onProgress (may be nil) streams NodeUpgradeEvent stages upstream so the
+// console shows live download bytes and the step that failed; every early
+// error return emits "failed" before returning.
+func SelfUpgrade(ctx context.Context, spec *agentcomposev2.NodeSelfUpgrade, log *slog.Logger, fallback proxySpec, onProgress UpgradeProgressFunc) error {
 	if log == nil {
 		log = slog.Default()
 	}
+	emit := func(stage, msg string, pct int, cur, total int64) {
+		if onProgress != nil {
+			onProgress(stage, msg, pct, cur, total)
+		}
+	}
+	fail := func(stage, msg string) {
+		emit("failed", msg, 0, 0, 0)
+	}
 	if spec == nil {
 		log.Error("self-upgrade: nil spec")
+		fail("downloading", "self-upgrade: nil spec")
 		return fmt.Errorf("self-upgrade: nil spec")
 	}
 	url := strings.TrimSpace(spec.GetDownloadUrl())
@@ -73,37 +84,44 @@ func SelfUpgrade(ctx context.Context, spec *agentcomposev2.NodeSelfUpgrade, log 
 	log.Info("self-upgrade: received upgrade command, starting")
 	if url == "" {
 		log.Error("self-upgrade: download_url is required")
+		fail("downloading", "self-upgrade: download_url is required")
 		return fmt.Errorf("self-upgrade: download_url is required")
 	}
 	if RunningInContainer() {
 		log.Warn("self-upgrade: rejected — running inside docker; re-pull the image instead")
+		fail("downloading", "self-upgrade unsupported for docker deployments; re-pull the node image to update")
 		return fmt.Errorf("self-upgrade unsupported for docker deployments; re-pull the node image to update")
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		log.Error("self-upgrade: locate current executable failed", "error", err)
+		fail("downloading", fmt.Sprintf("locate current executable: %v", err))
 		return fmt.Errorf("self-upgrade: locate current executable: %w", err)
 	}
 	exe, err = filepath.EvalSymlinks(exe)
 	if err != nil {
 		log.Error("self-upgrade: resolve executable path failed", "error", err)
+		fail("downloading", fmt.Sprintf("resolve executable path: %v", err))
 		return fmt.Errorf("self-upgrade: resolve executable path: %w", err)
 	}
 	log.Info("self-upgrade: current binary resolved", "path", exe)
 
 	newPath := exe + ".new"
 	log.Info("self-upgrade: downloading new binary", "dest", newPath)
-	if err := downloadTo(ctx, url, newPath, pspec); err != nil {
+	emit("downloading", "开始下载节点程序", 0, 0, 0)
+	if err := progressDownload(ctx, url, newPath, pspec, onProgress); err != nil {
 		log.Error("self-upgrade: download failed", "error", err)
+		fail("downloading", fmt.Sprintf("下载节点程序失败：%v", err))
 		_ = os.Remove(newPath)
 		return err
 	}
-	log.Info("self-upgrade: download complete")
 	if want := strings.TrimSpace(spec.GetSha256()); want != "" {
 		log.Info("self-upgrade: verifying sha256", "expected", want)
+		emit("verifying", "校验 sha256", 92, 0, 0)
 		if err := verifySHA256(newPath, want); err != nil {
 			log.Error("self-upgrade: checksum verification failed", "error", err)
+			fail("verifying", fmt.Sprintf("sha256 校验失败：%v", err))
 			_ = os.Remove(newPath)
 			return err
 		}
@@ -113,16 +131,26 @@ func SelfUpgrade(ctx context.Context, spec *agentcomposev2.NodeSelfUpgrade, log 
 	}
 	if err := os.Chmod(newPath, 0o755); err != nil {
 		log.Error("self-upgrade: chmod new binary failed", "error", err)
+		fail("swapping", fmt.Sprintf("chmod new binary: %v", err))
 		_ = os.Remove(newPath)
 		return fmt.Errorf("self-upgrade: chmod new binary: %w", err)
 	}
 
 	log.Info("self-upgrade: swapping binary into place")
+	emit("swapping", "替换节点程序二进制", 96, 0, 0)
 	if err := swapBinary(exe, newPath); err != nil {
 		log.Error("self-upgrade: swap failed", "error", err)
+		fail("swapping", fmt.Sprintf("替换二进制失败：%v", err))
 		return err
 	}
 	log.Info("self-upgrade: binary swapped, restarting", "path", exe)
+	// Last event the process can send: on Unix restartSelf replaces the image
+	// (never returns), on Windows it spawns the replacement. Give the stream a
+	// short window to flush so the console sees "restarting" before the link
+	// drops; the terminal "completed" comes from the reconnect reporting the
+	// new client_version, not from here.
+	emit("restarting", "正在重启节点程序", 98, 0, 0)
+	time.Sleep(300 * time.Millisecond)
 	// swapBinary left the new binary at exe; restart against the original argv.
 	return restartSelf(exe)
 }
@@ -130,39 +158,11 @@ func SelfUpgrade(ctx context.Context, spec *agentcomposev2.NodeSelfUpgrade, log 
 // downloadTo fetches url into dest (truncating any existing file). A generous
 // timeout covers slow links; the binaries are ~15MB. When spec selects a
 // proxy, the client honors it (http/https via Transport.Proxy, socks5 via a
-// dialer, url_prefix by rewriting the URL onto a default client).
+// dialer, url_prefix by rewriting the URL onto a default client). Thin wrapper
+// over progressDownload without events — the host-tool installer and tests
+// only need the bytes on disk.
 func downloadTo(ctx context.Context, url, dest string, spec proxySpec) error {
-	finalURL := resolveDownloadURL(spec, url)
-	client, err := httpClientForProxy(spec)
-	if err != nil {
-		return fmt.Errorf("self-upgrade: build http client: %w", err)
-	}
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, finalURL, nil)
-	if err != nil {
-		return fmt.Errorf("self-upgrade: build request: %w", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("self-upgrade: download %s: %w", finalURL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("self-upgrade: download %s: status %d", finalURL, resp.StatusCode)
-	}
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-	if err != nil {
-		return fmt.Errorf("self-upgrade: create %s: %w", dest, err)
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		return fmt.Errorf("self-upgrade: write %s: %w", dest, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("self-upgrade: close %s: %w", dest, err)
-	}
-	return nil
+	return progressDownload(ctx, url, dest, spec, nil)
 }
 
 // verifySHA256 checks that the file at path hashes to want (hex, case-insensitive).

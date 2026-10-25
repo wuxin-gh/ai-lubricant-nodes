@@ -139,6 +139,15 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 	if err != nil {
 		return agent.Options{}, "", nil, false, err
 	}
+	// IosMgmtMode: the raw --ios value. "auto" (the default) makes the node
+	// re-probe usbmuxd on every capability snapshot instead of trusting a
+	// boot-time verdict that can outlive the condition it measured (see
+	// agent.IosMgmtProbed). Paired with newIosFrameHandler, which still builds
+	// the DeviceManager only when the boot verdict said yes — so a false-at-boot
+	// node advertises true (once usbmuxd is back) and acks iOS frames with a
+	// crisp "not enabled" until it is restarted, rather than stranding the whole
+	// iOS console behind a missing label.
+	iosMgmtMode := *iosFlag
 
 	// A managed child (launched by a management node) runs straight from its
 	// flags/env: no host lock, no persisted config, and never installs
@@ -175,6 +184,8 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 			Docker:           dockerEnabled,
 			SystemEnvAllowed: systemEnvAllowed,
 			IosMgmtAllowed:   iosMgmtAllowed,
+			IosMgmtMode:      iosMgmtMode,
+			WorkRoot:         managedWorkRoot(*workRoot),
 			MinBackoff:       time.Second,
 			MaxBackoff:       30 * time.Second,
 			Heartbeat:        *heartbeat,
@@ -253,6 +264,8 @@ func parseFlags(args []string) (agent.Options, string, *agent.Instance, bool, er
 		Docker:           dockerEnabled,
 		SystemEnvAllowed: systemEnvAllowed,
 		IosMgmtAllowed:   iosMgmtAllowed,
+		IosMgmtMode:      iosMgmtMode,
+		WorkRoot:         root,
 		MinBackoff:       time.Second,
 		MaxBackoff:       30 * time.Second,
 		Heartbeat:        *heartbeat,

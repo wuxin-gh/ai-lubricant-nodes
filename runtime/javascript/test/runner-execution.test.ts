@@ -343,6 +343,34 @@ describe("runner execution", () => {
     });
   });
 
+  it("persists the Claude thread even when the turn fails", async () => {
+    // Regression: a first turn that binds the Task's provider thread on the
+    // gateway but FAILS before the success-path write left the runtime with no
+    // stored thread. The next turn then forked a brand-new session while the
+    // gateway still enforced the first one → permanent 403 ("Task API Key 与
+    // provider 会话不匹配"). The thread the CLI actually used must survive a
+    // failed turn so the next resume stays on it.
+    const { ClaudeRunner } = await import("../src/runners/claude.js");
+    await withTempSession(async (root) => {
+      claudeState.closed = false;
+      claudeState.messages = [
+        { type: "stream_event", session_id: "claude-session", event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial" } } },
+        { type: "result", subtype: "error_max_turns", is_error: true, result: "context length exceeded" },
+      ];
+      const stdio = captureStdio();
+      try {
+        await expect(
+          new ClaudeRunner(runnerOptions(root, "", "claude")).runPrompt("prompt"),
+        ).rejects.toThrow();
+      } finally {
+        stdio.restore();
+      }
+
+      const stored = JSON.parse(await fs.readFile(path.join(root, "state", "agents", "providers", "claude.json"), "utf8"));
+      expect(stored.threadId).toBe("claude-session");
+    });
+  });
+
   it("returns immediately after a Claude success result even if the SDK stream stays open", async () => {
     const { ClaudeRunner } = await import("../src/runners/claude.js");
     await withTempSession(async (root) => {

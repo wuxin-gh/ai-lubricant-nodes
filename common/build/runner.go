@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,6 +118,13 @@ func (r *Runner) Start(ctx context.Context, req *agentcomposev2.NodeBuildRequest
 	}
 	if req.GetSourceUrl() == "" {
 		return errors.New("build: source_url is required")
+	}
+	// source_kind is "" / "git" (clone) or "archive" (download+extract); anything
+	// else is a server bug and must fail loudly rather than silently cloning.
+	switch strings.ToLower(strings.TrimSpace(req.GetSourceKind())) {
+	case "", "git", "archive":
+	default:
+		return fmt.Errorf("build: unknown source_kind %q", req.GetSourceKind())
 	}
 	if len(req.GetSteps()) == 0 {
 		return errors.New("build: steps is required")
@@ -210,43 +218,20 @@ func (r *Runner) runBuild(ctx context.Context, j *buildJob, req *agentcomposev2.
 
 	r.event(j, "queued", "build accepted", 0, "")
 
-	// ── clone ────────────────────────────────────────────────────────────
-	// Route through the node's egress proxy when one is bound (same snapshot
-	// self-upgrade / artifact downloads honor): url_prefix rewrites the clone
-	// URL; network passes a per-command git http(s).proxy via -c (never written
-	// to any git config, and visible in the argv of one short-lived process).
-	// No proxy bound ("" / direct) keeps the historical direct clone.
-	cloneURL := strings.TrimSpace(req.GetSourceUrl())
-	ref := strings.TrimSpace(req.GetSourceRef())
-	var preArgs []string
-	if r.client != nil {
-		if spec := r.client.DownloadProxySpec(); spec.Mode == "url_prefix" && spec.URLPrefix != "" {
-			cloneURL = strings.TrimRight(spec.URLPrefix, "/") + "/" + strings.TrimLeft(cloneURL, "/")
-		} else if spec.Mode == "network" && spec.URL != "" {
-			// libcurl (git's transport) accepts http(s):// and socks5(h)://
-			// proxy URLs here; https.proxy covers the github clone, http.proxy
-			// is the fallback for an http remote.
-			preArgs = []string{"-c", "https.proxy=" + spec.URL, "-c", "http.proxy=" + spec.URL}
-		}
-	}
-	cloneArgs := append(preArgs, "clone", "--depth", "1")
-	if ref != "" {
-		// --branch lands the pinned tag/branch in the same depth-1 clone; the
-		// old clone-then-checkout needed a full --unshallow fetch because a
-		// default-branch shallow clone does not carry the tag object.
-		cloneArgs = append(cloneArgs, "--branch", ref)
-	}
-	cloneArgs = append(cloneArgs, cloneURL, "src")
-
-	r.event(j, "cloning", "git clone "+workspaces.RedactGitURL(cloneURL)+" @ "+refLabel(ref), 5, "")
-	cloneOut, err := r.exec(ctx, workDir, "git", cloneArgs)
-	if err != nil {
-		if ctx.Err() != nil {
-			return buildOutcome{stage: "cloning", errCode: "cancelled", err: ctx.Err()}
-		}
-		return buildOutcome{stage: "cloning", errCode: "clone_failed", err: err, retryable: true, logTail: logTail(cloneOut)}
-	}
+	// ── source acquisition ───────────────────────────────────────────────
+	// Two source kinds share one workspace layout: the buildable tree always
+	// lands at <workDir>/src, so steps and the artifact glob are identical
+	// regardless of where the source came from.
+	//   "" / "git" → git clone source_url at source_ref (historic behaviour)
+	//   "archive"  → download source_url as tar.gz/zip and extract it
 	srcDir := filepath.Join(workDir, "src")
+	if strings.EqualFold(strings.TrimSpace(req.GetSourceKind()), "archive") {
+		if out, failed := r.acquireArchive(ctx, j, req, srcDir); failed {
+			return out
+		}
+	} else if out, failed := r.acquireGit(ctx, j, req, srcDir); failed {
+		return out
+	}
 
 	// ── steps ────────────────────────────────────────────────────────────
 	total := len(req.GetSteps())
@@ -289,6 +274,108 @@ func (r *Runner) runBuild(ctx context.Context, j *buildJob, req *agentcomposev2.
 	}
 
 	return buildOutcome{stage: "completed", artifactSHA: sum, artifactSize: size}
+}
+
+// acquireGit clones source_url at source_ref into dest (the historic build
+// source). Route through the node's egress proxy when one is bound (same
+// snapshot self-upgrade / artifact downloads honor): url_prefix rewrites the
+// clone URL; network passes a per-command git http(s).proxy via -c (never
+// written to any git config, and visible in the argv of one short-lived
+// process). No proxy bound ("" / direct), or source_no_proxy set, keeps the
+// clone direct.
+//
+// It returns (outcome, true) on failure — the caller returns the outcome — and
+// (zero, false) on success.
+func (r *Runner) acquireGit(ctx context.Context, j *buildJob, req *agentcomposev2.NodeBuildRequest, dest string) (buildOutcome, bool) {
+	cloneURL := strings.TrimSpace(req.GetSourceUrl())
+	ref := strings.TrimSpace(req.GetSourceRef())
+	var preArgs []string
+	// source_no_proxy skips the egress rewrite entirely — for internal sources a
+	// url_prefix mirror would mangle into a broken prefixed URL. Default honors
+	// the proxy (historic behaviour).
+	if r.client != nil && !req.GetSourceNoProxy() {
+		if spec := r.client.DownloadProxySpec(); spec.Mode == "url_prefix" && spec.URLPrefix != "" {
+			cloneURL = strings.TrimRight(spec.URLPrefix, "/") + "/" + strings.TrimLeft(cloneURL, "/")
+		} else if spec.Mode == "network" && spec.URL != "" {
+			// libcurl (git's transport) accepts http(s):// and socks5(h)://
+			// proxy URLs here; https.proxy covers the github clone, http.proxy
+			// is the fallback for an http remote.
+			preArgs = []string{"-c", "https.proxy=" + spec.URL, "-c", "http.proxy=" + spec.URL}
+		}
+	}
+	cloneArgs := append(preArgs, "clone", "--depth", "1")
+	if ref != "" {
+		// --branch lands the pinned tag/branch in the same depth-1 clone; the
+		// old clone-then-checkout needed a full --unshallow fetch because a
+		// default-branch shallow clone does not carry the tag object.
+		cloneArgs = append(cloneArgs, "--branch", ref)
+	}
+	cloneArgs = append(cloneArgs, cloneURL, "src")
+
+	r.event(j, "cloning", "git clone "+workspaces.RedactGitURL(cloneURL)+" @ "+refLabel(ref), 5, "")
+	cloneOut, err := r.exec(ctx, filepath.Dir(dest), "git", cloneArgs)
+	if err != nil {
+		if ctx.Err() != nil {
+			return buildOutcome{stage: "cloning", errCode: "cancelled", err: ctx.Err()}, true
+		}
+		return buildOutcome{stage: "cloning", errCode: "clone_failed", err: err, retryable: true, logTail: logTail(cloneOut)}, true
+	}
+	return buildOutcome{}, false
+}
+
+// acquireArchive downloads source_url as a tar.gz/zip and extracts it into
+// dest (the "archive" source kind). The download honors the node's egress
+// proxy (url_prefix rewrites the URL, network builds a proxied http.Client)
+// unless source_no_proxy is set. Unlike git, extraction has no external binary
+// dependency, so the whole thing is one in-process step.
+//
+// It returns (outcome, true) on failure — the caller returns the outcome — and
+// (zero, false) on success.
+func (r *Runner) acquireArchive(ctx context.Context, j *buildJob, req *agentcomposev2.NodeBuildRequest, dest string) (buildOutcome, bool) {
+	rawURL := strings.TrimSpace(req.GetSourceUrl())
+
+	// Proxy resolution mirrors acquireGit, but for an HTTP GET rather than a git
+	// command: url_prefix rewrites the URL, network supplies a proxied client.
+	// source_no_proxy skips the rewrite for internal sources (same reason as
+	// acquireGit).
+	var client *http.Client
+	if r.client != nil && !req.GetSourceNoProxy() {
+		spec := r.client.DownloadProxySpec()
+		switch spec.Mode {
+		case "url_prefix":
+			if spec.URLPrefix != "" {
+				rawURL = strings.TrimRight(spec.URLPrefix, "/") + "/" + strings.TrimLeft(rawURL, "/")
+			}
+		case "network":
+			c, err := agent.HTTPClientForProxyURL(spec.URL)
+			if err != nil {
+				return buildOutcome{stage: "cloning", errCode: "source_failed", err: err}, true
+			}
+			client = c
+		}
+	}
+	if client == nil {
+		client = &http.Client{Timeout: archiveDownloadTimeout}
+	}
+
+	r.event(j, "cloning", "download "+workspaces.RedactGitURL(rawURL), 5, "")
+	stageFn := func(msg string) { r.event(j, "cloning", msg, 8, "") }
+	// The workspace root is dest itself: fetchArchive extracts under a scratch
+	// dir beside dest and returns the project root, which we rename into place
+	// so steps see exactly <workDir>/src regardless of the archive's internal
+	// layout.
+	scratch := dest + ".dl"
+	projectRoot, err := fetchArchive(ctx, client, rawURL, scratch, req.GetSourceSubdir(), stageFn)
+	if err != nil {
+		if ctx.Err() != nil {
+			return buildOutcome{stage: "cloning", errCode: "cancelled", err: ctx.Err()}, true
+		}
+		return buildOutcome{stage: "cloning", errCode: "source_failed", err: err, retryable: true, logTail: redactErr(err)}, true
+	}
+	if err := os.Rename(projectRoot, dest); err != nil {
+		return buildOutcome{stage: "cloning", errCode: "source_failed", err: err}, true
+	}
+	return buildOutcome{}, false
 }
 
 // finish emits the terminal event + the single result frame.

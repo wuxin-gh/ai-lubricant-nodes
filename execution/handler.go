@@ -85,8 +85,7 @@ func (h *Handler) ActiveToolRuns() []*agentcomposev2.NodeActiveToolRun {
 	return h.toolruns.ActiveRuns()
 }
 
-// newIosFrameHandler wires the iOS device manager for this execution node, or
-// returns nil when the host does not offer the capability.
+// newIosFrameHandler wires the iOS device manager for this execution node.
 //
 // The device list lives in its own directory (agent-compose/ios), the same one
 // the standalone node-ios binary uses: the config format is identical, so an
@@ -97,9 +96,19 @@ func (h *Handler) ActiveToolRuns() []*agentcomposev2.NodeActiveToolRun {
 // ctx is the process-lifetime context: the tunnel agent and the device loops
 // must outlive a control-stream drop, so they are not tied to the client's
 // per-stream context.
+//
+// An unauthorised host still gets a FrameHandler — with no manager and no job
+// engine — because that is what makes it *answer* iOS frames instead of dropping
+// them. Returning nil here sent every iOS frame past the handler chain into the
+// "unexpected downstream frame" default branch, which logs and never acks; the
+// server then blocked on the ack timeout (30s for claim) and the user saw a
+// generic deadline error instead of "iOS device management is not enabled on this
+// host". The server no longer pre-gates on the self-reported ios_mgmt label
+// (a stale label used to hide a working node entirely), so it *will* send these
+// frames here, and a fast, specific error-ack is what makes that safe.
 func newIosFrameHandler(ctx context.Context, c *agent.Client, nodeID string, allowed bool) *ioshost.FrameHandler {
 	if !allowed {
-		return nil
+		return ioshost.NewFrameHandler(nil, nil)
 	}
 	logger := c.Logger()
 	cfg, path, err := ioshost.LoadDevicesConfig("")
@@ -117,7 +126,12 @@ func newIosFrameHandler(ctx context.Context, c *agent.Client, nodeID string, all
 	// start the same agent here, or WDA Launch (and the device-control runner
 	// loop) fails on 17+ with "no RSD tunnel". Reuses an external
 	// `ios tunnel start` if one is already up. iOS ≤16 never touches it.
-	ioshost.StartTunnelAgent(ctx, logger, ioshost.StateDir(path))
+	//
+	// The agent handle is kept so the WDA job engine can Pause the reconcile
+	// loop while a job runs: go-ios's UpdateTunnels tears down every healthy
+	// tunnel on one transient ListDevices failure, which was killing in-flight
+	// launches ("installation successful, then wda_unreachable 3s later").
+	tunnelAgent := ioshost.StartTunnelAgent(ctx, logger, ioshost.StateDir(path))
 	manager := ioshost.NewDeviceManager(ioshost.ManagerConfig{
 		Logger:        logger,
 		ConfigPath:    path,
@@ -129,18 +143,51 @@ func newIosFrameHandler(ctx context.Context, c *agent.Client, nodeID string, all
 			})
 		},
 	})
-	jobs := ioshost.NewWdaJobManager(c.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, c), ioshost.StateDir(path), logger)
+	jobs := ioshost.NewWdaJobManager(c.EmitUpstream, ioshost.NewGoiosWdaSteps(logger, c).WithArtifactCache(ioshost.StateDir(path)), ioshost.StateDir(path), logger)
 	// Wire job progress/terminal outcome back into the device's wda_state so the
 	// console renders "initializing 42%" / "ready" / "failed" from the durable
 	// inventory — surviving a server restart (the job snapshot does not).
 	jobs.OnProgress = manager.NoteWdaJobProgress
-	jobs.OnTerminal = func(udid string, ok bool, cancelled bool, errCode string, profileExpiresAt string) {
-		manager.NoteWdaJobResult(udid, ok, cancelled, errCode, profileExpiresAt)
+	jobs.OnTerminal = func(udid string, ok bool, cancelled bool, installed bool, errCode string, message string, profileExpiresAt string) {
+		manager.NoteWdaJobResult(udid, ok, cancelled, installed, errCode, message, profileExpiresAt)
 	}
+	// Tunnel stability during jobs: pause the reconcile while the first job
+	// starts, resume once the last drains. Overlapping jobs don't resume early
+	// (the callback fires on set-size transitions, not per job).
+	jobs.OnActiveChanged = func(running bool) {
+		if running {
+			tunnelAgent.Pause()
+		} else {
+			tunnelAgent.Resume()
+		}
+	}
+	// A job for an unplugged phone parks until the phone is back, rather than
+	// failing at the install stage. Presence is the host's own usbmuxd view.
+	jobs.IsPresent = manager.IsPresent
+	// LAN (no-USB) control: the tunnel agent owns the RemotePairing tunnels for
+	// claimed phones that usbmuxd cannot see. It reports reachability back into
+	// the same online axis the console already reads (present = USB || LAN), and
+	// surfaces the one human step — the on-device Trust prompt — as last_error.
+	// Shares the agent's Pause flag, so a running WDA job is never yanked.
 	// The device loops and the WDA job engine both outlive a control-stream drop;
 	// the manager is started here and stopped by the client's ctx.
 	go manager.Start(context.Background())
-	go manager.StartClaimedDevices(context.Background())
+	// Approval gate: a freshly (re)installed node registers PENDING. Without
+	// this gate the runner loop and the LAN agent start the moment
+	// devices.json exists on disk — putting the attached iPhone into Automation
+	// (or flashing a Trust prompt) for a node nobody has adopted yet. The
+	// server has no status push, so approval lands on the node's next
+	// registration ack (reconnect).
+	go func() {
+		if err := c.WaitApproved(context.Background()); err != nil {
+			return
+		}
+		tunnelAgent.SetLanHooks(context.Background(), logger, manager.ClaimedUDIDs, ioshost.LanHostHooks{
+			Reachable:      manager.NoteLanReachable,
+			PairingPending: manager.NoteLanPairingPending,
+		})
+		manager.StartClaimedDevices(context.Background())
+	}()
 	return ioshost.NewFrameHandler(manager, jobs)
 }
 
@@ -248,11 +295,14 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			c.SendHostToolAck(frameID, err, nodeV, npmV, xcodeV)
 		}(payload.InstallHostTool)
 	case *agentcomposev2.NodeDownstreamFrame_ManageEnvironment:
-		// Create/remove a named shared environment directory on this host. Disk
-		// work only (mkdir/remove), so it is cheap, but run it off the dispatch
-		// loop anyway so a slow filesystem cannot stall heartbeats.
+		// Create/remove a named shared environment directory on this host.
+		// CREATE may now pre-warm the shared checkout (clone the repo) for
+		// fresh/worktree modes — a multi-minute download whose ack only lands
+		// when it finishes, so like SyncEnvironment it must run off the dispatch
+		// loop AND detached from the stream ctx (a stream blip must not cancel a
+		// clone that is already paying for itself).
 		go func(spec *agentcomposev2.NodeManageEnvironment) {
-			err := h.sessions.manageEnvironment(ctx, spec)
+			err := h.sessions.manageEnvironment(agent.DetachStreamContext(ctx), spec)
 			c.SendAck(frameID, err, nil)
 		}(payload.ManageEnvironment)
 	case *agentcomposev2.NodeDownstreamFrame_SyncEnvironment:
@@ -307,7 +357,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 			"download_url", payload.SelfUpgrade.GetDownloadUrl())
 		c.SendAck(frameID, nil, nil)
 		go func(spec *agentcomposev2.NodeSelfUpgrade) {
-			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy()); err != nil {
+			if err := agent.SelfUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy(), c.UpgradeEventEmitter(frameID, "node")); err != nil {
 				if agent.IsRestartExit(err) {
 					c.Logger().Info("self-upgrade: restarting into new binary")
 					os.Exit(0)
@@ -323,7 +373,7 @@ func (h *Handler) HandleFrame(ctx context.Context, c *agent.Client, frame *agent
 		// archive is swapped in on disk regardless, so killing it mid-way only
 		// loses the ack and the version label).
 		go func(spec *agentcomposev2.NodeRuntimeUpgrade) {
-			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy())
+			err := agent.RuntimeUpgrade(agent.DetachStreamContext(ctx), spec, c.Logger(), c.DownloadProxy(), c.UpgradeEventEmitter(frameID, "runtime"))
 			if err != nil {
 				// Previously only the ack carried the error, so a failed runtime
 				// upgrade left nothing in the node log — the operator saw a

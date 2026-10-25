@@ -235,6 +235,13 @@ export class PromptRunnerSession implements InteractiveSession {
         messageId,
         deliveryAttempt,
         status: "failed",
+        // Report the thread the runtime is ACTUALLY on, even though this turn
+        // failed. The runner persists its thread on failure too (see the Claude
+        // runner), so re-reading the store yields the forked id. The gateway
+        // binds a Task's provider thread once and 403s any mismatch, so a
+        // forked-then-failed turn must still reach the platform's binding or the
+        // task wedges forever (the very 403 that failed this turn keeps failing).
+        threadId: await this.threadOnFailure(options),
         error: error instanceof Error ? error.message : String(error),
       });
       throw error;
@@ -250,6 +257,30 @@ export class PromptRunnerSession implements InteractiveSession {
     if (!this.currentAbort) return false;
     this.currentAbort.abort();
     return true;
+  }
+
+  /**
+   * The thread the runtime is on after a failed turn, read from the persisted
+   * state file. The runner writes it on the failure path too, so this reflects
+   * a session the provider created or forked before erroring — the value the
+   * gateway needs to keep its Task binding in sync. The store is preferred over
+   * ``lastThreadId`` (which only advances on success) because the runner writes
+   * the store before the error propagates. Best-effort: any read error falls
+   * back to the last known id, and "" when neither is available (the node-side
+   * sync treats "" as a no-op).
+   */
+  private async threadOnFailure(options: RunnerOptions): Promise<string> {
+    try {
+      const stored = await readStoredThread(
+        options.stateRoot,
+        options.provider,
+        options.sessionScope,
+      );
+      if (stored?.threadId) return stored.threadId;
+    } catch {
+      // fall through to the last known id
+    }
+    return this.lastThreadId;
   }
 
   /**

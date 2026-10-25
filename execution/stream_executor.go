@@ -124,6 +124,11 @@ func (e *streamExecutor) start(ctx context.Context, session *nodeSession) (*exec
 	if plugins := e.mgr.activePluginNames(session.spec); len(plugins) > 0 {
 		startFrame["plugins"] = plugins
 	}
+	// resumeThreadId: 外部会话采用成平台任务后，节点 runtime 靠它把 provider
+	// thread 指回原会话，保留原有上下文继续聊。tag 渠道免动 proto（无 pb2 重生成）。
+	if hint := resumeThreadHint(session.spec); hint != "" {
+		startFrame["resumeThreadId"] = hint
+	}
 	if err := e.writeFrame(startFrame); err != nil {
 		return nil, fmt.Errorf("send start frame: %w", err)
 	}
@@ -261,4 +266,24 @@ func (e *streamExecutor) nextSeq() int {
 	seq := e.seq
 	e.seq++
 	return seq
+}
+
+// resumeThreadHint reads the adopt-resume hint out of the create-session tags.
+//
+// The data service sets tags["resume_thread_id"] = <external editor session
+// uuid> when a synced session is adopted into a platform task (see
+// user_platform/environment_service.py:adopt_environment_session). The node
+// passes it to the runtime as resumeThreadId, which seeds the provider thread
+// so the adopted task continues the ORIGINAL conversation instead of starting a
+// blank one. Empty means "start fresh" — the normal case for every task that
+// was not adopted.
+//
+// It rides the existing `tags` map (proto field 12) rather than a new
+// NodeCreateSession field: tags already flow from the server down to the
+// runtime start frame, so this needs no proto change and no pb2 regeneration.
+func resumeThreadHint(spec *agentcomposev2.NodeCreateSession) string {
+	if spec == nil {
+		return ""
+	}
+	return strings.TrimSpace(spec.GetTags()["resume_thread_id"])
 }
